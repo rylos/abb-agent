@@ -5,9 +5,15 @@
 # The server connection (address, token, certificate fingerprint) is not configured here:
 # `abb-agent connect` creates it in /var/lib/abb-agent.
 
-# Disks the agent may back up, by kernel name (see `lsblk`). Each disk becomes one image on
-# the server with its partition table, so it can be restored bare-metal. Which volumes of them
-# are sent depends on the task's source type in the console.
+# Disks the agent may back up. Each disk becomes one image on the server with its partition
+# table, so it can be restored bare-metal. Which volumes of them are sent depends on the task's
+# source type in the console.
+# Name them so that they are found again if the kernel numbers disks differently (nvme0n1 and
+# nvme1n1 can swap between boots or kernels):
+#   "system"                          the disk holding /
+#   "/dev/disk/by-id/nvme-Samsung…"   a stable device path (`ls -l /dev/disk/by-id`)
+#   "nvme0n1"                         a kernel name (only if it never changes)
+# Each disk keeps the image name it was first backed up under, whatever the kernel calls it later.
 # Empty: all internal disks (not removable, not USB, not virtual).
 disks = []
 
@@ -45,3 +51,12 @@ freeze_mounted = false
 [performance]
 # Threads that read, verify and compress data (0 = one per CPU, at most 8).
 workers = 0
+
+[hooks]
+# Shell commands (run as root with /bin/sh, at most 5 minutes each). on_finish gets
+# ABB_STATUS (complete, partial, error or cancel) and ABB_EXIT (0 only when complete).
+# Example, a healthchecks.io check:
+#   on_start = "curl -fsS -m 10 --retry 5 -o /dev/null https://hc-ping.com/<uuid>/start"
+#   on_finish = "curl -fsS -m 10 --retry 5 -o /dev/null https://hc-ping.com/<uuid>/$ABB_EXIT"
+on_start = ""
+on_finish = ""

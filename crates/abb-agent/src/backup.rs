@@ -439,7 +439,19 @@ type Scan = (Vec<(Disk, Vec<Interval>)>, Vec<Partition>);
 fn scan_disks(sel: &Selection) -> Result<(Scan, bool)> {
     let cfg = crate::config::get();
     let explicit = !cfg.disks.is_empty();
-    let names = if explicit { cfg.disks.clone() } else { disk::internal_disks()? };
+    let names = if explicit {
+        let mut names = Vec::new();
+        for e in &cfg.disks {
+            let n = disk::resolve(e)?;
+            // "system" and a path may name the same disk.
+            if !names.contains(&n) {
+                names.push(n);
+            }
+        }
+        names
+    } else {
+        disk::internal_disks()?
+    };
     let mut disks = Vec::new();
     let mut volume_parts = Vec::new();
     let mut missed = false;
@@ -486,6 +498,11 @@ fn scan_disks(sel: &Selection) -> Result<(Scan, bool)> {
     if disks.is_empty() {
         return Err(Error::Protocol("nothing to back up".into()));
     }
+    let mut only: Vec<Disk> = disks.iter().map(|(d, _)| d.clone()).collect();
+    crate::state::image_names(&mut only);
+    for ((d, _), named) in disks.iter_mut().zip(only) {
+        d.image = named.image;
+    }
     Ok(((disks, volume_parts), missed))
 }
 
@@ -522,6 +539,22 @@ pub fn run(sess: &Session, trigger: Trigger) -> Result<()> {
         _shared.push(flock(l, false, true)?);
     }
 
+    crate::hooks::on_start();
+    let started = now();
+    let res = run_locked(sess, trigger);
+    let last = LastRun::load();
+    let status = match &res {
+        Ok(()) if last.start >= started => last.status.clone(),
+        Ok(()) => "complete".into(),
+        Err(_) if last.start >= started && last.status != "running" => last.status.clone(),
+        Err(_) => "error".into(),
+    };
+    crate::hooks::on_finish(&status);
+    res
+}
+
+/// The backup itself, once the locks are held.
+fn run_locked(sess: &Session, trigger: Trigger) -> Result<()> {
     let mut c = sess.connect()?;
     let tasks = sess.tasks(&mut c)?;
     let task = match &trigger {

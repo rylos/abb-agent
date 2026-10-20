@@ -10,12 +10,14 @@ pub const DEFAULT_PATH: &str = "/etc/abb-agent.toml";
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
-    /// Disks to back up (kernel names, e.g. "nvme0n1"); empty = the disk holding `/`.
+    /// Disks to back up: kernel names ("nvme0n1"), device paths (/dev/disk/by-id/…) or "system";
+    /// empty = all internal disks.
     pub disks: Vec<String>,
     pub schedule: Schedule,
     pub btrfs: Btrfs,
     pub ext: Ext,
     pub performance: Performance,
+    pub hooks: Hooks,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -58,6 +60,15 @@ pub struct Ext {
 pub struct Performance {
     /// Threads that read, verify and compress data (0 = one per CPU, at most 8).
     pub workers: usize,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Hooks {
+    /// Shell command run when a backup starts (after waiting for `wait_locks`).
+    pub on_start: String,
+    /// Shell command run when a backup ends, with ABB_STATUS and ABB_EXIT in the environment.
+    pub on_finish: String,
 }
 
 static CONFIG: OnceLock<Config> = OnceLock::new();

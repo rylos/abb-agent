@@ -62,6 +62,50 @@ fn path() -> PathBuf {
     Path::new(STATE_DIR).join("state.json")
 }
 
+/// Keeps the image name of each disk stable: the kernel may name disks differently from one boot
+/// or kernel to the next (nvme0n1 and nvme1n1 swapping), but on the server a disk must keep its
+/// image, or every backup after a change would be a full one in a new image. The first name a
+/// disk was backed up under is remembered by its stable id (`disk-images.json`). Disks without a
+/// stable id keep their kernel name. Ids no longer present (a replaced disk, a restore onto new
+/// hardware) give their name up.
+pub fn image_names(disks: &mut [crate::disk::Disk]) {
+    let file = Path::new(STATE_DIR).join("disk-images.json");
+    let mut map: std::collections::BTreeMap<String, String> =
+        fs::read_to_string(&file).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    let present: Vec<Option<String>> = disks.iter().map(|d| crate::disk::stable_id(&d.name)).collect();
+    let live_ids: Vec<String> = crate::disk::internal_disks()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|n| crate::disk::stable_id(n))
+        .chain(present.iter().flatten().cloned())
+        .collect();
+    map.retain(|id, _| live_ids.contains(id));
+    for (d, id) in disks.iter_mut().zip(&present) {
+        let Some(id) = id else { continue };
+        let name = match map.get(id) {
+            Some(n) => n.clone(),
+            None => {
+                let mut n = d.name.clone();
+                let mut k = 2;
+                while map.values().any(|v| *v == n) {
+                    n = format!("{}-{k}", d.name);
+                    k += 1;
+                }
+                map.insert(id.clone(), n.clone());
+                n
+            }
+        };
+        if name != d.name {
+            eprintln!("{}: image {name}.img (the disk's name when first backed up)", d.name);
+        }
+        d.image = name;
+    }
+    let _ = fs::create_dir_all(STATE_DIR);
+    if let Ok(t) = serde_json::to_string_pretty(&map) {
+        let _ = fs::write(&file, t);
+    }
+}
+
 impl State {
     pub fn load() -> std::io::Result<State> {
         let text = fs::read_to_string(path())?;

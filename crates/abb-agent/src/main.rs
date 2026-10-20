@@ -6,6 +6,7 @@ mod config;
 mod control;
 mod disk;
 mod fixup;
+mod hooks;
 mod host;
 mod nodes;
 mod scheduler;

@@ -90,6 +90,9 @@ impl Partition {
 pub struct Disk {
     /// e.g. "nvme0n1"
     pub name: String,
+    /// Name of its image on the server without ".img": the kernel name the disk had when it
+    /// was first backed up, kept when the kernel names it differently (see `state::image_names`).
+    pub image: String,
     pub size: u64,
     pub sector_size: u32,
     /// "GPT" (MBR not supported yet).
@@ -105,7 +108,7 @@ impl Disk {
 
     /// Image name on the server ("nvme0n1.img").
     pub fn image_name(&self) -> String {
-        format!("{}.img", self.name)
+        format!("{}.img", self.image)
     }
 }
 
@@ -147,6 +150,50 @@ fn is_internal_disk(name: &str) -> bool {
 pub fn has_partitions(name: &str) -> bool {
     fs::read_dir(Path::new("/sys/block").join(name))
         .is_ok_and(|d| d.filter_map(|e| e.ok()).any(|e| e.path().join("partition").exists()))
+}
+
+/// An identifier of the disk that does not depend on the order the kernel finds disks in: the
+/// WWID (NVMe EUI/NGUID, SCSI/SATA WWN) or else model and serial number.
+pub fn stable_id(name: &str) -> Option<String> {
+    let sys = Path::new("/sys/block").join(name);
+    for p in [sys.join("wwid"), sys.join("device/wwid")] {
+        if let Ok(w) = read_trim(p)
+            && !w.is_empty()
+        {
+            return Some(w.split_whitespace().collect::<Vec<_>>().join(" "));
+        }
+    }
+    let model = read_trim(sys.join("device/model")).unwrap_or_default();
+    // virtio-blk has `serial` on the disk, SCSI/SATA under the device.
+    for p in [sys.join("serial"), sys.join("device/serial")] {
+        if let Ok(serial) = read_trim(p)
+            && !serial.is_empty()
+        {
+            return Some(format!("{model} {serial}").trim().to_string());
+        }
+    }
+    // SCSI device identification page (what udev's /dev/disk/by-id/scsi-… names come from).
+    let vpd = fs::read(sys.join("device/vpd_pg83")).ok().filter(|v| v.len() > 4)?;
+    Some(format!("vpd83:{}", vpd.iter().map(|b| format!("{b:02x}")).collect::<String>()))
+}
+
+/// Kernel name of a disk named in the configuration: a kernel name ("nvme0n1"), a device path
+/// (stable ones such as /dev/disk/by-id/…, also of a partition: its disk is taken), or "system"
+/// for the disk holding `/`.
+pub fn resolve(entry: &str) -> std::io::Result<String> {
+    if entry == "system" {
+        return system_disk();
+    }
+    let name = if entry.starts_with('/') {
+        let dev = fs::canonicalize(entry).map_err(|e| std::io::Error::new(e.kind(), format!("{entry}: {e}")))?;
+        parent_disk(&dev.file_name().unwrap_or_default().to_string_lossy())?
+    } else {
+        entry.to_string()
+    };
+    if !Path::new("/sys/block").join(&name).exists() {
+        return Err(std::io::Error::other(format!("{entry}: no such disk")));
+    }
+    Ok(name)
 }
 
 /// Internal disks of the machine, sorted by name.
@@ -250,7 +297,7 @@ pub fn scan(name: &str) -> std::io::Result<Disk> {
         });
     }
     partitions.sort_by_key(|p| p.offset);
-    Ok(Disk { name: name.to_string(), size, sector_size, layout: "GPT".into(), partitions })
+    Ok(Disk { name: name.to_string(), image: name.to_string(), size, sector_size, layout: "GPT".into(), partitions })
 }
 
 fn guid(b: &[u8]) -> String {
