@@ -126,7 +126,7 @@ pub fn run(
     });
     // Mounting and checking need the devices that are open exclusively here.
     drop(devices);
-    let result = result.map(|(grown, esps)| after_restore(plan, grown, esps, report));
+    let result = result.map(|work| after_restore(plan, work, report));
     let (status, code) = match &result {
         Ok(()) => ("complete", LOG_RESTORE_FINISH),
         Err(_) if cancel.load(Ordering::Relaxed) => ("cancel", LOG_RESTORE_CANCEL),
@@ -318,8 +318,16 @@ fn download(
     }
 }
 
-/// Filesystems to grow (device, type) and EFI system partitions to check.
-type AfterWork = (Vec<(PathBuf, String)>, Vec<PathBuf>);
+/// What is left once the disks are closed.
+#[derive(Default)]
+struct AfterWork {
+    /// Disks whose partition table must be reread by the kernel.
+    reread: Vec<PathBuf>,
+    /// Filesystems to grow: device and type.
+    grow: Vec<(PathBuf, String)>,
+    /// EFI system partitions to check.
+    esps: Vec<PathBuf>,
+}
 
 /// After the data: partition tables for the real disk size, bigger partitions and filesystems,
 /// EFI fallback boot path.
@@ -331,8 +339,8 @@ fn finish_disks(
     devices: &[Device],
     report: &mut dyn FnMut(Event),
 ) -> Result<AfterWork, String> {
-    let mut grown: Vec<(PathBuf, String)> = Vec::new();
-    let mut esps: Vec<PathBuf> = Vec::new();
+    let mut work = AfterWork::default();
+    let (grown, esps) = (&mut work.grow, &mut work.esps);
     match plan.mode {
         Mode::Device | Mode::System => {
             for dev in devices {
@@ -360,7 +368,7 @@ fn finish_disks(
                         let e = &mut g.entries[n as usize - 1];
                         if let Some(p) = d.partitions.iter().find(|p| p.offset == e.first_lba * l.sector_size)
                             && !p.excluded
-                            && (p.fs.starts_with("ext") || p.fs == "btrfs")
+                            && growable(p)
                         {
                             e.last_lba = last_usable;
                             grow_part = Some((n, p.fs.clone()));
@@ -388,7 +396,8 @@ fn finish_disks(
                 let start = match t.place {
                     Place::Free(start) => start,
                     Place::Partition(n) => {
-                        if plan.grow {
+                        let bigger = l.partitions.iter().any(|q| q.number == n && q.length > p.length);
+                        if plan.grow && bigger && growable(p) {
                             grown.push((l.partition_path(n), p.fs.clone()));
                         }
                         continue;
@@ -417,23 +426,37 @@ fn finish_disks(
                     if e.type_guid == gpt::ESP {
                         esps.push(l.partition_path(n as u64 + 1));
                     }
-                    if plan.grow {
+                    if plan.grow && (e.last_lba - e.first_lba + 1) * l.sector_size > p.length && growable(p) {
                         grown.push((l.partition_path(n as u64 + 1), p.fs.clone()));
                     }
                 }
                 g.write(&file, l.size, false).map_err(|e| format!("{}: {e}", l.name))?;
-                if let Err(e) = reread_partitions(&file) {
-                    report(Event::Warning(e));
+                if !work.reread.contains(&l.path()) {
+                    work.reread.push(l.path());
                 }
             }
         }
     }
-    Ok((grown, esps))
+    Ok(work)
 }
 
-/// Growing filesystems and the EFI boot path, once the disks are closed.
-fn after_restore(plan: &Plan, grown: Vec<(PathBuf, String)>, esps: Vec<PathBuf>, report: &mut dyn FnMut(Event)) {
-    for (path, fs) in grown {
+fn growable(p: &Partition) -> bool {
+    p.fs.starts_with("ext") || p.fs == "btrfs"
+}
+
+/// Partition tables, growing filesystems and the EFI boot path, once the disks are closed.
+fn after_restore(plan: &Plan, work: AfterWork, report: &mut dyn FnMut(Event)) {
+    for disk in &work.reread {
+        match File::open(disk) {
+            Ok(f) => {
+                if let Err(e) = reread_partitions(&f) {
+                    report(Event::Warning(format!("{}: {e}", disk.display())));
+                }
+            }
+            Err(e) => report(Event::Warning(format!("{}: {e}", disk.display()))),
+        }
+    }
+    for (path, fs) in work.grow {
         report(Event::Step(format!("Growing {fs} on {}", path.display())));
         if !wait_for(&path) {
             report(Event::Warning(format!("{} did not appear: filesystem not grown", path.display())));
@@ -444,7 +467,7 @@ fn after_restore(plan: &Plan, grown: Vec<(PathBuf, String)>, esps: Vec<PathBuf>,
         }
     }
     if plan.efi_fallback {
-        for esp in esps {
+        for esp in work.esps {
             report(Event::Step(format!("Checking the EFI boot path on {}", esp.display())));
             match crate::fs::efi_fallback(&esp) {
                 Ok(Some(msg)) => report(Event::Step(msg)),

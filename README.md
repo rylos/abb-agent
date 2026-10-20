@@ -33,8 +33,8 @@ Disks must use GPT partition tables.
 
 > **Status: experimental.** Backups and incremental backups work and have been verified
 > by checking the images stored on the server (`btrfs check`, scrub, `e2fsck`, file
-> comparison) and by booting them. Bare-metal restore with the ABB recovery media is
-> still being tested. Do not use it as your only backup yet.
+> comparison) and by booting them; bare-metal restores with `abb-restore` and with Synology's
+> recovery media boot. Do not use it as your only backup yet.
 
 This project is not affiliated with, endorsed or supported by Synology Inc. "Synology" and
 "Active Backup for Business" are trademarks of Synology Inc.
@@ -98,6 +98,14 @@ sudo install -Dm644 packaging/systemd/abb-agent-fixup.service /usr/lib/systemd/s
 sudo install -Dm644 packaging/abb-agent.toml /etc/abb-agent.toml
 ```
 
+The restore tool is built as a static binary, to copy onto a USB stick next to any live image:
+
+```sh
+rustup target add x86_64-unknown-linux-musl
+cargo build --release --target x86_64-unknown-linux-musl -p abb-restore
+# target/x86_64-unknown-linux-musl/release/abb-restore
+```
+
 ## Usage
 
 1. Connect the machine to the server. This creates the device and its backup task in ABB, using
@@ -148,14 +156,52 @@ interval, retries after a failure and lock files to wait for.
 ## Restore
 
 The server stores one image per disk. Files can be browsed and restored from the ABB portal.
-For a bare-metal restore, boot the target machine from the ABB recovery media and restore the
-whole disk. The target disk must be at least as large as the original.
 
-After a restore the agent removes, on its first start, the temporary snapshots that were part of
-the image. Excluded subvolumes are gone in the restored system; `abb-agent-fixup` recreates them
-empty early at boot (it reads the list from `/var/lib/abb-agent`, which must be on the root
-filesystem). Your own btrfs snapshots (btrbk, snapper, …) are restored with everything else. The
-first backup after a restore is a full one.
+### Bare-metal restore with abb-restore
+
+`abb-restore` is a single static binary (no dependencies) that restores a whole machine from any
+Linux live system: Arch ISO, SystemRescue, Ubuntu live, anything with a network and a shell.
+
+```sh
+# on the live system, as root
+./abb-restore
+```
+
+A text interface walks through the same steps as Synology's recovery wizard: NAS address and
+account, device and task, restore mode, version, disk mapping, summary and progress.
+
+| mode | what it does |
+|---|---|
+| Entire device | every disk of the backup onto a whole local disk, partition table included |
+| System volumes | only the EFI/BIOS boot partitions and the volumes holding `/` and `/boot`, in place |
+| Selected volumes | chosen volumes onto existing partitions or new partitions in free space |
+
+- Only the areas in use are transferred, and the restore shows up in the ABB console like one made
+  with Synology's media.
+- The target disk can be **bigger** than the original: the backup GPT is moved to the end of the
+  disk and, if you want, the last partition and its btrfs or ext filesystem are grown to fill it.
+  A **smaller** disk works as long as the partitions fit on it.
+- Partition UUIDs and filesystem UUIDs are kept, so `/etc/fstab` and boot entries keep working.
+- On UEFI machines the boot loader (systemd-boot, GRUB or shim) is copied to `\EFI\BOOT\` when
+  missing, so the restored disk boots on a new machine without an NVRAM entry.
+
+For scripts the same restore runs without the interface:
+
+```sh
+abb-restore list     -a nas.example.lan -u backupuser
+abb-restore versions -a nas.example.lan -u backupuser -t 2
+abb-restore run      -a nas.example.lan -u backupuser -t 2 --device --map sda=nvme0n1 --grow --yes
+```
+
+Synology's own recovery media works too: the agent reports the device so that it is listed there.
+
+### After a restore
+
+The agent removes, on its first start, the temporary snapshots that were part of the image.
+Excluded subvolumes are gone in the restored system; `abb-agent-fixup` recreates them empty early
+at boot (it reads the list from `/var/lib/abb-agent`, which must be on the root filesystem). Your
+own btrfs snapshots (btrbk, snapper, …) are restored with everything else. The first backup after a
+restore is a full one.
 
 ## How it works
 

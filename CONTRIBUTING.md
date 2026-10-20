@@ -10,6 +10,7 @@ Thanks for helping. A few notes to make it smooth.
 | `crates/btrfs-image` | read-only btrfs parser on the raw device: chunk map, tree walks with verification, used-block map, snapshots, capture, change fingerprints, copy-on-read tree edits for subvolume exclusion |
 | `crates/ext-image` | read-only ext2/3/4 used-block map |
 | `crates/abb-agent` | the agent: CLI, service, schedule, device description, upload stream |
+| `crates/abb-restore` | bare-metal restore for live systems: recovery protocol, disk mapping, GPT, text interface |
 
 ## Building and testing
 

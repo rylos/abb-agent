@@ -82,6 +82,14 @@ impl Server {
         self.open()?.call(&msg)
     }
 
+    /// First contact, before sending the password: the certificate fingerprint to confirm.
+    pub fn probe(&mut self) -> Result<Fingerprint> {
+        let mut c = Connection::open(&self.host, self.port, None)?;
+        c.call(&request("query_server_info", vec![]))?;
+        self.pin = Some(c.fingerprint);
+        Ok(c.fingerprint)
+    }
+
     /// Checks the account. Returns the server's package version, e.g. "3.2.1-25059".
     pub fn login(&mut self) -> Result<String> {
         let otp = Value::str(self.otp.clone());
