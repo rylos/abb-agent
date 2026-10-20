@@ -2,7 +2,7 @@
 
 <h3 align="center">
 An Active Backup for Business agent that runs on any Linux distribution and any kernel, 7.x
-included: no kernel module to build, nothing to break on the next update.<br>
+included: written in Rust, no kernel module to build, nothing to break on the next update.<br>
 The way it should have been from the start.
 </h3>
 
@@ -11,7 +11,8 @@ backups of machines whose root filesystem is **btrfs**, and also of ext2/3/4 vol
 unmodified ABB server: the device shows up in the ABB console like any other physical
 server, backups are versioned, deduplicated and restorable with Synology's tools.
 
-It needs no kernel module and no Synology binaries.
+Written in **Rust**: one self-contained binary, memory-safe by design. It needs
+no kernel module and no Synology binaries.
 
 > **Status: experimental.** Backups and incremental backups work and have been verified
 > by checking the images stored on the server (`btrfs check`, scrub, `e2fsck`, file
