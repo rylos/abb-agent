@@ -226,13 +226,13 @@ impl Plan {
 }
 
 /// System mode writes the boot volumes back in place: the local disk must have the partitions of
-/// the backup at the same positions, or no partition table at all.
+/// the backup at the same positions (at least as big), or no partition table at all.
 pub fn same_layout(d: &Disk, l: &LocalDisk) -> Result<(), String> {
     if l.partitions.is_empty() {
         return Ok(());
     }
     for p in d.partitions.iter().filter(|p| p.is_system()) {
-        if !l.partitions.iter().any(|q| q.offset == p.offset && q.length == p.length) {
+        if !l.partitions.iter().any(|q| q.offset == p.offset && q.length >= p.length) {
             return Err(format!("no partition matching {} at the same position", p.label));
         }
     }

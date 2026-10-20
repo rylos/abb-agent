@@ -353,9 +353,15 @@ fn finish_disks(
                 }
                 if plan.mode == Mode::System && !l.partitions.is_empty() {
                     // The local table was kept as it was.
-                    esps.extend(d.partitions.iter().filter(|p| p.is_esp()).filter_map(|p| {
-                        l.partitions.iter().find(|q| q.offset == p.offset).map(|q| l.partition_path(q.number))
-                    }));
+                    for p in d.partitions.iter().filter(|p| p.is_system() && !p.excluded) {
+                        let Some(q) = l.partitions.iter().find(|q| q.offset == p.offset) else { continue };
+                        if p.is_esp() {
+                            esps.push(l.partition_path(q.number));
+                        }
+                        if plan.grow && q.length > p.length && growable(p) {
+                            grown.push((l.partition_path(q.number), p.fs.clone()));
+                        }
+                    }
                     continue;
                 }
                 let mut g = Gpt::read(&dev.file, l.sector_size)
