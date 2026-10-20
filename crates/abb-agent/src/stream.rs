@@ -187,7 +187,7 @@ pub fn plan_incremental(intervals: &[Interval], volumes: &[Vol], prev: &[Digests
                 let blocks = (i.end - i.start).div_ceil(cbt::BLOCK);
                 let per_mib = MIB / cbt::BLOCK;
                 let btrfs = vol.changed(old, 0).is_some();
-                let mut whole = false;
+                let (mut whole, mut freed) = (false, false);
                 for k in 0..blocks {
                     let s = i.start + k * cbt::BLOCK;
                     let e = (s + cbt::BLOCK).min(i.end);
@@ -196,7 +196,11 @@ pub fn plan_incremental(intervals: &[Interval], volumes: &[Vol], prev: &[Digests
                     // free 64 KiB block (hundreds of thousands of messages on a big fragmented
                     // btrfs). Freed blocks keep their old content, which nothing reads.
                     if k % per_mib == 0 {
-                        whole = btrfs && (k..(k + per_mib).min(blocks)).any(|b| vol.block_used(b as usize));
+                        let mib = k..(k + per_mib).min(blocks);
+                        whole = btrfs && mib.clone().any(|b| vol.block_used(b as usize));
+                        // A free MiB gets one "changed" flag (data there before), so that free
+                        // MiBs in a row make a single message.
+                        freed = btrfs && mib.clone().any(|b| old.used(b as usize));
                     }
                     let k = k as usize;
                     if whole && !(vol.block_used(k) && vol.changed(old, k) == Some(true)) {
@@ -204,7 +208,7 @@ pub fn plan_incremental(intervals: &[Interval], volumes: &[Vol], prev: &[Digests
                         continue;
                     }
                     out.push(if !vol.block_used(k) {
-                        Piece::Run(Run { start: s, end: e, used: false, changed: old.used(k), cbt: true })
+                        Piece::Run(Run { start: s, end: e, used: false, changed: if btrfs { freed } else { old.used(k) }, cbt: true })
                     } else {
                         match vol.changed(old, k) {
                             Some(false) => Piece::Run(Run { start: s, end: e, used: true, changed: false, cbt: true }),

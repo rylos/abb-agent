@@ -110,8 +110,23 @@ pub fn prepare(
     let exclude = &patterns[..];
     let leaving: Vec<PathBuf> = exclude::matching(&subvols, Path::new(SNAP_DIR), exclude).into_iter().map(|s| s.path).collect();
     before_snapshot(&leaving);
+    // Read-only subvolumes left out (e.g. btrbk's snapshots) do not change: they need no
+    // snapshot of their own, and every snapshot costs a commit and metadata rewritten. If one
+    // is deleted meanwhile, its nodes fail verification and the backup is retried.
+    const ROOT_SUBVOL_RDONLY: u64 = 1;
+    let read_only: Vec<u64> = fs
+        .root_items()?
+        .into_iter()
+        .filter(|(_, d)| u64_at(d, 208) & ROOT_SUBVOL_RDONLY != 0)
+        .map(|(id, _)| id)
+        .collect();
+    let frozen: Vec<u64> = subvols
+        .iter()
+        .filter(|s| leaving.contains(&s.path) && read_only.contains(&s.id))
+        .map(|s| s.id)
+        .collect();
     let mut sources: Vec<(u64, PathBuf, String)> = vec![(TOPLEVEL_ID, top.clone(), "5.toplevel".into())];
-    for s in subvols.iter().filter(|s| !s.path.starts_with(SNAP_DIR)) {
+    for s in subvols.iter().filter(|s| !s.path.starts_with(SNAP_DIR) && !frozen.contains(&s.id)) {
         let name = format!("{}.{}", s.id, s.path.to_string_lossy().replace('/', "_"));
         sources.push((s.id, top.join(&s.path), name));
     }
@@ -137,7 +152,7 @@ pub fn prepare(
     let run_prefix = Path::new(SNAP_DIR).join(run_name);
     let mut pinned = Vec::new();
     let mut snap_ids = Vec::new();
-    let mut ours = Vec::new();
+    let mut ours = frozen.clone();
     for s in &after {
         if let Ok(rest) = s.path.strip_prefix(&run_prefix) {
             let src: u64 = rest
