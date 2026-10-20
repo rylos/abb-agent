@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/abb-agent", "crates/abb-proto", "crates/btrfs-image", "crates/ext-image"]
+members = ["crates/abb-agent", "crates/abb-proto", "crates/abb-restore", "crates/btrfs-image", "crates/ext-image"]
 
 [workspace.package]
 edition = "2024"
