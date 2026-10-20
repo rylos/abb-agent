@@ -1,13 +1,23 @@
-//! Local backup schedule: one at every boot and then every `interval_hours`, retrying
-//! after `retry_minutes` on failure. The schedule set on the server is ignored; backups
-//! started from the server ("Back up now") still work and count as the last backup.
+//! When to back up. The schedule and backup window set in the ABB console are followed as
+//! the official agent does (in server time; a start missed while the machine was off runs once
+//! when it comes back). The configuration adds what the console cannot express for Linux: a
+//! backup after every boot, a fixed interval, and retries after a failure. Backups started from
+//! the console run whenever the server asks.
 
-use crate::backup::{self, TRIGGER_SCHEDULE, Trigger};
+use crate::backup::{EVENT_STARTUP, TRIGGER_EVENT, TRIGGER_SCHEDULE};
+use crate::config::{self, Schedule as LocalSchedule};
+use crate::control;
 use crate::host::now;
 use crate::session::Session;
-use crate::config::{self, Schedule};
-use crate::state::LastRun;
-use std::time::Duration;
+use crate::state::{LastRun, STATE_DIR};
+use crate::task::TaskInfo;
+use serde::{Deserialize, Serialize};
+use std::path::Path;
+use std::sync::mpsc::Sender;
+use std::time::{Duration, Instant};
+
+/// A backup the agent decides to start: (trigger_type, trigger_event).
+pub type LocalTrigger = (u64, Option<u64>);
 
 /// System boot time (Unix seconds), from /proc/stat.
 fn boot_time() -> u64 {
@@ -17,38 +27,96 @@ fn boot_time() -> u64 {
         .unwrap_or(0)
 }
 
-/// When the next backup is due (`None` = never).
-pub fn next_due(sc: &Schedule, last: &LastRun) -> Option<u64> {
-    if last.start == 0 {
-        return Some(0);
+/// Backup due from the local settings: when, and with which trigger.
+pub fn local_due(sc: &LocalSchedule, last: &LastRun) -> Option<(u64, LocalTrigger)> {
+    let failed = last.start > 0 && (last.status == "error" || last.status == "running");
+    let mut due: Vec<(u64, LocalTrigger)> = Vec::new();
+    if failed && sc.retry_minutes > 0 {
+        due.push((last.start + sc.retry_minutes * 60, (TRIGGER_SCHEDULE, None)));
     }
-    if last.status == "error" || last.status == "running" {
-        return Some(last.start + sc.retry_minutes * 60);
+    if sc.on_boot && last.last_ok_start < boot_time() && !failed {
+        due.push((0, (TRIGGER_EVENT, Some(EVENT_STARTUP))));
     }
-    if sc.on_boot && last.last_ok_start < boot_time() {
-        return Some(0);
+    if sc.interval_hours > 0 && last.last_ok_start > 0 {
+        due.push((last.last_ok_start + sc.interval_hours * 3600, (TRIGGER_SCHEDULE, None)));
     }
-    (sc.interval_hours > 0).then(|| last.last_ok_start + sc.interval_hours * 3600)
+    due.into_iter().min_by_key(|d| d.0)
 }
 
-pub fn run(sess: Session) {
+/// Last time the console schedule was checked (UTC seconds).
+#[derive(Default, Serialize, Deserialize)]
+struct Checked {
+    checked: u64,
+}
+
+fn checked_path() -> std::path::PathBuf {
+    Path::new(STATE_DIR).join("schedule.json")
+}
+
+fn load_checked() -> u64 {
+    std::fs::read_to_string(checked_path())
+        .ok()
+        .and_then(|t| serde_json::from_str::<Checked>(&t).ok())
+        .map_or(0, |c| c.checked)
+}
+
+fn save_checked(t: u64) {
+    if let Ok(text) = serde_json::to_string(&Checked { checked: t }) {
+        let _ = std::fs::write(checked_path(), text);
+    }
+}
+
+/// Next start from the console schedule (UTC seconds), counted from the last check.
+pub fn console_due(task: &TaskInfo) -> Option<u64> {
+    let checked = match load_checked() {
+        0 => now(),
+        c => c,
+    };
+    let off = control::server_offset();
+    task.schedule.next_after(checked as i64 + off).map(|t| (t - off).max(0) as u64)
+}
+
+pub fn refresh_timezone(sess: &Session) {
+    match sess.connect().and_then(|mut c| sess.server_offset(&mut c)) {
+        Ok(off) => control::set_server_offset(off),
+        Err(e) => eprintln!("get_timezone: {e}"),
+    }
+}
+
+pub fn run(sess: Session, worker: Sender<LocalTrigger>) {
+    if load_checked() == 0 {
+        save_checked(now());
+    }
+    let mut task: Option<TaskInfo> = None;
+    let mut fetched: Option<Instant> = None;
+    let mut tz: Option<Instant> = None;
     loop {
-        let last = LastRun::load();
-        if next_due(&config::get().schedule, &last).is_some_and(|t| t <= now()) {
-            eprintln!("scheduled backup");
-            if let Err(e) = backup::run(&sess, Trigger::Local { trigger_type: TRIGGER_SCHEDULE }) {
-                eprintln!("scheduled backup: {e}");
-                // Failed before starting (e.g. server unreachable): retry later.
-                let mut l = LastRun::load();
-                if l.start == last.start {
-                    l.start = now();
-                    l.status = "error".into();
-                    let _ = l.save();
-                }
-            }
-            // A backup requested by the server in the meantime.
-            crate::run_pending(&sess);
+        if tz.is_none_or(|t| t.elapsed() > Duration::from_secs(3600)) {
+            refresh_timezone(&sess);
+            tz = Some(Instant::now());
         }
-        std::thread::sleep(Duration::from_secs(60));
+        if control::take_tasks_changed() || fetched.is_none_or(|t| t.elapsed() > Duration::from_secs(300)) {
+            match sess.connect().and_then(|mut c| sess.tasks(&mut c)) {
+                Ok(list) => {
+                    task = list.first().and_then(TaskInfo::parse);
+                    fetched = Some(Instant::now());
+                }
+                Err(e) => eprintln!("get_task: {e}"),
+            }
+        }
+        if !control::busy() {
+            let t = now();
+            let console = task.as_ref().and_then(console_due).filter(|&d| d <= t);
+            let local = local_due(&config::get().schedule, &LastRun::load()).filter(|d| d.0 <= t);
+            if console.is_some() {
+                eprintln!("scheduled backup (console schedule)");
+                save_checked(t);
+                let _ = worker.send((TRIGGER_SCHEDULE, None));
+            } else if let Some((_, trigger)) = local {
+                eprintln!("scheduled backup ({})", if trigger.1.is_some() { "after boot" } else { "local schedule" });
+                let _ = worker.send(trigger);
+            }
+        }
+        std::thread::sleep(Duration::from_secs(30));
     }
 }

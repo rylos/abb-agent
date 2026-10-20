@@ -64,7 +64,7 @@ pub fn plan_full(d: &Disk, intervals: &[Interval], volumes: &[Vol]) -> Vec<Piece
             }
             used |= match i.source {
                 Source::Raw => true,
-                Source::Excluded => false,
+                Source::Excluded(_) => false,
                 Source::Vol(v) => {
                     let off = i.part.as_ref().unwrap().offset;
                     volumes[v].any_used(w.max(i.start) - off, we.min(i.end) - off)
@@ -92,7 +92,7 @@ pub fn plan_incremental(intervals: &[Interval], volumes: &[Vol], prev: &[Digests
             out.push(Piece::Log(LOG_VOLUME_START, a.clone()));
         }
         match i.source {
-            Source::Excluded => {
+            Source::Excluded(_) => {
                 out.push(Piece::Run(Run { start: i.start, end: i.end, used: false, changed: false, cbt: false }));
             }
             Source::Raw => {
@@ -138,7 +138,7 @@ fn build(dev: &Device, intervals: &[Interval], volumes: &[Vol], start: u64, end:
         let seg = &mut buf[(s - start) as usize..(e - start) as usize];
         match i.source {
             Source::Raw => {}
-            Source::Excluded => seg.fill(0),
+            Source::Excluded(_) => seg.fill(0),
             Source::Vol(v) => {
                 let p = i.part.as_ref().unwrap();
                 volumes[v].fill(s - p.offset, seg).map_err(|e| Error::Protocol(format!("volume {}: {e}", alias(p))))?;
@@ -371,10 +371,14 @@ fn send_stream(
     let mut first_perf = Some(snapshot_time);
     let mut last_perf = Instant::now();
     let (mut blocks, mut unchanged, mut sent_raw) = (0u64, 0u64, 0u64);
+    let mut throttle = Throttle::default();
     for ((d, _), plan) in disks.iter().zip(plans) {
         let image = d.image_name();
         let mut pending: Option<Run> = None;
         for piece in plan {
+            if crate::control::should_stop() {
+                return Err(Error::Protocol("backup cancelled".into()));
+            }
             match piece {
                 Piece::Log(t, a) => job.log(logc, *t, Some(a)),
                 Piece::Run(r) => {
@@ -412,7 +416,12 @@ fn send_stream(
                         ("used", Value::Int(1)),
                     ]);
                     let ts = Instant::now();
+                    let packed_len = msg.get("buffer").map_or(0, |b| match b {
+                        Value::Buffer(b) => b.len() as u64,
+                        _ => 0,
+                    });
                     up.send(&msg)?;
+                    throttle.sent(packed_len);
                     ctr.send_time += ts.elapsed();
                     ctr.send_bytes += ready.len;
                 }
@@ -445,6 +454,31 @@ fn send_stream(
         ctr.sent_compressed as f64 / MIB as f64
     );
     Ok(())
+}
+
+/// Bandwidth limit set in the console (`control::bandwidth`, bytes per second): after each
+/// message, sleeps as needed to keep the average rate under the limit.
+#[derive(Default)]
+struct Throttle {
+    since: Option<(Instant, u64)>,
+    bytes: u64,
+}
+
+impl Throttle {
+    fn sent(&mut self, n: u64) {
+        let limit = crate::control::bandwidth();
+        // Restart the measure when the limit changes.
+        if self.since.is_none_or(|(_, l)| l != limit) {
+            self.since = (limit > 0).then(|| (Instant::now(), limit));
+            self.bytes = 0;
+        }
+        let Some((start, _)) = self.since else { return };
+        self.bytes += n;
+        let due = Duration::from_secs_f64(self.bytes as f64 / limit as f64);
+        if let Some(wait) = due.checked_sub(start.elapsed()) {
+            std::thread::sleep(wait);
+        }
+    }
 }
 
 fn send_run(up: &mut Connection, image: &str, r: &Run) -> Result<()> {

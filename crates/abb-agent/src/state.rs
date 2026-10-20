@@ -34,6 +34,12 @@ pub struct LastRun {
     pub status: String,
     /// Start of the last successful backup (complete or partial).
     pub last_ok_start: u64,
+    /// Result of the last backup on the server, and its final status there (the server
+    /// verifies each new version after the upload: "success", "partial", "failure", …).
+    #[serde(default)]
+    pub result_id: u64,
+    #[serde(default)]
+    pub server_status: String,
 }
 
 impl LastRun {

@@ -5,17 +5,22 @@
 # The server connection (address, token, certificate fingerprint) is not configured here:
 # `abb-agent connect` creates it in /var/lib/abb-agent.
 
-# Disks to back up, by kernel name (see `lsblk`). Each disk becomes one image on the server
-# and is restored as a whole: partition table, boot partitions and all volumes.
-# Empty: the disk that holds the root filesystem.
+# Disks the agent may back up, by kernel name (see `lsblk`). Each disk becomes one image on
+# the server with its partition table, so it can be restored bare-metal. Which volumes of them
+# are sent depends on the task's source type in the console.
+# Empty: all internal disks (not removable, not USB, not virtual).
 disks = []
 
 [schedule]
+# The schedule, backup window, source (whole device, system volumes or selected volumes),
+# bandwidth limit and pre/post scripts are set on the task in the ABB console, and the agent
+# follows them. The settings below add what the console does not offer for Linux.
+#
 # Back up once after every boot, as soon as the server is reachable.
 on_boot = true
-# Hours between backups while the machine stays on (0 = only after boot).
-interval_hours = 24
-# Minutes before retrying a failed backup.
+# Back up every N hours in addition to the console schedule (0 = never).
+interval_hours = 0
+# Minutes before retrying a failed backup (0 = do not retry).
 retry_minutes = 60
 # Lock files to wait for before starting, so that other backup jobs do not run at the same
 # time (abb-agent takes an exclusive flock on each). Missing files are ignored.

@@ -100,8 +100,21 @@ Other commands:
 | `abb-agent disks [disk]` | disks, partitions and filesystems as the agent sees them |
 | `abb-agent bench [disk] [--limit GiB]` | everything a full backup does except sending, to measure speed |
 
-The schedule configured on the ABB server is ignored: the agent decides when to back up. You can
-remove the schedule from the task to avoid confusion.
+### What the ABB console controls
+
+The task settings in the ABB console apply as they do with the official agent:
+
+| console setting | behaviour |
+|---|---|
+| Source type | *Entire device*: every internal disk. *System volume*: the volumes holding `/` and `/boot` plus the EFI/BIOS boot partitions. *Custom volume*: the volumes picked in the console (btrfs volumes are offered too). Partition tables are always kept, so the disks can be restored bare-metal with all their partitions; volumes left out are restored empty. |
+| Schedule and backup window | followed in server time; a run missed while the machine was off happens when it comes back; a backup still running when the window closes is cancelled |
+| Bandwidth limit | applied to the upload, also when changed during a backup |
+| Pre/post scripts | the pre script runs before the snapshots, the post script right after them, as root with `/bin/sh` (180 s limit); output and result are reported to the server |
+| Back up now / Cancel | start and stop a backup at any time |
+| Retention, permissions, backup verification | handled by the server |
+
+On top of that, `/etc/abb-agent.toml` can add a backup after every boot (on by default), a fixed
+interval, retries after a failure and lock files to wait for.
 
 ## Restore
 

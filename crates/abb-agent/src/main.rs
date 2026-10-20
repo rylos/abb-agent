@@ -3,16 +3,20 @@
 
 mod backup;
 mod config;
+mod control;
 mod disk;
 mod host;
+mod nodes;
 mod scheduler;
+mod scripts;
 mod session;
 mod stream;
+mod task;
 mod volume;
 mod state;
 
 use abb_proto::transport::{DEFAULT_PORT, fingerprint_hex};
-use abb_proto::{Connection, request};
+use abb_proto::{Connection, Value, request};
 use session::Session;
 use state::State;
 use std::io::{BufRead, Write};
@@ -54,7 +58,8 @@ fn main() {
         Some("backup") => {
             let sess = load();
             sess.auth_by_token(false).unwrap_or_else(|e| die(e));
-            backup::run(&sess, backup::Trigger::Local { trigger_type: backup::TRIGGER_MANUAL }).unwrap_or_else(|e| die(e));
+            let trigger = backup::Trigger::Local { trigger_type: backup::TRIGGER_MANUAL, trigger_event: None };
+            backup::run(&sess, trigger).unwrap_or_else(|e| die(e));
         }
         Some("daemon") => daemon(),
         Some("disks") => {
@@ -136,14 +141,29 @@ fn status() {
     println!("server {}:{}  user {}  device {}", sess.state.server, sess.state.port, sess.state.username, sess.state.device_uuid);
     sess.auth_by_token(false).unwrap_or_else(|e| die(e));
     let mut c = sess.connect().unwrap_or_else(|e| die(e));
-    for t in sess.tasks(&mut c).unwrap_or_else(|e| die(e)) {
+    let tasks = sess.tasks(&mut c).unwrap_or_else(|e| die(e));
+    for t in &tasks {
         println!(
-            "task {} {:?}  compression {:?}  encryption {:?}",
+            "task {} {:?}",
             t.get("id").and_then(|v| v.as_int()).unwrap_or(0),
             t.get("name").and_then(|v| v.as_str()).unwrap_or(""),
-            t.get("compression").and_then(|v| v.as_int()),
-            t.get("encryption").and_then(|v| v.as_int()),
         );
+        if let Some(info) = task::TaskInfo::parse(t) {
+            println!("  source: {:?}", info.selection);
+            let sch = &info.schedule;
+            if sch.is_scheduled() {
+                println!(
+                    "  console schedule: days {:?} (0 = Sunday) at {:02}:{:02} server time{}{}",
+                    sch.weekdays,
+                    sch.hour,
+                    sch.minute,
+                    if sch.hourly { ", then every hour" } else { "" },
+                    if sch.window.is_some() { ", within the backup window" } else { "" }
+                );
+            } else {
+                println!("  console schedule: manual only");
+            }
+        }
     }
     for rt in sess.running_tasks(&mut c).unwrap_or_else(|e| die(e)) {
         println!("queued/running: {rt:?}");
@@ -151,15 +171,26 @@ fn status() {
     let last = state::LastRun::load();
     let sc = &config::get().schedule;
     println!(
-        "schedule: at boot {}, every {} h; last backup: start {} end {} result {:?}",
+        "local schedule: after boot {}, every {} h, retry after {} min",
         if sc.on_boot { "yes" } else { "no" },
-        sc.interval_hours,
+        if sc.interval_hours == 0 { "-".into() } else { sc.interval_hours.to_string() },
+        sc.retry_minutes
+    );
+    println!(
+        "last backup: start {} end {} result {:?}{}",
         fmt_time(last.start),
         fmt_time(last.end),
-        last.status
+        last.status,
+        if last.server_status.is_empty() { String::new() } else { format!(", on the server {:?}", last.server_status) }
     );
-    if let Some(t) = scheduler::next_due(sc, &last) {
-        println!("next backup: {}", fmt_time(t));
+    if let Ok(off) = sess.server_offset(&mut c) {
+        control::set_server_offset(off);
+    }
+    let console = tasks.first().and_then(task::TaskInfo::parse).and_then(|t| scheduler::console_due(&t));
+    let local = scheduler::local_due(sc, &last).map(|d| d.0.max(host::now()));
+    match [console, local].into_iter().flatten().min() {
+        Some(t) => println!("next backup: {}", fmt_time(t)),
+        None => println!("next backup: when started from the console or with `abb-agent backup`"),
     }
 }
 
@@ -181,7 +212,8 @@ fn fmt_time(t: u64) -> String {
     )
 }
 
-/// Service: heartbeat in one thread, events and backups in the main thread.
+/// Service: heartbeat, schedule and backups each in a thread of their own; the main thread
+/// handles the server's events, also while a backup runs (cancel, bandwidth, console requests).
 fn daemon() {
     let sess = load();
     backup::startup_cleanup();
@@ -221,13 +253,48 @@ fn daemon() {
         }
     });
 
+    // Backups run one at a time in the worker: local triggers come from the scheduler, `None`
+    // means "run what the server has queued".
+    let (tx, rx) = std::sync::mpsc::channel::<Option<scheduler::LocalTrigger>>();
+    let worker_state = sess.state.clone();
+    std::thread::spawn(move || {
+        let s = Session::new(worker_state);
+        for req in rx {
+            control::set_busy(true);
+            if let Some((trigger_type, trigger_event)) = req {
+                let last = state::LastRun::load();
+                if let Err(e) = backup::run(&s, backup::Trigger::Local { trigger_type, trigger_event }) {
+                    eprintln!("backup: {e}");
+                    // Failed before starting (e.g. server unreachable): retry later.
+                    let mut l = state::LastRun::load();
+                    if l.start == last.start {
+                        l.start = host::now();
+                        l.status = "error".into();
+                        let _ = l.save();
+                    }
+                }
+            }
+            run_pending(&s);
+            control::set_busy(false);
+        }
+    });
+
     let sched_state = sess.state.clone();
-    std::thread::spawn(move || scheduler::run(Session::new(sched_state)));
+    let sched_tx = tx.clone();
+    std::thread::spawn(move || {
+        let (stx, srx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for t in srx {
+                let _ = sched_tx.send(Some(t));
+            }
+        });
+        scheduler::run(Session::new(sched_state), stx)
+    });
 
     let mut sess = sess;
     let mut poll: Option<Connection> = None;
     // A backup may already be queued at startup.
-    run_pending(&sess);
+    let _ = tx.send(None);
     loop {
         if poll.is_none() {
             match sess.connect() {
@@ -263,22 +330,92 @@ fn daemon() {
             }
         };
         let mut check_tasks = false;
-        for (id, action, task_id) in &events {
-            eprintln!("event {id}: {action} (task {task_id})");
-            if action == "update_running_task" || action == "change_task" || action == "update_task" {
-                check_tasks = true;
+        for ev in &events {
+            eprintln!("event {}: {} (task {})", ev.id, ev.action, ev.task_id);
+            match ev.action.as_str() {
+                "change_task" | "update_task" => {
+                    control::tasks_changed();
+                    check_tasks = true;
+                }
+                "update_running_task" => check_tasks = true,
+                "update_backup_bandwidth" => {
+                    match sess.connect().and_then(|mut c| sess.call(&mut c, "get_backup_bandwidth", vec![])) {
+                        Ok(r) => control::set_bandwidth(r.get("backup_bandwidth").and_then(Value::as_int).unwrap_or(0)),
+                        Err(e) => eprintln!("get_backup_bandwidth: {e}"),
+                    }
+                }
+                // Requests from the ABB console that need an answer (e.g. the volume list).
+                "act_client" => nodes::answer(&sess, ev),
+                // The server finished processing a version (verification included).
+                "get_running_task_result" => fetch_result(&sess),
+                _ => {}
             }
         }
-        for (id, _, _) in &events {
-            if let Err(e) = sess.done_event(c, *id) {
-                eprintln!("done_event {id}: {e}");
+        for ev in &events {
+            if let Err(e) = sess.done_event(c, ev.id) {
+                eprintln!("done_event {}: {e}", ev.id);
             }
-            sess.state.last_event_id = sess.state.last_event_id.max(*id);
+            sess.state.last_event_id = sess.state.last_event_id.max(ev.id);
         }
         let _ = sess.state.save();
         if check_tasks {
-            run_pending(&sess);
+            if control::busy() {
+                check_cancel(&sess);
+            } else {
+                let _ = tx.send(None);
+            }
         }
+    }
+}
+
+/// Final status of our last backup on the server. A version the server rejects after the
+/// upload (e.g. its verification failed) counts as a failed backup, so it is retried.
+fn fetch_result(sess: &Session) {
+    let mut last = state::LastRun::load();
+    if last.result_id == 0 {
+        return;
+    }
+    let r = sess.connect().and_then(|mut c| {
+        sess.call(&mut c, "get_running_task_result", vec![("result_id", Value::Int(last.result_id))])
+    });
+    let status = match &r {
+        Ok(r) => r
+            .get("running_task_result")
+            .and_then(|t| t.get("status"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        Err(e) => {
+            eprintln!("get_running_task_result: {e}");
+            return;
+        }
+    };
+    if status.is_empty() || status == last.server_status {
+        return;
+    }
+    eprintln!("result {} on the server: {status}", last.result_id);
+    last.server_status = status.clone();
+    if status == "failure" && last.status != "running" {
+        last.status = "error".into();
+        last.last_ok_start = 0;
+    }
+    let _ = last.save();
+}
+
+/// While a backup runs: if the server no longer lists its running task as running (cancelled
+/// from the console), stop it.
+fn check_cancel(sess: &Session) {
+    let id = control::running_task();
+    if id == 0 {
+        return;
+    }
+    match sess.connect().and_then(|mut c| sess.running_tasks(&mut c)) {
+        Ok(list) => match list.iter().find(|rt| rt.running_task_id == id) {
+            Some(rt) if rt.status <= 1 => {}
+            Some(rt) => control::cancel(&format!("running task {id} has status {} on the server", rt.status)),
+            None => control::cancel(&format!("running task {id} no longer on the server")),
+        },
+        Err(e) => eprintln!("get_running_task: {e}"),
     }
 }
 

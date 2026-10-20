@@ -55,6 +55,8 @@ pub struct Partition {
     pub fs_uuid: String,
     /// Main mount point ("/" if present), empty if not mounted.
     pub mount_path: String,
+    /// All mount points (a btrfs volume is often mounted several times, one per subvolume).
+    pub mounts: Vec<String>,
     /// Mounted read-only (meaningful only if mounted).
     pub read_only: bool,
 }
@@ -125,6 +127,36 @@ pub fn parent_disk(part: &str) -> std::io::Result<String> {
         Some(p) if Path::new("/sys/block").join(&p).exists() => Ok(p),
         _ => Ok(part.to_string()),
     }
+}
+
+/// Whether `name` (under /sys/block) is a physical disk worth backing up: not a virtual
+/// device (loop, zram, ram, device-mapper, md, optical) and not removable or on USB.
+fn is_internal_disk(name: &str) -> bool {
+    const VIRTUAL: &[&str] = &["loop", "zram", "ram", "dm-", "md", "sr", "nbd", "fd"];
+    if VIRTUAL.iter().any(|v| name.starts_with(v)) {
+        return false;
+    }
+    let sys = Path::new("/sys/block").join(name);
+    if read_trim(sys.join("removable")).is_ok_and(|r| r == "1") || read_u64(sys.join("size")).unwrap_or(0) == 0 {
+        return false;
+    }
+    !fs::canonicalize(&sys).is_ok_and(|p| p.to_string_lossy().contains("/usb"))
+}
+
+/// The kernel sees partitions on disk `name` (whatever the table type).
+pub fn has_partitions(name: &str) -> bool {
+    fs::read_dir(Path::new("/sys/block").join(name))
+        .is_ok_and(|d| d.filter_map(|e| e.ok()).any(|e| e.path().join("partition").exists()))
+}
+
+/// Internal disks of the machine, sorted by name.
+pub fn internal_disks() -> std::io::Result<Vec<String>> {
+    let mut out: Vec<String> = fs::read_dir("/sys/block")?
+        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+        .filter(|n| is_internal_disk(n))
+        .collect();
+    out.sort();
+    Ok(out)
 }
 
 /// Disk containing the filesystem mounted at `/`.
@@ -213,6 +245,7 @@ pub fn scan(name: &str) -> std::io::Result<Disk> {
             fs,
             fs_uuid,
             mount_path: targets.first().map(|t| t.to_string()).unwrap_or_default(),
+            mounts: targets.iter().map(|t| t.to_string()).collect(),
             read_only,
         });
     }

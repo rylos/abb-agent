@@ -122,6 +122,21 @@ impl Session {
         Ok(())
     }
 
+    /// Offset to add to the local Unix time to get the server's wall clock as Unix seconds
+    /// (UTC offset of the server plus clock difference), from `get_timezone`.
+    pub fn server_offset(&self, c: &mut Connection) -> Result<i64> {
+        let r = self.call(c, "get_timezone", vec![])?;
+        let num = |k: &str| -> Option<i64> {
+            match r.get(k)? {
+                Value::Int(n) => Some(*n as i64),
+                v => v.as_str()?.trim().parse().ok(),
+            }
+        };
+        let epoch = num("epoch").ok_or_else(|| Error::Protocol("get_timezone: epoch missing".into()))?;
+        let tz = num("timezone").unwrap_or(0);
+        Ok(tz + epoch - crate::host::now() as i64)
+    }
+
     pub fn heart_beat(&self, c: &mut Connection) -> Result<()> {
         c.call(&authed(&self.state, "heart_beat", vec![("driver_status", Value::str("enable"))]))?;
         Ok(())
@@ -141,18 +156,19 @@ impl Session {
         Ok(r.get("has_event").and_then(Value::as_int) == Some(1))
     }
 
-    /// Pending events: (id, action, task_id).
-    pub fn pull_events(&self, c: &mut Connection) -> Result<Vec<(u64, String, u64)>> {
+    /// Pending events.
+    pub fn pull_events(&self, c: &mut Connection) -> Result<Vec<Event>> {
         let r = self.call(c, "pull_event", vec![("event_list", Value::Array(vec![]))])?;
         let Some(Value::Array(list)) = r.get("event_list") else { return Ok(vec![]) };
         Ok(list
             .iter()
             .filter_map(|e| {
-                Some((
-                    e.get("id")?.as_int()?,
-                    e.get("action")?.as_str()?.to_string(),
-                    e.get("task_id").and_then(Value::as_int).unwrap_or(0),
-                ))
+                Some(Event {
+                    id: e.get("id")?.as_int()?,
+                    action: e.get("action")?.as_str()?.to_string(),
+                    task_id: e.get("task_id").and_then(Value::as_int).unwrap_or(0),
+                    body: e.clone(),
+                })
             })
             .collect())
     }
@@ -187,6 +203,16 @@ impl Session {
             _ => Ok(vec![]),
         }
     }
+}
+
+/// An event from `pull_event`.
+#[derive(Clone, Debug)]
+pub struct Event {
+    pub id: u64,
+    pub action: String,
+    pub task_id: u64,
+    /// The whole event (e.g. `webapi_task` for `act_client`).
+    pub body: Value,
 }
 
 #[derive(Clone, Debug)]

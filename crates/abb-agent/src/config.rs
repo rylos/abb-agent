@@ -20,9 +20,10 @@ pub struct Config {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Schedule {
-    /// One backup after every boot, as soon as the server is reachable.
+    /// One backup after every boot, as soon as the server is reachable (on top of the schedule
+    /// set in the ABB console).
     pub on_boot: bool,
-    /// Hours between backups (0 = only after boot).
+    /// Hours between backups, on top of the console schedule (0 = none).
     pub interval_hours: u64,
     /// Minutes before retrying a failed backup.
     pub retry_minutes: u64,
@@ -32,7 +33,7 @@ pub struct Schedule {
 
 impl Default for Schedule {
     fn default() -> Schedule {
-        Schedule { on_boot: true, interval_hours: 24, retry_minutes: 60, wait_locks: Vec::new() }
+        Schedule { on_boot: true, interval_hours: 0, retry_minutes: 60, wait_locks: Vec::new() }
     }
 }
 

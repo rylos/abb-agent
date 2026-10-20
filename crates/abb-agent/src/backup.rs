@@ -4,7 +4,10 @@
 use crate::disk::{self, Disk, Fs, Partition};
 use crate::host::now;
 use crate::session::{RunningTask, Session, get_int};
+use crate::control;
+use crate::scripts::{self, Hook};
 use crate::state::LastRun;
+use crate::task::TaskInfo;
 use crate::stream::{self, MIB, Piece};
 use crate::volume::{self, Vol};
 use abb_proto::transport::{Error, Result};
@@ -31,9 +34,77 @@ pub enum Source {
     Raw,
     /// Volume with a consistent image (btrfs, ext): index into the volume list.
     Vol(usize),
-    /// Excluded: not sent (swap, filesystems that are unsupported or cannot be read
-    /// consistently).
-    Excluded,
+    /// Not sent (interval type 5).
+    Excluded(Skip),
+}
+
+/// Why a partition is left out of the image.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Skip {
+    /// Filesystem not supported, or not readable consistently (backup is partial).
+    Unsupported,
+    /// Not selected by the task's source type.
+    NotSelected,
+    Swap,
+}
+
+/// What the task asks to back up (the ABB "source type").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Selection {
+    /// 1: every internal disk, whole.
+    WholeDevice,
+    /// 2: the system volumes (`/`, `/boot`, EFI and BIOS boot partitions) and the disks holding them.
+    System,
+    /// 3: the volumes mounted at these paths, plus the system volumes if `/` is among them.
+    Custom(Vec<String>),
+}
+
+impl Selection {
+    /// From a `get_task` entry: `source_type` and `custom_volume` (a JSON array of mount paths,
+    /// sent as a string).
+    pub fn from_task(task: &Value) -> Selection {
+        let paths = |v: Option<&Value>| -> Vec<String> {
+            match v {
+                Some(Value::Array(a)) => a.iter().filter_map(|x| x.as_str().map(normalize_mount)).collect(),
+                Some(v) => v
+                    .as_str()
+                    .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|x| normalize_mount(x))
+                    .collect(),
+                None => Vec::new(),
+            }
+        };
+        match task.get("source_type").and_then(Value::as_int) {
+            Some(2) => Selection::System,
+            Some(3) => Selection::Custom(paths(task.get("custom_volume"))),
+            _ => Selection::WholeDevice,
+        }
+    }
+
+    fn selects(&self, p: &Partition) -> bool {
+        match self {
+            Selection::WholeDevice => true,
+            Selection::System => is_system(p),
+            Selection::Custom(list) => {
+                p.mounts.iter().any(|m| list.contains(m)) || (list.iter().any(|m| m == "/") && is_system(p))
+            }
+        }
+    }
+}
+
+fn normalize_mount(m: &str) -> String {
+    let t = m.trim_end_matches('/');
+    if t.is_empty() { "/".into() } else { t.into() }
+}
+
+/// System volume: holds `/` or `/boot` (also `/boot/efi`, `/efi`), or is an EFI or BIOS boot
+/// partition.
+fn is_system(p: &Partition) -> bool {
+    p.is_esp()
+        || p.is_bios_boot()
+        || p.mounts.iter().any(|m| m == "/" || m == "/boot" || m.starts_with("/boot/") || m == "/efi")
 }
 
 #[derive(Clone, Debug)]
@@ -48,7 +119,7 @@ pub struct Interval {
 
 /// Disk intervals and volumes to prepare. A read-write mounted ext is backed up only with
 /// `freeze_ext` (frozen for the whole upload), otherwise it is excluded (partial backup).
-fn plan(d: &Disk, volumes: &mut Vec<Partition>, freeze_ext: bool) -> Vec<Interval> {
+fn plan(d: &Disk, volumes: &mut Vec<Partition>, freeze_ext: bool, sel: &Selection) -> Vec<Interval> {
     let mut out = Vec::new();
     let mut pos = 0;
     let gap = |s: u64, e: u64| Interval { start: s, end: e, kind: 3, part: None, source: Source::Raw };
@@ -57,13 +128,17 @@ fn plan(d: &Disk, volumes: &mut Vec<Partition>, freeze_ext: bool) -> Vec<Interva
             out.push(gap(pos, p.offset));
         }
         let vol = matches!(p.fs, Fs::Btrfs) || (matches!(p.fs, Fs::Ext(_)) && volume::ext_readable(p, freeze_ext));
-        let (kind, source) = if vol {
+        let (kind, source) = if p.fs == Fs::Swap {
+            (5, Source::Excluded(Skip::Swap))
+        } else if !sel.selects(p) {
+            (5, Source::Excluded(Skip::NotSelected))
+        } else if vol {
             volumes.push(p.clone());
             (1, Source::Vol(volumes.len() - 1))
         } else if matches!(p.fs, Fs::None | Fs::Vfat) {
             (2, Source::Raw)
         } else {
-            (5, Source::Excluded)
+            (5, Source::Excluded(Skip::Unsupported))
         };
         out.push(Interval { start: p.offset, end: p.offset + p.length, kind, part: Some(p.clone()), source });
         pos = p.offset + p.length;
@@ -74,13 +149,33 @@ fn plan(d: &Disk, volumes: &mut Vec<Partition>, freeze_ext: bool) -> Vec<Interva
     out
 }
 
+fn skip_of(intervals: &[Interval], p: &Partition) -> Option<Skip> {
+    intervals.iter().find(|i| i.part.as_ref().is_some_and(|q| q.name == p.name)).and_then(|i| match i.source {
+        Source::Excluded(why) => Some(why),
+        _ => None,
+    })
+}
+
+/// Unsupported volumes and swap are reported as excluded, as the official agent does; volumes
+/// left out by the source type are simply not transferred.
 fn is_excluded(intervals: &[Interval], p: &Partition) -> bool {
-    intervals.iter().any(|i| i.source == Source::Excluded && i.part.as_ref().is_some_and(|q| q.name == p.name))
+    matches!(skip_of(intervals, p), Some(Skip::Unsupported | Skip::Swap))
+}
+
+/// The image can boot: no system volume is missing (swap does not count).
+fn is_bootable(disks: &[(Disk, Vec<Interval>)]) -> bool {
+    disks.iter().any(|(d, _)| d.partitions.iter().any(|p| p.mounts.iter().any(|m| m == "/")))
+        && disks.iter().all(|(d, iv)| {
+            d.partitions
+                .iter()
+                .filter(|p| is_system(p))
+                .all(|p| matches!(skip_of(iv, p), None | Some(Skip::Swap)))
+        })
 }
 
 /// Excluded volumes that contain data ("partial" backup); swap does not count.
 fn unsupported<'a>(d: &'a Disk, intervals: &[Interval]) -> Vec<&'a Partition> {
-    d.partitions.iter().filter(|p| p.fs != Fs::Swap && is_excluded(intervals, p)).collect()
+    d.partitions.iter().filter(|p| skip_of(intervals, p) == Some(Skip::Unsupported)).collect()
 }
 
 pub struct Job<'a> {
@@ -149,7 +244,9 @@ fn spec(sess: &Session, disks: &[(Disk, Vec<Interval>)], used: &[u64], start_tim
                 "partition_number": p.number,
                 "volume_name": p.fs_uuid,
             }));
-            if !p.mount_path.is_empty() && !excluded {
+            // The server mounts every volume of the mount map to verify the new version: only
+            // the volumes actually sent may be listed, or the version is marked as failed.
+            if !p.mount_path.is_empty() && skip_of(intervals, p).is_none() {
                 mount_map.insert(
                     p.mount_path.clone(),
                     json!({
@@ -234,7 +331,7 @@ fn spec(sess: &Session, disks: &[(Disk, Vec<Interval>)], used: &[u64], start_tim
             "cpu_number": sess.host.cpu_number,
             "disk_layout": disk_layout,
             "images": images,
-            "is_bootable": true,
+            "is_bootable": is_bootable(disks),
             "is_system_mbr": true,
             "is_volume": false,
             "memory_size": sess.host.memory_size,
@@ -258,7 +355,7 @@ fn used_estimate(intervals: &[Interval], volumes: &[Vol], d: &Disk) -> u64 {
                 && i.end > w
                 && match i.source {
                     Source::Raw => true,
-                    Source::Excluded => false,
+                    Source::Excluded(_) => false,
                     Source::Vol(v) => {
                         let off = i.part.as_ref().unwrap().offset;
                         volumes[v].any_used(w.max(i.start) - off, we.min(i.end) - off)
@@ -304,13 +401,16 @@ pub enum Trigger {
     /// The server queued a running task (e.g. "Back up now" from the console).
     Server(RunningTask),
     /// The agent (local schedule or `backup` command): `client_trigger/add_backup_task`.
-    Local { trigger_type: u64 },
+    Local { trigger_type: u64, trigger_event: Option<u64> },
 }
 
 /// `trigger_type` for `add_backup_task`: 2 for scheduled runs, as the official agent does,
 /// 1 for manual runs.
 pub const TRIGGER_SCHEDULE: u64 = 2;
 pub const TRIGGER_MANUAL: u64 = 1;
+/// Event trigger (`trigger_event` 3 = system startup).
+pub const TRIGGER_EVENT: u64 = 3;
+pub const EVENT_STARTUP: u64 = 3;
 
 const LOCK: &str = "/run/lock/abb-agent.lock";
 fn flock(path: &str, create: bool, wait: bool) -> Result<Option<std::fs::File>> {
@@ -333,17 +433,60 @@ fn flock(path: &str, create: bool, wait: bool) -> Result<Option<std::fs::File>> 
 /// Disks with their intervals, and the partitions of the volumes to prepare.
 type Scan = (Vec<(Disk, Vec<Interval>)>, Vec<Partition>);
 
-fn scan_disks() -> Result<Scan> {
+/// Disks and volumes to back up for `sel`. Without `disks` in the configuration every internal
+/// disk is a candidate; disks without a GPT table are skipped (with a warning, and the backup is
+/// partial if they have partitions), and disks with nothing selected are not sent.
+fn scan_disks(sel: &Selection) -> Result<(Scan, bool)> {
     let cfg = crate::config::get();
-    let names = if cfg.disks.is_empty() { vec![disk::system_disk()?] } else { cfg.disks.clone() };
+    let explicit = !cfg.disks.is_empty();
+    let names = if explicit { cfg.disks.clone() } else { disk::internal_disks()? };
     let mut disks = Vec::new();
     let mut volume_parts = Vec::new();
+    let mut missed = false;
     for n in names {
-        let d = disk::scan(&n)?;
-        let iv = plan(&d, &mut volume_parts, cfg.ext.freeze_mounted);
+        let d = match disk::scan(&n) {
+            Ok(d) => d,
+            Err(e) if !explicit => {
+                let has_parts = disk::has_partitions(&n);
+                eprintln!("{n}: not backed up: {e}");
+                missed |= has_parts;
+                continue;
+            }
+            Err(e) => return Err(Error::Protocol(format!("{n}: {e}"))),
+        };
+        let mut parts = Vec::new();
+        let iv = plan(&d, &mut parts, cfg.ext.freeze_mounted, sel);
+        let wanted = *sel == Selection::WholeDevice
+            || iv.iter().any(|i| i.part.is_some() && !matches!(i.source, Source::Excluded(_)));
+        if !wanted {
+            continue;
+        }
+        // Volume indices are global across disks.
+        let base = volume_parts.len();
+        let iv = iv
+            .into_iter()
+            .map(|mut i| {
+                if let Source::Vol(v) = i.source {
+                    i.source = Source::Vol(base + v);
+                }
+                i
+            })
+            .collect();
+        volume_parts.extend(parts);
         disks.push((d, iv));
     }
-    Ok((disks, volume_parts))
+    if let Selection::Custom(list) = sel {
+        for m in list {
+            if !disks.iter().any(|(d, _)| d.partitions.iter().any(|p| p.mounts.contains(m))) {
+                eprintln!("selected volume {m}: not found");
+                missed = true;
+            }
+        }
+    }
+    if disks.is_empty() {
+        return Err(Error::Protocol("nothing to back up".into()));
+    }
+    Ok(((disks, volume_parts), missed))
 }
 
 fn remove_stale_snapshots(volume_parts: &[Partition]) {
@@ -360,8 +503,8 @@ fn remove_stale_snapshots(volume_parts: &[Partition]) {
 /// system), if no backup is running.
 pub fn startup_cleanup() {
     let Ok(Some(_lock)) = flock(LOCK, true, false) else { return };
-    match scan_disks() {
-        Ok((_, parts)) => remove_stale_snapshots(&parts),
+    match scan_disks(&Selection::WholeDevice) {
+        Ok(((_, parts), _)) => remove_stale_snapshots(&parts),
         Err(e) => eprintln!("cleaning up leftover snapshots: {e}"),
     }
 }
@@ -379,18 +522,20 @@ pub fn run(sess: &Session, trigger: Trigger) -> Result<()> {
         _shared.push(flock(l, false, true)?);
     }
 
-    let (disks, volume_parts) = scan_disks()?;
+    let mut c = sess.connect()?;
+    let tasks = sess.tasks(&mut c)?;
+    let task = match &trigger {
+        Trigger::Server(rt) => tasks.iter().find(|t| t.get("id").and_then(Value::as_int) == Some(rt.task_id)),
+        Trigger::Local { .. } => tasks.first(),
+    }
+    .and_then(TaskInfo::parse)
+    .ok_or_else(|| Error::Protocol("no task for this device".into()))?;
+    let (task_id, task_uuid, selection) = (task.id, task.uuid.clone(), task.selection.clone());
+    eprintln!("source: {selection:?}");
+
+    let ((disks, volume_parts), missed) = scan_disks(&selection)?;
     remove_stale_snapshots(&volume_parts);
 
-    let mut c = sess.connect()?;
-    let (task_id, task_uuid) = match &trigger {
-        Trigger::Server(rt) => (rt.task_id, rt.task_uuid.clone()),
-        Trigger::Local { .. } => {
-            let tasks = sess.tasks(&mut c)?;
-            let t = tasks.first().ok_or_else(|| Error::Protocol("no task for this device".into()))?;
-            (get_int(t, "id")?, t.get("task_uuid").and_then(Value::as_str).unwrap_or("").to_string())
-        }
-    };
     let base = sess.call(
         &mut c,
         "client_trigger",
@@ -415,20 +560,20 @@ pub fn run(sess: &Session, trigger: Trigger) -> Result<()> {
             )?;
             (rt, upd)
         }
-        Trigger::Local { trigger_type } => {
-            let upd = sess.call(
-                &mut c,
-                "client_trigger",
-                vec![
-                    ("subaction", Value::str("add_backup_task")),
-                    ("base_version_id", Value::Int(base_version_id)),
-                    ("check_point_backup", Value::Int(0)),
-                    ("is_cache", Value::Int(0)),
-                    ("is_cbt", Value::Int(is_cbt)),
-                    ("task_id", Value::Int(task_id)),
-                    ("trigger_type", Value::Int(trigger_type)),
-                ],
-            )?;
+        Trigger::Local { trigger_type, trigger_event } => {
+            let mut fields = vec![
+                ("subaction", Value::str("add_backup_task")),
+                ("base_version_id", Value::Int(base_version_id)),
+                ("check_point_backup", Value::Int(0)),
+                ("is_cache", Value::Int(0)),
+                ("is_cbt", Value::Int(is_cbt)),
+                ("task_id", Value::Int(task_id)),
+                ("trigger_type", Value::Int(trigger_type)),
+            ];
+            if let Some(ev) = trigger_event {
+                fields.push(("trigger_event", Value::Int(ev)));
+            }
+            let upd = sess.call(&mut c, "client_trigger", fields)?;
             let rt = RunningTask { running_task_id: get_int(&upd, "running_task_id")?, task_id, task_uuid, status: 1 };
             (rt, upd)
         }
@@ -439,21 +584,31 @@ pub fn run(sess: &Session, trigger: Trigger) -> Result<()> {
     let mut last = LastRun::load();
     last.start = start_time;
     last.status = "running".into();
+    last.result_id = result_id;
+    last.server_status = String::new();
     let _ = last.save();
     let run_name = format!("abb-{start_time}");
     let job = Job { sess, rt: rt.clone(), result_id, run_name: run_name.clone() };
+    control::begin(rt.running_task_id, Some(task.schedule.clone()));
+    match sess.call(&mut c, "get_backup_bandwidth", vec![]) {
+        Ok(r) => control::set_bandwidth(r.get("backup_bandwidth").and_then(Value::as_int).unwrap_or(0)),
+        Err(e) => eprintln!("get_backup_bandwidth: {e}"),
+    }
     eprintln!(
         "backup {}: task {task_id}, running_task {} version {version_id} (base {base_version_id})",
         if is_cbt == 1 { "incremental" } else { "full" },
         rt.running_task_id
     );
 
-    let outcome = run_inner(&job, &mut c, start_time, &disks, &volume_parts, prev.as_deref(), version_id);
+    let outcome = run_inner(&job, &mut c, &task, start_time, &disks, &volume_parts, prev.as_deref(), version_id)
+        .map(|complete| complete && !missed);
     let status = match &outcome {
         Ok(true) => "complete",
         Ok(false) => "partial",
+        Err(_) if control::cancelled() => "cancel",
         Err(_) => "error",
     };
+    control::end();
     if let Err(e) = &outcome {
         eprintln!("backup failed: {e}");
     }
@@ -498,9 +653,11 @@ fn prepare_volumes(volume_parts: &[Partition], run_name: &str, mut each: impl Fn
 }
 
 /// `Ok(true)` complete backup, `Ok(false)` partial.
+#[allow(clippy::too_many_arguments)]
 fn run_inner(
     job: &Job,
     c: &mut Connection,
+    task: &TaskInfo,
     start_time: u64,
     disks: &[(Disk, Vec<Interval>)],
     volume_parts: &[Partition],
@@ -509,13 +666,21 @@ fn run_inner(
 ) -> Result<bool> {
     let sess = job.sess;
     job.log(c, LOG_DEVICE_INFO, None);
+    scripts::run(job, c, &task.scripts, Hook::Pre, version_id)?;
     let t = Instant::now();
     let volumes = {
         let c = &mut *c;
         prepare_volumes(volume_parts, &job.run_name, |p, done| {
             job.log(c, if done { LOG_SNAPSHOT_DONE } else { LOG_SNAPSHOT_START }, Some(&alias(p)))
-        })?
+        })
     };
+    // The post script runs right after the snapshots, whether they succeeded or not.
+    let post = scripts::run(job, c, &task.scripts, Hook::Post, version_id);
+    let volumes = volumes?;
+    if let Err(e) = post {
+        volumes.into_iter().for_each(Vol::cleanup);
+        return Err(e);
+    }
     let snapshot_time = t.elapsed();
     let result = (|| -> Result<bool> {
         let used: Vec<u64> = disks.iter().map(|(d, iv)| used_estimate(iv, &volumes, d)).collect();
@@ -565,7 +730,7 @@ pub fn bench(names: Vec<String>, freeze_ext: bool, limit: Option<u64>) -> Result
     let mut volume_parts = Vec::new();
     for n in names {
         let d = disk::scan(&n)?;
-        let iv = plan(&d, &mut volume_parts, freeze_ext);
+        let iv = plan(&d, &mut volume_parts, freeze_ext, &Selection::WholeDevice);
         disks.push((d, iv));
     }
     for (d, iv) in &disks {
