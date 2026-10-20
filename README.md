@@ -39,6 +39,56 @@ Disks must use GPT partition tables.
 This project is not affiliated with, endorsed or supported by Synology Inc. "Synology" and
 "Active Backup for Business" are trademarks of Synology Inc.
 
+## Quick start
+
+![abb-agent connecting to the NAS and reporting its first backup](docs/screenshots/agent-terminal.png)
+
+1. **On the NAS**: install *Active Backup for Business* from the Package Center. In ABB →
+   *Settings* → *Template*, check that the default template points to an existing shared folder
+   (new devices take their destination from it). Use a DSM account allowed to use ABB.
+2. **Install** abb-agent. On Arch Linux, from the AUR:
+
+   ```sh
+   yay -S abb-agent-bin      # prebuilt; or `abb-agent` to build it from source
+   ```
+
+   On other distributions see [Install](#install).
+3. **Connect** the machine to the NAS (the password is asked, a two-factor code too if enabled):
+
+   ```sh
+   sudo abb-agent connect -a nas.local -u admin
+   ```
+
+   The device and its backup task appear in the ABB console. Rename the task or set its
+   retention there if you like.
+4. **Configure** `/etc/abb-agent.toml`. As installed it contains only comments: uncomment at least
+   the disks to back up, e.g. `disks = ["system"]`, and the schedule you want.
+5. **Start** the service. The first backup runs right away (after every boot by default), the
+   following ones are incremental:
+
+   ```sh
+   sudo systemctl enable --now abb-agent abb-agent-fixup
+   sudo abb-agent status
+   ```
+
+To **restore** a whole machine, boot any Linux live USB, download `abb-restore` from the
+[latest release](https://github.com/rylos/abb-agent/releases/latest) and run `sudo ./abb-restore`
+(see [Restore](#restore)).
+
+## Screenshots
+
+The machine in the ABB console, as any other physical server:
+
+![The Linux device in the Active Backup for Business console](docs/screenshots/abb-console.png)
+
+`abb-restore`, the bare-metal restore for live systems:
+
+| | |
+|---|---|
+| ![Welcome page: network and local disks](docs/screenshots/restore-welcome.png) | ![Device and task of the backup](docs/screenshots/restore-tasks.png) |
+| ![Restore mode](docs/screenshots/restore-mode.png) | ![Versions and their contents](docs/screenshots/restore-versions.png) |
+| ![Disk mapping, with btrfs subvolumes left out](docs/screenshots/restore-mapping.png) | ![Restore in progress](docs/screenshots/restore-progress.png) |
+
 ## Why
 
 The official Linux agent relies on a kernel module (`synosnap`) that tracks block writes.
@@ -82,7 +132,18 @@ See [Supported filesystems](#supported-filesystems) for what is left out.
 
 ### Arch Linux
 
-Download the package from the [latest release](https://github.com/rylos/abb-agent/releases/latest)
+From the AUR, with any AUR helper:
+
+| package | |
+|---|---|
+| [`abb-agent-bin`](https://aur.archlinux.org/packages/abb-agent-bin) | the release binaries, installs in seconds |
+| [`abb-agent`](https://aur.archlinux.org/packages/abb-agent) | built from the release source |
+
+```sh
+yay -S abb-agent-bin
+```
+
+Or download the package from the [latest release](https://github.com/rylos/abb-agent/releases/latest)
 and install it:
 
 ```sh
@@ -140,6 +201,15 @@ cargo build --release --target x86_64-unknown-linux-musl -p abb-restore
    sudo systemctl enable --now abb-agent
    sudo systemctl enable abb-agent-fixup   # only needed if you exclude subvolumes
    ```
+
+### Troubleshooting
+
+| message | what to do |
+|---|---|
+| `server error 0x1005: Requires OTP` | the account has two-factor authentication: enter the code when asked, or pass `--otp <code>` |
+| `server error 0x100f: Create Task Failed due to invalid parameters` | the default template's destination does not exist: fix it in ABB → *Settings* → *Template*, then connect again |
+| `permission denied: run it with sudo` | the agent's state is readable by root only |
+| backup ends with `partial` | a volume could not be backed up (unsupported filesystem, read-write mounted ext volume…): see `journalctl -u abb-agent` |
 
 Other commands:
 

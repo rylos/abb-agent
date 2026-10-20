@@ -1,16 +1,16 @@
-# Maintainer: Marco Ziliani
+# Maintainer: Marco Ziliani (rylos)
 pkgname=abb-agent-git
 _pkgname=abb-agent
 pkgver=0.1.0
 pkgrel=1
-pkgdesc="Image backup agent and bare-metal restore for Synology Active Backup for Business (btrfs, ext2/3/4)"
+pkgdesc="Synology Active Backup for Business agent for any Linux distro and kernel, first-class btrfs, bare-metal restore (https://github.com/rylos/abb-agent)"
 arch=('x86_64' 'aarch64')
 url="https://github.com/rylos/abb-agent"
 license=('GPL-3.0-or-later')
 depends=('gcc-libs' 'glibc')
 makedepends=('cargo' 'git')
 provides=("$_pkgname")
-conflicts=("$_pkgname")
+conflicts=("$_pkgname" "$_pkgname-bin")
 backup=('etc/abb-agent.toml')
 # ring compiles C code: GCC LTO objects cannot be linked by the Rust toolchain.
 options=('!lto')

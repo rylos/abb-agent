@@ -79,6 +79,8 @@ struct App {
     /// Server waiting for the certificate to be confirmed, with its fingerprint.
     trust: Option<(Server, String)>,
     running: Option<Running>,
+    /// IPv4 addresses of this computer and whether there is a default route.
+    net: (Vec<String>, bool),
     quit: bool,
 }
 
@@ -116,6 +118,7 @@ pub fn run() {
         message: None,
         trust: None,
         running: None,
+        net: network(),
         quit: false,
     };
     let res = app.main_loop(&mut terminal);
@@ -250,7 +253,10 @@ impl App {
             Page::Welcome => match k.code {
                 KeyCode::Enter => self.page = Page::Login,
                 KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
-                KeyCode::Char('r') => self.locals = local::disks(),
+                KeyCode::Char('r') => {
+                    self.locals = local::disks();
+                    self.net = network();
+                }
                 _ => {}
             },
             Page::Login => self.key_login(k, terminal)?,
@@ -592,7 +598,7 @@ impl App {
 
     fn draw_welcome(&self, f: &mut Frame, head: Rect, body: Rect, foot: Rect) {
         header(f, head, "Before the recovery begins", 1);
-        let (ips, route) = network();
+        let (ips, route) = (&self.net.0, self.net.1);
         let mut lines = vec![
             Line::from("This tool restores a computer backed up by Active Backup for Business, from any Linux live system."),
             Line::from(""),
@@ -911,5 +917,194 @@ fn power(how: libc::c_int) {
     unsafe {
         libc::sync();
         libc::reboot(how);
+    }
+}
+
+/// Screenshots of the pages for the README, with made-up data, written as HTML to the directory
+/// in `ABB_SCREENSHOTS`: `ABB_SCREENSHOTS=/tmp/shots cargo test -p abb-restore screenshots -- --ignored`.
+#[cfg(test)]
+mod screenshots {
+    use super::*;
+    use crate::spec::{Disk, Partition};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+
+    const GIB: u64 = 1 << 30;
+    const DAY: u64 = 86400;
+    /// 2026-10-20 02:00 UTC.
+    const NOW: u64 = 1792461600;
+
+    fn part(number: u64, offset: u64, length: u64, mount: &str, fs: &str, attribute: u64) -> Partition {
+        let label = match attribute {
+            9 => "EFI system partition".to_string(),
+            _ => mount.to_string(),
+        };
+        Partition { number, offset, length, label, mount_path: mount.into(), device: String::new(), fs: fs.into(), attribute, excluded: false }
+    }
+
+    fn version(id: u64, time: u64) -> Version {
+        let nvme = Disk {
+            number: 0,
+            image_path: format!("ActiveBackup_{id}/nvme0n1.img"),
+            object_id: 1,
+            size: 2000398934016,
+            sector_size: 512,
+            gpt: true,
+            partitions: vec![part(1, 1 << 20, GIB, "/boot", "vfat", 9), part(2, GIB + (1 << 20), 2000398934016 - GIB - (2 << 20), "/", "btrfs", 0)],
+        };
+        let sda = Disk {
+            number: 1,
+            image_path: format!("ActiveBackup_{id}/sda.img"),
+            object_id: 2,
+            size: 1000204886016,
+            sector_size: 512,
+            gpt: true,
+            partitions: vec![part(1, 1 << 20, 1000204886016 - (2 << 20), "/data", "ext4", 0)],
+        };
+        Version { id, time, bootable: true, disks: vec![nvme, sda] }
+    }
+
+    fn local(name: &str, size: u64, model: &str, busy: Option<&str>) -> LocalDisk {
+        LocalDisk {
+            name: name.into(),
+            size,
+            sector_size: 512,
+            model: model.into(),
+            removable: busy.is_some(),
+            busy: busy.map(str::to_string),
+            partitions: vec![],
+            gpt: None,
+        }
+    }
+
+    fn task(host: &str, name: &str, os: &str, latest: u64) -> Task {
+        Task { device_id: 1, task_id: 1, task_name: name.into(), host_name: host.into(), os_name: os.into(), latest }
+    }
+
+    fn app() -> App {
+        let versions: Vec<Version> = (0..6).map(|i| version(10 - i, NOW - i * DAY)).collect();
+        let mut app = App {
+            page: Page::Welcome,
+            login: Login { fields: ["nas.local".into(), "admin".into(), "password1".into(), String::new()], focus: 2 },
+            server: None,
+            server_version: "3.2.1-25059, certificate 5f:3a:9c:e1:…:b2:07".into(),
+            tasks: vec![
+                task("laptop", "Laptop", "Linux - Debian GNU/Linux 13 (trixie)", NOW - DAY / 2),
+                task("media-pc", "Media PC", "Linux - Fedora Linux 43", NOW - 3 * DAY),
+                task("workstation", "Workstation", "Linux - Arch Linux", NOW),
+            ],
+            task_state: TableState::default().with_selected(Some(2)),
+            mode: 0,
+            versions,
+            version_state: ListState::default().with_selected(Some(0)),
+            chosen: vec![],
+            volume_cursor: 0,
+            locals: vec![
+                local("nvme0n1", 4000787030016, "WD_BLACK SN850X 4000GB", None),
+                local("sda", 1000204886016, "Samsung SSD 870 EVO 1TB", None),
+                local("sdb", 32015679488, "SanDisk Ultra Fit", Some("/dev/sdb1 is mounted on /run/archiso/bootmnt")),
+            ],
+            plan: None,
+            map_cursor: 0,
+            grow: true,
+            efi_fallback: true,
+            exclude: "@games".into(),
+            confirm: false,
+            message: None,
+            trust: None,
+            running: None,
+            net: (vec!["enp5s0: 192.168.1.50".into()], true),
+            quit: false,
+        };
+        let v = &app.versions[0];
+        let disks = plan::auto_map(v, &app.locals);
+        app.plan = Some(Plan { mode: Mode::Device, disks, volumes: vec![], grow: true, efi_fallback: true, exclude_subvolumes: vec!["@games".into()] });
+        app
+    }
+
+    fn color(c: Color, default: &str) -> String {
+        match c {
+            Color::Reset => default.into(),
+            Color::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
+            Color::White => "#ffffff".into(),
+            Color::DarkGray => "#7c8190".into(),
+            Color::Green => "#7fd17f".into(),
+            Color::Red => "#ef6f6f".into(),
+            Color::Yellow => "#e9c46a".into(),
+            c => panic!("no colour for {c:?}"),
+        }
+    }
+
+    fn html(buf: &Buffer) -> String {
+        let (fg0, bg0) = ("#d6dae2", "#16181d");
+        let mut out = format!(
+            "<!doctype html><meta charset=utf-8><style>body{{margin:0;background:{bg0}}}pre{{margin:0;padding:14px 16px;font:15px/1.17 'DejaVu Sans Mono',monospace;color:{fg0};background:{bg0}}}</style><pre>"
+        );
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                let c = &buf[(x, y)];
+                let mut style = format!("color:{};background:{}", color(c.fg, fg0), color(c.bg, "transparent"));
+                if c.modifier.contains(Modifier::BOLD) {
+                    style.push_str(";font-weight:bold");
+                }
+                let sym = c.symbol().replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+                out.push_str(&format!("<span style=\"{style}\">{sym}</span>"));
+            }
+            out.push('\n');
+        }
+        out.push_str("</pre>");
+        out
+    }
+
+    #[test]
+    #[ignore]
+    fn screenshots() {
+        let Ok(dir) = std::env::var("ABB_SCREENSHOTS") else { return };
+        // Fixed time zone, for the dates of the versions.
+        unsafe { std::env::set_var("TZ", "UTC") };
+        let mut app = app();
+        let shoot = |app: &mut App, name: &str| {
+            let mut t = Terminal::new(TestBackend::new(110, 26)).unwrap();
+            t.draw(|f| app.draw(f)).unwrap();
+            std::fs::write(format!("{dir}/{name}.html"), html(t.backend().buffer())).unwrap();
+        };
+        shoot(&mut app, "1-welcome");
+        app.page = Page::Login;
+        shoot(&mut app, "2-login");
+        app.page = Page::Tasks;
+        shoot(&mut app, "3-tasks");
+        app.page = Page::Mode;
+        shoot(&mut app, "4-mode");
+        app.page = Page::Versions;
+        shoot(&mut app, "5-versions");
+        app.page = Page::Mapping;
+        app.map_cursor = 4;
+        shoot(&mut app, "6-mapping");
+        app.page = Page::Summary;
+        shoot(&mut app, "7-summary");
+        let (_tx, rx) = channel();
+        let steps = [
+            "Preparing the disks",
+            "Starting the restore on the server",
+            "Restoring",
+            "/: superblock",
+            "/: chunk tree",
+            "/: metadata (3.1 GiB)",
+            "/: leaving out @games",
+            "/: data (412.6 GiB left out)",
+        ];
+        app.running = Some(Running {
+            rx,
+            cancel: Arc::new(AtomicBool::new(false)),
+            started: Instant::now() - Duration::from_secs(1311),
+            ended: None,
+            done: 287 * GIB,
+            total: 655 * GIB,
+            steps: steps.iter().map(|s| (false, s.to_string())).collect(),
+            result: None,
+        });
+        app.page = Page::Progress;
+        shoot(&mut app, "8-progress");
     }
 }

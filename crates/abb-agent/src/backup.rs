@@ -59,6 +59,16 @@ pub enum Selection {
     Custom(Vec<String>),
 }
 
+impl std::fmt::Display for Selection {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Selection::WholeDevice => f.write_str("entire device"),
+            Selection::System => f.write_str("system volumes"),
+            Selection::Custom(paths) => write!(f, "custom volumes: {}", paths.join(", ")),
+        }
+    }
+}
+
 impl Selection {
     /// From a `get_task` entry: `source_type` and `custom_volume` (a JSON array of mount paths,
     /// sent as a string).
@@ -564,7 +574,7 @@ fn run_locked(sess: &Session, trigger: Trigger) -> Result<()> {
     .and_then(TaskInfo::parse)
     .ok_or_else(|| Error::Protocol("no task for this device".into()))?;
     let (task_id, task_uuid, selection) = (task.id, task.uuid.clone(), task.selection.clone());
-    eprintln!("source: {selection:?}");
+    eprintln!("source: {selection}");
 
     let ((disks, volume_parts), missed) = scan_disks(&selection)?;
     remove_stale_snapshots(&volume_parts);

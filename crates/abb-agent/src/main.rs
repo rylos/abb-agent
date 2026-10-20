@@ -154,13 +154,16 @@ fn prompt_password(user: &str) -> String {
 }
 
 fn load() -> Session {
-    let state = State::load().unwrap_or_else(|e| die(format!("cannot read state ({e}): run `abb-agent connect` first")));
+    let state = State::load().unwrap_or_else(|e| match e.kind() {
+        std::io::ErrorKind::PermissionDenied => die("permission denied: run it with sudo"),
+        _ => die(format!("cannot read state ({e}): run `abb-agent connect` first")),
+    });
     Session::new(state)
 }
 
 fn status() {
     let sess = load();
-    println!("server {}:{}  user {}  device {}", sess.state.server, sess.state.port, sess.state.username, sess.state.device_uuid);
+    println!("server {}:{} · user {} · device {}", sess.state.server, sess.state.port, sess.state.username, sess.state.device_uuid);
     sess.auth_by_token(false).unwrap_or_else(|e| die(e));
     let mut c = sess.connect().unwrap_or_else(|e| die(e));
     let tasks = sess.tasks(&mut c).unwrap_or_else(|e| die(e));
@@ -171,7 +174,7 @@ fn status() {
             t.get("name").and_then(|v| v.as_str()).unwrap_or(""),
         );
         if let Some(info) = task::TaskInfo::parse(t) {
-            println!("  source: {:?}", info.selection);
+            println!("  source: {}", info.selection);
             let sch = &info.schedule;
             if sch.is_scheduled() {
                 println!(
@@ -187,9 +190,7 @@ fn status() {
             }
         }
     }
-    for rt in sess.running_tasks(&mut c).unwrap_or_else(|e| die(e)) {
-        println!("queued/running: {rt:?}");
-    }
+    let running = sess.running_tasks(&mut c).unwrap_or_else(|e| die(e));
     let last = state::LastRun::load();
     let sc = &config::get().schedule;
     println!(
@@ -198,19 +199,30 @@ fn status() {
         if sc.interval_hours == 0 { "-".into() } else { sc.interval_hours.to_string() },
         sc.retry_minutes
     );
-    println!(
-        "last backup: start {} end {} result {:?}{}",
-        fmt_time(last.start),
-        fmt_time(last.end),
-        last.status,
-        if last.server_status.is_empty() { String::new() } else { format!(", on the server {:?}", last.server_status) }
-    );
+    if last.status == "running" {
+        println!("backup in progress, started {}", fmt_time(last.start));
+    } else if !running.is_empty() {
+        let what = if running.iter().any(|r| r.status == 1) { "running" } else { "queued" };
+        println!("backup {what} on the server");
+    }
+    if last.status != "running" && last.start != 0 {
+        println!(
+            "last backup: {} → {}, {}{}",
+            fmt_time(last.start),
+            fmt_time(last.end),
+            last.status,
+            if last.server_status.is_empty() { String::new() } else { format!(" (on the server: {})", last.server_status) }
+        );
+    } else if last.last_ok_start != 0 {
+        println!("last successful backup: started {}", fmt_time(last.last_ok_start));
+    }
     if let Ok(off) = sess.server_offset(&mut c) {
         control::set_server_offset(off);
     }
     let console = tasks.first().and_then(task::TaskInfo::parse).and_then(|t| scheduler::console_due(&t));
     let local = scheduler::local_due(sc, &last).map(|d| d.0.max(host::now()));
     match [console, local].into_iter().flatten().min() {
+        _ if last.status == "running" || !running.is_empty() => {}
         Some(t) => println!("next backup: {}", fmt_time(t)),
         None => println!("next backup: when started from the console or with `abb-agent backup`"),
     }
