@@ -1,5 +1,11 @@
 # abb-agent
 
+<h3 align="center">
+An Active Backup for Business agent that runs on any Linux distribution and any kernel, 7.x
+included: no kernel module to build, nothing to break on the next update.<br>
+The way it should have been from the start.
+</h3>
+
 A Linux agent for **Synology Active Backup for Business** (ABB) that makes full-disk image
 backups of machines whose root filesystem is **btrfs**, and also of ext2/3/4 volumes. It talks to an
 unmodified ABB server: the device shows up in the ABB console like any other physical
