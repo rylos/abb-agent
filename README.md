@@ -14,6 +14,23 @@ server, backups are versioned, deduplicated and restorable with Synology's tools
 Written in **Rust**: one self-contained binary, memory-safe by design. It needs
 no kernel module and no Synology binaries.
 
+## Supported filesystems
+
+> ### 🟢 btrfs: first-class support
+> The filesystem the official agent cannot back up. abb-agent reads btrfs natively: read-only
+> snapshots of every subvolume, only the blocks in use, every data block verified against the
+> btrfs checksums, incremental backups from btrfs metadata, subvolumes that can be left out.
+
+| filesystem | backup | incremental | notes |
+|---|---|---|---|
+| **btrfs** | ✅ | ✅ | single device, any subvolume layout (`@`, `@home`, snapper, btrbk…) |
+| **ext4** | ✅ | ✅ | read-write mounted volumes are skipped, or frozen if you allow it |
+| **ext3**, **ext2** | ✅ | ✅ | as ext4 |
+| vfat (EFI system partition), BIOS boot | ✅ | ✅ | copied as they are |
+| XFS, LVM, LUKS, md-raid, multi-device btrfs | ❌ | | left out, the backup is reported as partial |
+
+Disks must use GPT partition tables.
+
 > **Status: experimental.** Backups and incremental backups work and have been verified
 > by checking the images stored on the server (`btrfs check`, scrub, `e2fsck`, file
 > comparison) and by booting them. Bare-metal restore with the ABB recovery media is
@@ -52,8 +69,7 @@ read-only snapshots and a bit of care.
 - Parallel read, verification and LZ4 compression (several GB/s on NVMe).
 - Mutual exclusion with other backup jobs through lock files.
 
-Not supported yet: MBR disks, LVM, LUKS, md-raid, multi-device btrfs, XFS. Partitions of these
-kinds are left out of the image and the backup is reported as partial.
+See [Supported filesystems](#supported-filesystems) for what is left out.
 
 ## Requirements
 
