@@ -3,7 +3,7 @@ pkgname=abb-agent-git
 _pkgname=abb-agent
 pkgver=0.1.0
 pkgrel=1
-pkgdesc="Image backup agent for Synology Active Backup for Business (btrfs, ext2/3/4)"
+pkgdesc="Image backup agent and bare-metal restore for Synology Active Backup for Business (btrfs, ext2/3/4)"
 arch=('x86_64' 'aarch64')
 url="https://github.com/rylos/abb-agent"
 license=('GPL-3.0-or-later')
@@ -30,7 +30,7 @@ build() {
   cd "$_pkgname"
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
-  cargo build --frozen --release -p abb-agent
+  cargo build --frozen --release -p abb-agent -p abb-restore
 }
 
 check() {
@@ -42,6 +42,7 @@ check() {
 package() {
   cd "$_pkgname"
   install -Dm755 target/release/abb-agent "$pkgdir/usr/bin/abb-agent"
+  install -Dm755 target/release/abb-restore "$pkgdir/usr/bin/abb-restore"
   install -Dm644 packaging/systemd/abb-agent.service "$pkgdir/usr/lib/systemd/system/abb-agent.service"
   install -Dm644 packaging/systemd/abb-agent-fixup.service "$pkgdir/usr/lib/systemd/system/abb-agent-fixup.service"
   install -Dm644 packaging/abb-agent.toml "$pkgdir/etc/abb-agent.toml"
