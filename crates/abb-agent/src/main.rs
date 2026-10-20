@@ -25,8 +25,10 @@ use std::io::{BufRead, Write};
 use std::time::{Duration, Instant};
 
 const USAGE: &str = "usage:
-  abb-agent connect -a <server> -u <user> [-p <port>]    pair this computer with the ABB server
-                                                         (password from ABB_PASSWORD or prompted)
+  abb-agent connect -a <server> -u <user> [-p <port>] [--otp <code>]
+                                                         pair this computer with the ABB server
+                                                         (password from ABB_PASSWORD or prompted,
+                                                         two-factor code prompted when needed)
   abb-agent status                                       connection and task status
   abb-agent daemon                                       service: heartbeat, events, scheduled backups
   abb-agent backup                                       back up now, in the foreground
@@ -55,7 +57,19 @@ fn main() {
             let user = opt("-u").unwrap_or_else(|| usage());
             let port = opt("-p").map_or(DEFAULT_PORT, |p| p.parse().unwrap_or_else(|_| usage()));
             let password = std::env::var("ABB_PASSWORD").unwrap_or_else(|_| prompt_password(&user));
-            let state = session::pair(&server, port, &user, &password, None).unwrap_or_else(|e| die(e));
+            let otp = opt("--otp");
+            let state = match session::pair(&server, port, &user, &password, otp.as_deref()) {
+                // 0x1005: the account has two-factor authentication and no code was given.
+                Err(abb_proto::Error::Server { code: 0x1005, .. }) if otp.is_none() => {
+                    eprint!("two-factor code for {user}: ");
+                    let _ = std::io::stderr().flush();
+                    let mut code = String::new();
+                    let _ = std::io::stdin().lock().read_line(&mut code);
+                    session::pair(&server, port, &user, &password, Some(code.trim()))
+                }
+                r => r,
+            }
+            .unwrap_or_else(|e| die(e));
             state.save().unwrap_or_else(|e| die(e));
             println!("paired with {server} as {user}: device and task created on the server");
         }
