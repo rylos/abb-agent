@@ -1,0 +1,18 @@
+[Unit]
+Description=Image backup agent for Synology Active Backup for Business
+Documentation=https://github.com/rylos/abb-agent
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/abb-agent daemon
+Restart=on-failure
+RestartSec=30
+# Backups run in the background: keep the machine responsive.
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+[Install]
+WantedBy=multi-user.target

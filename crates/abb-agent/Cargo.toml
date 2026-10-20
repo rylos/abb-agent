@@ -1,0 +1,17 @@
+[package]
+name = "abb-agent"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Linux agent for Synology Active Backup for Business, with btrfs image backup"
+
+[dependencies]
+abb-proto.workspace = true
+btrfs-image.workspace = true
+ext-image.workspace = true
+libc = "0.2"
+lz4_flex = { version = "0.11", default-features = false, features = ["std", "safe-encode", "safe-decode"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }

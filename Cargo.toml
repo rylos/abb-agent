@@ -1,0 +1,15 @@
+[workspace]
+resolver = "3"
+members = ["crates/abb-agent", "crates/abb-proto", "crates/btrfs-image", "crates/ext-image"]
+
+[workspace.package]
+edition = "2024"
+license = "GPL-3.0-or-later"
+
+[workspace.dependencies]
+abb-proto = { path = "crates/abb-proto" }
+btrfs-image = { path = "crates/btrfs-image" }
+ext-image = { path = "crates/ext-image" }
+
+[profile.release]
+lto = true

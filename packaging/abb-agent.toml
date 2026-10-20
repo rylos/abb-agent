@@ -1,0 +1,34 @@
+# abb-agent configuration. Every setting is optional: the values shown are the defaults.
+# Apply changes with `systemctl restart abb-agent`; `abb-agent config` shows the
+# configuration in effect.
+#
+# The server connection (address, token, certificate fingerprint) is not configured here:
+# `abb-agent connect` creates it in /var/lib/abb-agent.
+
+# Disks to back up, by kernel name (see `lsblk`). Each disk becomes one image on the server
+# and is restored as a whole: partition table, boot partitions and all volumes.
+# Empty: the disk that holds the root filesystem.
+disks = []
+
+[schedule]
+# Back up once after every boot, as soon as the server is reachable.
+on_boot = true
+# Hours between backups while the machine stays on (0 = only after boot).
+interval_hours = 24
+# Minutes before retrying a failed backup.
+retry_minutes = 60
+# Lock files to wait for before starting, so that other backup jobs do not run at the same
+# time (abb-agent takes an exclusive flock on each). Missing files are ignored.
+# Example: wait_locks = ["/run/lock/backup-nas.lock"]
+wait_locks = []
+
+[ext]
+# ext2/3/4 filesystems mounted read-write cannot be imaged consistently without a snapshot.
+# false: they are skipped and the backup is reported as partial.
+# true: they are frozen (fsfreeze) from the start of the backup until the upload ends, so
+# writers to them block meanwhile. Never applied to filesystems holding /, /var or /tmp.
+freeze_mounted = false
+
+[performance]
+# Threads that read, verify and compress data (0 = one per CPU, at most 8).
+workers = 0

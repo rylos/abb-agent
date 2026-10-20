@@ -1,0 +1,49 @@
+# Maintainer: Marco Ziliani
+pkgname=abb-agent-git
+_pkgname=abb-agent
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Image backup agent for Synology Active Backup for Business (btrfs, ext2/3/4)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/rylos/abb-agent"
+license=('GPL-3.0-or-later')
+depends=('gcc-libs' 'glibc')
+makedepends=('cargo' 'git')
+provides=("$_pkgname")
+conflicts=("$_pkgname")
+backup=('etc/abb-agent.toml')
+source=("$_pkgname::git+$url.git")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "$_pkgname"
+  printf "0.1.0.r%s.g%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+prepare() {
+  cd "$_pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$_pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release -p abb-agent
+}
+
+check() {
+  cd "$_pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo test --frozen --release
+}
+
+package() {
+  cd "$_pkgname"
+  install -Dm755 target/release/abb-agent "$pkgdir/usr/bin/abb-agent"
+  install -Dm644 packaging/systemd/abb-agent.service "$pkgdir/usr/lib/systemd/system/abb-agent.service"
+  install -Dm644 packaging/abb-agent.toml "$pkgdir/etc/abb-agent.toml"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$_pkgname/README.md"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
