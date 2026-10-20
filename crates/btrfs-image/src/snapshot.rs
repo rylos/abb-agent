@@ -133,6 +133,52 @@ fn ino_lookup(top: &File, treeid: u64, objectid: u64) -> Result<PathBuf, Error> 
     Ok(PathBuf::from(String::from_utf8_lossy(&args.name[..len]).into_owned()))
 }
 
+/// Subvolumes deleted but not yet dropped by the btrfs cleaner (orphan items of the root tree).
+fn pending_deletions(top: &File) -> Result<u32, Error> {
+    // _IOWR(0x94, 17, struct btrfs_ioctl_search_args), 4096 bytes.
+    const IOC_TREE_SEARCH: libc::c_ulong = 0xd000_9411;
+    const ORPHAN_OBJECTID: u64 = u64::MAX - 4;
+    const ORPHAN_ITEM_KEY: u32 = 48;
+    let mut args = [0u8; 4096];
+    let key = [1u64, ORPHAN_OBJECTID, ORPHAN_OBJECTID, 0, u64::MAX, 0, u64::MAX];
+    for (i, v) in key.iter().enumerate() {
+        args[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+    }
+    args[56..60].copy_from_slice(&ORPHAN_ITEM_KEY.to_le_bytes());
+    args[60..64].copy_from_slice(&ORPHAN_ITEM_KEY.to_le_bytes());
+    args[64..68].copy_from_slice(&4096u32.to_le_bytes());
+    if unsafe { libc::ioctl(top.as_raw_fd(), IOC_TREE_SEARCH as _, args.as_mut_ptr()) } < 0 {
+        return Err(os_err("BTRFS_IOC_TREE_SEARCH"));
+    }
+    Ok(u32::from_le_bytes(args[64..68].try_into().unwrap()))
+}
+
+/// Waits until btrfs has finished dropping deleted subvolumes, as `btrfs subvolume sync` does.
+/// Until then their blocks still count as in use in the committed trees, but the cleaner frees
+/// them and new writes can reuse them while the backup reads the device: the image would hold
+/// other data than its checksums say.
+pub fn wait_deletions(top: &Path, timeout: std::time::Duration) -> Result<(), Error> {
+    let f = open_dir(top)?;
+    let start = std::time::Instant::now();
+    let mut told = false;
+    loop {
+        let n = pending_deletions(&f)?;
+        if n == 0 {
+            return Ok(());
+        }
+        if !told {
+            eprintln!("waiting for btrfs to finish deleting {n} subvolumes");
+            told = true;
+        }
+        if start.elapsed() > timeout {
+            return Err(Error::Format(format!("btrfs is still deleting {n} subvolumes after {} min", timeout.as_secs() / 60)));
+        }
+        // A commit wakes the cleaner up.
+        unsafe { libc::ioctl(f.as_raw_fd(), IOC_SYNC as _) };
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+}
+
 /// Commits the running transaction (BTRFS_IOC_SYNC): the on-disk superblock becomes current.
 pub fn sync(top: &Path) -> Result<(), Error> {
     let f = open_dir(top)?;

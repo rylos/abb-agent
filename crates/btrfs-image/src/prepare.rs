@@ -82,6 +82,12 @@ pub fn prepare(
 ) -> Result<Prepared, Error> {
     let t = Instant::now();
     let (top, mounted_by_us) = top_mount(dev, uuid)?;
+    if let Err(e) = snapshot::wait_deletions(&top, std::time::Duration::from_secs(30 * 60)) {
+        if mounted_by_us {
+            top_unmount(&top);
+        }
+        return Err(e);
+    }
     let run_dir = top.join(SNAP_DIR).join(run_name);
     std::fs::create_dir_all(&run_dir)?;
 
