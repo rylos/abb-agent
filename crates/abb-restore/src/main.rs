@@ -1,6 +1,7 @@
 //! abb-restore: bare-metal restore from Synology Active Backup for Business. One static
 //! binary to run from any Linux live system: a guided text interface, or commands for scripts.
 
+mod btrfs;
 mod fs;
 mod gpt;
 mod local;
@@ -29,6 +30,8 @@ const USAGE: &str = "usage:
      mode: --device [--map <disk>=<local disk>]…   every disk (default mapping: automatic)
            --system [--map <disk>=<local disk>]…   only the volumes needed to boot, in place
            --volume <volume>=<local disk>:free|<local partition number>…
+     --exclude-subvolume <pattern>…   leave btrfs subvolumes out (e.g. @games): their data is not
+                                      downloaded, their snapshots go with them, they come back empty
   options: -p <port>, --otp <code>; the password comes from ABB_PASSWORD or is asked for.
 
 Disks of the backup are named as on the original machine (sda, nvme0n1); volumes by mount path
@@ -173,7 +176,7 @@ fn main() {
                 None => versions.first().unwrap_or_else(|| die("the task has no version")),
             };
             let disk_index = |name: &str| v.disks.iter().position(|d| d.name() == name).unwrap_or_else(|| die(format!("no disk {name} in the backup")));
-            let mut plan = Plan { mode, disks: vec![None; v.disks.len()], volumes: vec![], grow: has("--grow"), efi_fallback: !has("--no-efi-fallback") };
+            let mut plan = Plan { mode, disks: vec![None; v.disks.len()], volumes: vec![], grow: has("--grow"), efi_fallback: !has("--no-efi-fallback"), exclude_subvolumes: opts("--exclude-subvolume") };
             match mode {
                 Mode::Device | Mode::System => {
                     let maps = opts("--map");

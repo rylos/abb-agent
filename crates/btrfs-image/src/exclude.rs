@@ -34,6 +34,8 @@ const ROOT_SUBVOL_DEAD: u64 = 1 << 48;
 pub struct Exclusion {
     /// Excluded subvolumes (paths from the top level).
     pub subvolumes: Vec<PathBuf>,
+    /// Their ids, in the same order.
+    pub ids: Vec<u64>,
     /// Edited tree nodes, by logical address.
     pub nodes: HashMap<u64, Vec<u8>>,
     /// Data extents not sent: (logical, length), sorted.
@@ -237,9 +239,117 @@ pub fn plan(
         })?;
     }
 
-    let mut paths: Vec<PathBuf> = subvols.iter().filter(|s| excluded.contains(&s.id)).map(|s| s.path.clone()).collect();
-    paths.sort();
-    Ok(Some(Exclusion { subvolumes: paths, nodes: ed.finish(), data }))
+    let mut gone: Vec<&Subvolume> = subvols.iter().filter(|s| excluded.contains(&s.id)).collect();
+    gone.sort_by(|a, b| a.path.cmp(&b.path));
+    let (subvolumes, ids) = gone.iter().map(|s| (s.path.clone(), s.id)).unzip();
+    Ok(Some(Exclusion { subvolumes, ids, nodes: ed.finish(), data }))
+}
+
+const INODE_REF_KEY: u8 = 12;
+const FIRST_FREE: u64 = 256;
+const LAST_FREE: u64 = u64::MAX - 256;
+
+/// Subvolumes of an unmounted filesystem (a restored disk), with their paths from the top level,
+/// read from the trees alone: ROOT_REF items and the INODE_REF chain of the directory holding
+/// each one.
+pub fn offline_subvolumes(fs: &Filesystem) -> Result<Vec<Subvolume>, Error> {
+    let mut refs = Vec::new();
+    fs.walk(fs.sb.root, 0, &mut |_, key, data| {
+        if key.kind == ROOT_REF_KEY && (FIRST_FREE..=LAST_FREE).contains(&key.offset) {
+            let name_len = u16_at(data, 16) as usize;
+            let name = String::from_utf8_lossy(&data[18..18 + name_len]).into_owned();
+            refs.push((key.objectid, key.offset, u64_at(data, 0), name));
+        }
+        Ok(())
+    })?;
+    let items = fs.root_items()?;
+    let tree_of = |id: u64| items.iter().find(|(i, _)| *i == id).map(|(_, d)| u64_at(d, 176));
+    let ed = Editor::new(fs);
+    let mut done: Vec<Subvolume> = Vec::new();
+    let mut pending = refs;
+    while !pending.is_empty() {
+        let before = pending.len();
+        let mut rest = Vec::new();
+        for (parent, id, dirid, name) in pending {
+            let parent_path = if parent == FS_TREE_OBJECTID {
+                Some(PathBuf::new())
+            } else {
+                done.iter().find(|s| s.id == parent).map(|s| s.path.clone())
+            };
+            let Some(pp) = parent_path else {
+                rest.push((parent, id, dirid, name));
+                continue;
+            };
+            let tree = tree_of(parent).ok_or_else(|| Error::Format(format!("tree of subvolume {parent} not found")))?;
+            // Directory path inside the parent, walking up to its root directory (256).
+            let mut parts = Vec::new();
+            let mut ino = dirid;
+            while ino != FIRST_FREE_OBJECTID {
+                let (key, data) = ed
+                    .find_first(tree, ino, INODE_REF_KEY)?
+                    .ok_or_else(|| Error::Format(format!("inode {ino} of subvolume {parent} has no name")))?;
+                let len = u16_at(&data, 8) as usize;
+                parts.push(String::from_utf8_lossy(&data[10..10 + len]).into_owned());
+                ino = key.offset;
+            }
+            let mut path = pp;
+            for p in parts.iter().rev() {
+                path.push(p);
+            }
+            done.push(Subvolume { id, parent, path: path.join(name) });
+        }
+        if rest.len() == before {
+            return Err(Error::Format("subvolumes with parent not found".into()));
+        }
+        pending = rest;
+    }
+    done.sort_by_key(|s| s.id);
+    Ok(done)
+}
+
+/// Restore-time exclusion: the subvolumes matching `patterns`, those nested in them and their
+/// snapshots (by parent UUID, e.g. btrbk's and the agent's own), are deleted in the image as
+/// [`plan`] does at backup time. Returns the plan and the subvolumes matched directly (to be
+/// recreated empty), or None if nothing matches.
+pub fn restore_plan(fs: &Filesystem, patterns: &[String]) -> Result<Option<(Exclusion, Vec<PathBuf>)>, Error> {
+    let subvols = offline_subvolumes(fs)?;
+    let direct: Vec<&Subvolume> = subvols
+        .iter()
+        .filter(|s| patterns.iter().any(|p| glob(p.trim_matches('/'), &s.path.to_string_lossy())))
+        .collect();
+    if direct.is_empty() {
+        return Ok(None);
+    }
+    let items = fs.root_items()?;
+    // Root items written by kernels since 3.x carry uuid (247) and parent_uuid (263).
+    let uuids = |id: u64| {
+        items
+            .iter()
+            .find(|(i, _)| *i == id)
+            .filter(|(_, d)| d.len() >= 279)
+            .map(|(_, d)| (d[247..263].to_vec(), d[263..279].to_vec()))
+    };
+    let mut set: HashSet<u64> = direct.iter().map(|s| s.id).collect();
+    loop {
+        let before = set.len();
+        let own: Vec<Vec<u8>> = set.iter().filter_map(|&id| uuids(id)).map(|(u, _)| u).collect();
+        for s in &subvols {
+            let snapshot_of_set = uuids(s.id).is_some_and(|(_, parent)| parent != [0; 16] && own.contains(&parent));
+            if set.contains(&s.parent) || snapshot_of_set {
+                set.insert(s.id);
+            }
+        }
+        if set.len() == before {
+            break;
+        }
+    }
+    let exact: Vec<String> = subvols.iter().filter(|s| set.contains(&s.id)).map(|s| s.path.to_string_lossy().into_owned()).collect();
+    let map = crate::usedmap::UsedMap::build(fs)?;
+    let data = map.ranges.iter().filter(|r| r.kind == crate::usedmap::Kind::Data).map(|r| (r.logical, r.len));
+    // No path is the agent's snapshot directory here: snapshots were found by UUID.
+    let none = Path::new("/");
+    let picked = direct.iter().map(|s| s.path.clone()).collect();
+    Ok(plan(fs, &subvols, &[], &[], none, &exact, data)?.map(|e| (e, picked)))
 }
 
 #[cfg(test)]

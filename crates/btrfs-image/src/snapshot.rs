@@ -126,7 +126,7 @@ pub fn list_subvolumes(fs: &Filesystem, top: &Path) -> Result<Vec<Subvolume>, Er
 /// Path (relative to subvolume `treeid`) of directory `objectid`.
 fn ino_lookup(top: &File, treeid: u64, objectid: u64) -> Result<PathBuf, Error> {
     let mut args = InoLookupArgs { treeid, objectid, name: [0; 4080] };
-    if unsafe { libc::ioctl(top.as_raw_fd(), IOC_INO_LOOKUP, &mut args) } < 0 {
+    if unsafe { libc::ioctl(top.as_raw_fd(), IOC_INO_LOOKUP as _, &mut args) } < 0 {
         return Err(os_err("BTRFS_IOC_INO_LOOKUP"));
     }
     let len = args.name.iter().position(|&b| b == 0).unwrap_or(0);
@@ -136,7 +136,7 @@ fn ino_lookup(top: &File, treeid: u64, objectid: u64) -> Result<PathBuf, Error> 
 /// Commits the running transaction (BTRFS_IOC_SYNC): the on-disk superblock becomes current.
 pub fn sync(top: &Path) -> Result<(), Error> {
     let f = open_dir(top)?;
-    if unsafe { libc::ioctl(f.as_raw_fd(), IOC_SYNC) } < 0 {
+    if unsafe { libc::ioctl(f.as_raw_fd(), IOC_SYNC as _) } < 0 {
         return Err(os_err("BTRFS_IOC_SYNC"));
     }
     Ok(())
@@ -151,7 +151,7 @@ pub fn create_subvolume(parent_dir: &Path, name: &str) -> Result<(), Error> {
         return Err(Error::Format(format!("invalid subvolume name {name:?}")));
     }
     args.name[..bytes.len()].copy_from_slice(bytes);
-    if unsafe { libc::ioctl(dir.as_raw_fd(), IOC_SUBVOL_CREATE, &args) } < 0 {
+    if unsafe { libc::ioctl(dir.as_raw_fd(), IOC_SUBVOL_CREATE as _, &args) } < 0 {
         return Err(os_err(&format!("creating subvolume {name}")));
     }
     Ok(())
@@ -174,7 +174,7 @@ pub fn create_readonly(source: &Path, dest_dir: &Path, name: &str) -> Result<(),
         return Err(Error::Format("snapshot name too long".into()));
     }
     args.name[..bytes.len()].copy_from_slice(bytes);
-    if unsafe { libc::ioctl(dst.as_raw_fd(), IOC_SNAP_CREATE_V2, &args) } < 0 {
+    if unsafe { libc::ioctl(dst.as_raw_fd(), IOC_SNAP_CREATE_V2 as _, &args) } < 0 {
         return Err(os_err(&format!("snapshot of {}", source.display())));
     }
     Ok(())
@@ -189,7 +189,7 @@ pub fn destroy(parent_dir: &Path, name: &str) -> Result<(), Error> {
         return Err(Error::Format("subvolume name too long".into()));
     }
     args.name[..bytes.len()].copy_from_slice(bytes);
-    if unsafe { libc::ioctl(dir.as_raw_fd(), IOC_SNAP_DESTROY, &args) } < 0 {
+    if unsafe { libc::ioctl(dir.as_raw_fd(), IOC_SNAP_DESTROY as _, &args) } < 0 {
         return Err(os_err(&format!("deleting {name}")));
     }
     Ok(())

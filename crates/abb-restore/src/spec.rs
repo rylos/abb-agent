@@ -184,5 +184,6 @@ fn disks(doc: &Json, objects: &[(String, u64, u64)]) -> Option<Vec<Disk>> {
             partitions,
         });
     }
+    out.sort_by_key(|d| d.name());
     Some(out)
 }

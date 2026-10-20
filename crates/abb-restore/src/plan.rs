@@ -66,6 +66,10 @@ pub struct Plan {
     pub grow: bool,
     /// Make sure the EFI system partition can be booted without an NVRAM entry.
     pub efi_fallback: bool,
+    /// btrfs subvolumes to leave out (patterns from the top level, `*` and `?`): their data is
+    /// not downloaded, their snapshots and nested subvolumes go with them, and they are
+    /// recreated empty.
+    pub exclude_subvolumes: Vec<String>,
 }
 
 /// End of the last partition of a disk of the backup (bytes).

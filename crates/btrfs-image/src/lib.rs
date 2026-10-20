@@ -93,7 +93,12 @@ impl Node {
 
 impl Filesystem {
     pub fn open(path: &Path) -> Result<Filesystem, Error> {
-        let dev = Device::open(path)?;
+        Filesystem::open_at(path, 0)
+    }
+
+    /// A filesystem starting `base` bytes into `path`.
+    pub fn open_at(path: &Path, base: u64) -> Result<Filesystem, Error> {
+        let dev = Device::open_at(path, base)?;
         let mut raw = vec![0u8; SUPER_SIZE];
         dev.read_exact_at(&mut raw, SUPER_OFFSET)?;
         let sb = Superblock::parse(raw)?;

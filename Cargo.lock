@@ -30,6 +30,7 @@ name = "abb-restore"
 version = "0.1.0"
 dependencies = [
  "abb-proto",
+ "btrfs-image",
  "crossterm",
  "libc",
  "lz4_flex",

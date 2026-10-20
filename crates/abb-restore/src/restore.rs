@@ -28,19 +28,21 @@ pub enum Event {
 }
 
 /// Where the bytes of one range go.
-struct Job {
-    range: Range,
+pub(crate) struct Job {
+    pub(crate) range: Range,
     /// Index in `devices`; None for data kept in memory (`table`).
-    dev: Option<usize>,
+    pub(crate) dev: Option<usize>,
     /// Device offset = image offset + delta.
-    delta: i64,
+    pub(crate) delta: i64,
     /// Original partition table, read to copy partition types and names.
-    table: Option<Vec<u8>>,
+    pub(crate) table: Option<Vec<u8>>,
+    /// Further copies to write, as other deltas (the second stripe of btrfs DUP chunks).
+    pub(crate) mirrors: Vec<i64>,
 }
 
-struct Device {
-    path: PathBuf,
-    file: File,
+pub(crate) struct Device {
+    pub(crate) path: PathBuf,
+    pub(crate) file: File,
     /// Local disk index, if the device is a whole disk.
     disk: Option<usize>,
 }
@@ -107,6 +109,7 @@ pub fn run(
 ) -> Result<(), String> {
     report(Event::Step("Preparing the disks".into()));
     let (mut jobs, devices) = prepare(v, plan, locals)?;
+    let specials = if plan.exclude_subvolumes.is_empty() { vec![] } else { carve(&mut jobs, v) };
     let ranges: Vec<Range> = jobs.iter().map(|j| j.range.clone()).collect();
     let total: u64 = ranges.iter().map(|r| r.length).sum();
 
@@ -117,6 +120,17 @@ pub fn run(
 
     report(Event::Step("Restoring".into()));
     let result = download(server, running, &mut jobs, &devices, total, cancel, report);
+    let mut recreate = Vec::new();
+    let result = result.and_then(|_| {
+        for sp in &specials {
+            let ctx = crate::btrfs::Ctx { server: &mut *server, task, version: v, mode: plan.mode.code(), devices: &devices, cancel };
+            let left = crate::btrfs::restore(ctx, sp, &plan.exclude_subvolumes, report)?;
+            if !left.deleted.is_empty() {
+                recreate.push((sp.disk, sp.part.offset, sp.dev, left));
+            }
+        }
+        Ok(())
+    });
     let result = result.and_then(|_| {
         for d in &devices {
             d.file.sync_all().map_err(|e| format!("{}: {e}", d.path.display()))?;
@@ -125,8 +139,16 @@ pub fn run(
         finish_disks(v, plan, locals, &jobs, &devices, report)
     });
     // Mounting and checking need the devices that are open exclusively here.
+    // Where the kernel will show the partitions holding subvolumes to recreate.
+    let recreate: Vec<(PathBuf, crate::btrfs::Left)> = recreate
+        .into_iter()
+        .filter_map(|(disk, offset, dev, paths)| partition_device(v, locals, &devices, disk, offset, dev).map(|p| (p, paths)))
+        .collect();
     drop(devices);
-    let result = result.map(|work| after_restore(plan, work, report));
+    let result = result.map(|mut work| {
+        work.recreate = recreate;
+        after_restore(plan, work, report)
+    });
     let (status, code) = match &result {
         Ok(()) => ("complete", LOG_RESTORE_FINISH),
         Err(_) if cancel.load(Ordering::Relaxed) => ("cancel", LOG_RESTORE_CANCEL),
@@ -136,6 +158,73 @@ pub fn run(
         report(Event::Warning(format!("could not report the result to the server: {e}")));
     }
     result
+}
+
+/// A btrfs partition restored in phases, to leave subvolumes out.
+pub(crate) struct Special {
+    /// Disk of the version.
+    pub(crate) disk: usize,
+    pub(crate) part: Partition,
+    /// Device index and delta (device offset = image offset + delta), as for its job.
+    pub(crate) dev: usize,
+    pub(crate) delta: i64,
+}
+
+/// Takes the btrfs partitions out of the jobs (splitting the jobs around them).
+fn carve(jobs: &mut Vec<Job>, v: &Version) -> Vec<Special> {
+    let mut specials = Vec::new();
+    let mut out = Vec::new();
+    for job in jobs.drain(..) {
+        let Some(dev) = job.dev else {
+            out.push(job);
+            continue;
+        };
+        let Some(disk) = v.disks.iter().position(|d| d.image_path == job.range.image_path) else {
+            out.push(job);
+            continue;
+        };
+        let (start, end) = (job.range.offset, job.range.offset + job.range.length);
+        let mut parts: Vec<&Partition> = v.disks[disk]
+            .partitions
+            .iter()
+            .filter(|p| p.fs == "btrfs" && !p.excluded && p.offset >= start && p.offset + p.length <= end)
+            .collect();
+        parts.sort_by_key(|p| p.offset);
+        let mut pos = start;
+        for p in parts {
+            if p.offset > pos {
+                let mut r = job.range.clone();
+                (r.offset, r.length) = (pos, p.offset - pos);
+                out.push(Job { range: r, dev: Some(dev), delta: job.delta, table: None, mirrors: vec![] });
+            }
+            specials.push(Special { disk, part: p.clone(), dev, delta: job.delta });
+            pos = p.offset + p.length;
+        }
+        if pos < end {
+            let mut r = job.range.clone();
+            (r.offset, r.length) = (pos, end - pos);
+            out.push(Job { range: r, dev: Some(dev), delta: job.delta, table: None, mirrors: vec![] });
+        }
+    }
+    *jobs = out;
+    specials
+}
+
+/// Device node of a restored partition (after the partition table is reread).
+fn partition_device(
+    v: &Version,
+    locals: &[LocalDisk],
+    devices: &[Device],
+    disk: usize,
+    offset: u64,
+    dev: usize,
+) -> Option<PathBuf> {
+    let d = &devices[dev];
+    let Some(j) = d.disk else { return Some(d.path.clone()) };
+    let l = &locals[j];
+    // Same position as in the backup: device and system modes keep the layout.
+    let n = v.disks[disk].partitions.iter().find(|p| p.offset == offset)?.number;
+    Some(l.partition_path(n))
 }
 
 /// Opens the target devices, clears old signatures and lists the ranges to download.
@@ -165,16 +254,16 @@ fn prepare(v: &Version, plan: &Plan, locals: &[LocalDisk]) -> Result<(Vec<Job>, 
                     for p in &d.partitions {
                         wipe_signatures(&file, p.offset, p.length).map_err(|e| format!("{}: {e}", l.name))?;
                     }
-                    jobs.push(Job { range: range(d, None, 0, length), dev: Some(dev), delta: 0, table: None });
+                    jobs.push(Job { range: range(d, None, 0, length), dev: Some(dev), delta: 0, table: None, mirrors: vec![] });
                 } else {
                     let first = d.partitions.first().map_or(MIB, |p| p.offset);
                     if l.partitions.is_empty() {
-                        jobs.push(Job { range: range(d, None, 0, first), dev: Some(dev), delta: 0, table: None });
+                        jobs.push(Job { range: range(d, None, 0, first), dev: Some(dev), delta: 0, table: None, mirrors: vec![] });
                     }
                     for p in d.partitions.iter().filter(|p| p.is_system() && !p.excluded) {
                         discard(&file, p.offset, p.length);
                         wipe_signatures(&file, p.offset, p.length).map_err(|e| format!("{}: {e}", l.name))?;
-                        jobs.push(Job { range: range(d, Some(p), p.offset, p.length), dev: Some(dev), delta: 0, table: None });
+                        jobs.push(Job { range: range(d, Some(p), p.offset, p.length), dev: Some(dev), delta: 0, table: None, mirrors: vec![] });
                     }
                 }
                 devices.push(Device { path: l.path(), file, disk: Some(j) });
@@ -234,7 +323,7 @@ fn prepare(v: &Version, plan: &Plan, locals: &[LocalDisk]) -> Result<(Vec<Job>, 
                 wipe_signatures(&file, 0, size).map_err(|e| format!("{}: {e}", path.display()))?;
                 let dev = devices.len();
                 devices.push(Device { path, file, disk: None });
-                jobs.push(Job { range: range(d, Some(p), p.offset, p.length), dev: Some(dev), delta: -(p.offset as i64), table: None });
+                jobs.push(Job { range: range(d, Some(p), p.offset, p.length), dev: Some(dev), delta: -(p.offset as i64), table: None, mirrors: vec![] });
                 if !sources.contains(&t.disk) {
                     sources.push(t.disk);
                 }
@@ -244,7 +333,7 @@ fn prepare(v: &Version, plan: &Plan, locals: &[LocalDisk]) -> Result<(Vec<Job>, 
                 let d = &v.disks[i];
                 if d.gpt {
                     let len = d.partitions.first().map_or(MIB, |p| p.offset).min(MIB);
-                    jobs.push(Job { range: range(d, None, 0, len), dev: None, delta: 0, table: Some(vec![0; len as usize]) });
+                    jobs.push(Job { range: range(d, None, 0, len), dev: None, delta: 0, table: Some(vec![0; len as usize]), mirrors: vec![] });
                 }
             }
         }
@@ -258,7 +347,7 @@ fn device_size(f: &File) -> Option<u64> {
     (unsafe { libc::ioctl(f.as_raw_fd(), BLKGETSIZE64 as _, &mut size) } == 0).then_some(size)
 }
 
-fn download(
+pub(crate) fn download(
     server: &mut Server,
     running: u64,
     jobs: &mut [Job],
@@ -286,7 +375,9 @@ fn download(
                         let s = (offset - job.range.offset) as usize;
                         t[s..s + data.len()].copy_from_slice(data);
                     } else if let Some(d) = job.dev {
-                        devices[d].file.write_all_at(data, (offset as i64 + job.delta) as u64)?;
+                        for delta in std::iter::once(job.delta).chain(job.mirrors.iter().copied()) {
+                            devices[d].file.write_all_at(data, (offset as i64 + delta) as u64)?;
+                        }
                     }
                     job.range.done = end - job.range.offset;
                 }
@@ -327,6 +418,8 @@ struct AfterWork {
     grow: Vec<(PathBuf, String)>,
     /// EFI system partitions to check.
     esps: Vec<PathBuf>,
+    /// btrfs partitions with subvolumes left out at restore time.
+    recreate: Vec<(PathBuf, crate::btrfs::Left)>,
 }
 
 /// After the data: partition tables for the real disk size, bigger partitions and filesystems,
@@ -470,6 +563,22 @@ fn after_restore(plan: &Plan, work: AfterWork, report: &mut dyn FnMut(Event)) {
         }
         if let Err(e) = crate::fs::grow(&path, &fs) {
             report(Event::Warning(format!("{}: filesystem not grown: {e}", path.display())));
+        }
+    }
+    for (dev, left) in &work.recreate {
+        if !wait_for(dev) {
+            report(Event::Warning(format!("{} did not appear: subvolumes not recreated", dev.display())));
+            continue;
+        }
+        report(Event::Step(format!("{}: waiting for btrfs to drop the subvolumes left out", dev.display())));
+        match crate::fs::finish_exclusion(dev, &left.recreate, &left.deleted) {
+            Ok(()) if left.recreate.is_empty() => {}
+            Ok(()) => report(Event::Step(format!(
+                "Recreated empty on {}: {}",
+                dev.display(),
+                left.recreate.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+            ))),
+            Err(e) => report(Event::Warning(format!("{}: {e}", dev.display()))),
         }
     }
     if plan.efi_fallback {

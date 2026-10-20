@@ -13,12 +13,18 @@ struct Mount(PathBuf);
 
 impl Mount {
     fn new(dev: &Path, fstype: &str) -> Result<Mount, String> {
+        Mount::with(dev, fstype, "")
+    }
+
+    fn with(dev: &Path, fstype: &str, options: &str) -> Result<Mount, String> {
         let dir = PathBuf::from(format!("/run/abb-restore/mnt-{}", std::process::id()));
         fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let src = CString::new(dev.as_os_str().as_bytes()).unwrap();
         let dst = CString::new(dir.as_os_str().as_bytes()).unwrap();
         let ty = CString::new(fstype).unwrap();
-        let r = unsafe { libc::mount(src.as_ptr(), dst.as_ptr(), ty.as_ptr(), 0, std::ptr::null()) };
+        let opts = CString::new(options).unwrap();
+        let data = if options.is_empty() { std::ptr::null() } else { opts.as_ptr() as *const libc::c_void };
+        let r = unsafe { libc::mount(src.as_ptr(), dst.as_ptr(), ty.as_ptr(), 0, data) };
         if r != 0 {
             let e = std::io::Error::last_os_error();
             let _ = fs::remove_dir(&dir);
@@ -71,6 +77,56 @@ pub fn grow(dev: &Path, fs_type: &str) -> Result<(), String> {
         }
         other => Err(format!("growing {other} is not supported")),
     }
+}
+
+/// Is the root item of subvolume `id` still in the root tree? (BTRFS_IOC_TREE_SEARCH)
+fn root_exists(dir: &fs::File, id: u64) -> Result<bool, String> {
+    const TREE_SEARCH: u32 = 0xd000_9411;
+    let mut args = [0u8; 4096];
+    let key = [1u64, id, id, 0, u64::MAX, 0, u64::MAX];
+    for (i, v) in key.iter().enumerate() {
+        args[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+    }
+    args[56..60].copy_from_slice(&132u32.to_le_bytes()); // min_type: ROOT_ITEM
+    args[60..64].copy_from_slice(&132u32.to_le_bytes()); // max_type
+    args[64..68].copy_from_slice(&1u32.to_le_bytes()); // nr_items
+    if unsafe { libc::ioctl(dir.as_raw_fd(), TREE_SEARCH as _, args.as_mut_ptr()) } != 0 {
+        return Err(format!("tree search: {}", std::io::Error::last_os_error()));
+    }
+    Ok(u32::from_le_bytes(args[64..68].try_into().unwrap()) > 0)
+}
+
+/// On the btrfs at `dev`: waits until the subvolumes deleted at restore time (`deleted`) are
+/// gone, as `btrfs subvolume sync` does (until then their extents still count as used, and a
+/// scrub would report their missing data), then creates `recreate` empty so that mounts in
+/// /etc/fstab still find them.
+pub fn finish_exclusion(dev: &Path, recreate: &[PathBuf], deleted: &[u64]) -> Result<(), String> {
+    let m = Mount::with(dev, "btrfs", "subvolid=5")?;
+    let dir = fs::File::open(&m.0).map_err(|e| e.to_string())?;
+    const SYNC: u32 = 0x9408;
+    let start = std::time::Instant::now();
+    for &id in deleted {
+        while root_exists(&dir, id)? {
+            if start.elapsed() > std::time::Duration::from_secs(1800) {
+                return Err("btrfs is still dropping the subvolumes left out (it goes on at the next mount)".into());
+            }
+            unsafe { libc::ioctl(dir.as_raw_fd(), SYNC as _) };
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    }
+    let mut paths = recreate.to_vec();
+    paths.sort();
+    for p in &paths {
+        let target = m.0.join(p);
+        if target.exists() {
+            continue;
+        }
+        let parent = target.parent().unwrap_or(&m.0);
+        fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+        let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        btrfs_image::snapshot::create_subvolume(parent, &name).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// Firmware looks for this file when no NVRAM boot entry points to the disk (a new machine).

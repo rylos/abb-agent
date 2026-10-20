@@ -72,6 +72,8 @@ struct App {
     map_cursor: usize,
     grow: bool,
     efi_fallback: bool,
+    /// btrfs subvolumes to leave out, as typed (space or comma separated).
+    exclude: String,
     confirm: bool,
     message: Option<(bool, String)>,
     /// Server waiting for the certificate to be confirmed, with its fingerprint.
@@ -109,6 +111,7 @@ pub fn run() {
         map_cursor: 0,
         grow: true,
         efi_fallback: true,
+        exclude: String::new(),
         confirm: false,
         message: None,
         trust: None,
@@ -389,7 +392,7 @@ impl App {
                 self.locals = local::disks();
                 let Some(v) = self.version() else { return };
                 let mode = MODES[self.mode].0;
-                let mut plan = Plan { mode, disks: vec![None; v.disks.len()], volumes: vec![], grow: self.grow, efi_fallback: self.efi_fallback };
+                let mut plan = Plan { mode, disks: vec![None; v.disks.len()], volumes: vec![], grow: self.grow, efi_fallback: self.efi_fallback, exclude_subvolumes: vec![] };
                 match mode {
                     Mode::Device => plan.disks = plan::auto_map(v, &self.locals),
                     Mode::System => {
@@ -425,14 +428,15 @@ impl App {
         }
     }
 
-    /// Rows of the mapping page: one per disk (device/system) or volume, then the two options.
+    /// Rows of the mapping page: one per disk (device/system) or volume, then the two options
+    /// and the subvolumes to leave out.
     fn mapping_rows(&self) -> usize {
         let p = self.plan.as_ref().unwrap();
         let n = match p.mode {
             Mode::Volumes => p.volumes.len(),
             _ => self.version().map_or(0, |v| v.disks.len()),
         };
-        n + 2
+        n + 3
     }
 
     fn key_mapping(&mut self, k: KeyEvent) {
@@ -441,12 +445,16 @@ impl App {
         let locals = &self.locals;
         let plan = self.plan.as_mut().unwrap();
         let item = self.map_cursor;
-        let n = rows - 2;
+        let n = rows - 3;
         let step = |forward: bool, len: usize, cur: usize| if forward { (cur + 1) % len } else { (cur + len - 1) % len };
         match k.code {
             KeyCode::Esc => self.page = Page::Versions,
             KeyCode::Up => self.map_cursor = self.map_cursor.saturating_sub(1),
             KeyCode::Down => self.map_cursor = (self.map_cursor + 1).min(rows - 1),
+            KeyCode::Char(c) if item == n + 2 => self.exclude.push(c),
+            KeyCode::Backspace if item == n + 2 => {
+                self.exclude.pop();
+            }
             KeyCode::Char(' ') if item == n => self.grow = !self.grow,
             KeyCode::Char(' ') if item == n + 1 => self.efi_fallback = !self.efi_fallback,
             KeyCode::Left | KeyCode::Right if item < n && plan.mode != Mode::Volumes => {
@@ -489,6 +497,8 @@ impl App {
             KeyCode::Enter => {
                 plan.grow = self.grow;
                 plan.efi_fallback = self.efi_fallback;
+                plan.exclude_subvolumes =
+                    self.exclude.split([' ', ',']).filter(|p| !p.is_empty()).map(str::to_string).collect();
                 let errs = plan.check(v, locals);
                 if errs.is_empty() {
                     self.confirm = false;
@@ -768,7 +778,7 @@ impl App {
                 }
             }
         }
-        let n = self.mapping_rows() - 2;
+        let n = self.mapping_rows() - 3;
         lines.push(Line::from(""));
         let check = |b: bool| if b { "[x]" } else { "[ ]" };
         let grow = match p.mode {
@@ -780,8 +790,20 @@ impl App {
             format!("{} Make the EFI system partition bootable without an NVRAM entry (\\EFI\\BOOT)", check(self.efi_fallback)),
             sel(n + 1),
         )));
+        let cursor = if self.map_cursor == n + 2 { "▏" } else { "" };
+        let value = if self.exclude.is_empty() && cursor.is_empty() { "none".to_string() } else { format!("{}{cursor}", self.exclude) };
+        lines.push(Line::from(vec![
+            Span::styled("Leave out btrfs subvolumes: ", sel(n + 2)),
+            Span::styled(value, sel(n + 2).add_modifier(Modifier::BOLD)),
+        ]));
+        if self.map_cursor == n + 2 {
+            lines.push(
+                Line::from("  e.g. @games — their snapshots go with them, their data is not downloaded, they come back empty")
+                    .dark_gray(),
+            );
+        }
         f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), body);
-        footer(f, foot, "↑↓ choose · ←→ change target · Space toggle · Enter next · Esc back");
+        footer(f, foot, "↑↓ choose · ←→ change target · Space toggle · type subvolumes · Enter next · Esc back");
     }
 
     fn draw_summary(&self, f: &mut Frame, head: Rect, body: Rect, foot: Rect) {
@@ -820,6 +842,9 @@ impl App {
         }
         lines.push(Line::from(""));
         lines.push(Line::from(format!("Grow filesystems: {}   EFI fallback: {}", if p.grow { "yes" } else { "no" }, if p.efi_fallback { "yes" } else { "no" })).dark_gray());
+        if !p.exclude_subvolumes.is_empty() {
+            lines.push(Line::from(format!("Left out, recreated empty: {}", p.exclude_subvolumes.join(", "))).bold());
+        }
         f.render_widget(Paragraph::new(lines), body);
         footer(f, foot, "Enter restore · Esc back");
         if self.confirm {

@@ -198,6 +198,11 @@ account, device and task, restore mode, version, disk mapping, summary and progr
 - The target disk can be **bigger** than the original: the backup GPT is moved to the end of the
   disk and, if you want, the last partition and its btrfs or ext filesystem are grown to fill it.
   A **smaller** disk works as long as the partitions fit on it.
+- **btrfs subvolumes can be left out at restore time** (e.g. a big games library): their data is
+  not downloaded at all, their snapshots (btrbk, snapper, the agent's own) go with them, and they
+  come back as empty subvolumes so that `/etc/fstab` still mounts them. The restore reads the
+  filesystem's metadata first, deletes those subvolumes in it the same way the agent does at backup
+  time, then downloads only the data still in use.
 - Partition UUIDs and filesystem UUIDs are kept, so `/etc/fstab` and boot entries keep working.
 - On UEFI machines the boot loader (systemd-boot, GRUB or shim) is copied to `\EFI\BOOT\` when
   missing, so the restored disk boots on a new machine without an NVRAM entry.
@@ -208,6 +213,7 @@ For scripts the same restore runs without the interface:
 abb-restore list     -a nas.example.lan -u backupuser
 abb-restore versions -a nas.example.lan -u backupuser -t 2
 abb-restore run      -a nas.example.lan -u backupuser -t 2 --device --map sda=nvme0n1 --grow --yes
+abb-restore run      -a nas.example.lan -u backupuser -t 2 --device --exclude-subvolume @games --yes
 ```
 
 Synology's own recovery media works too: the agent reports the device so that it is listed there.
