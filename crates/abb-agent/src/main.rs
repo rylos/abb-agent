@@ -260,6 +260,9 @@ fn daemon() {
         }
     }
     eprintln!("connected to {} as {}", sess.state.server, sess.host.host_name);
+    // A backup interrupted by a crash or power loss is still "running" here: take its outcome
+    // from the server before scheduling anything.
+    fetch_result(&sess);
 
     let hb_state = sess.state.clone();
     std::thread::spawn(move || {
@@ -426,12 +429,32 @@ fn fetch_result(sess: &Session) {
             return;
         }
     };
-    if status.is_empty() || status == last.server_status {
+    let stale = last.status == "running" && !control::busy();
+    if status.is_empty() || (status == last.server_status && !stale) {
         return;
     }
-    eprintln!("result {} on the server: {status}", last.result_id);
+    if status != last.server_status {
+        eprintln!("result {} on the server: {status}", last.result_id);
+    }
     last.server_status = status.clone();
-    if status == "failure" && last.status != "running" {
+    if last.status == "running" && !control::busy() {
+        // The process that ran this backup ended without recording how (killed, power loss):
+        // the server's outcome is the one that counts.
+        let local = match status.as_str() {
+            "complete" | "success" => Some("complete"),
+            "partial" => Some("partial"),
+            "cancel" => Some("cancel"),
+            "failure" | "error" => Some("error"),
+            _ => None,
+        };
+        if let Some(l) = local {
+            last.status = l.into();
+            if l == "complete" || l == "partial" {
+                last.last_ok_start = last.start;
+            }
+            last.end = last.end.max(last.start);
+        }
+    } else if status == "failure" {
         last.status = "error".into();
         last.last_ok_start = 0;
     }
