@@ -630,6 +630,7 @@ fn run_locked(sess: &Session, trigger: Trigger) -> Result<()> {
     )?;
     let base_version_id = get_int(&base, "base_version_id")?;
     let prev = previous_digests(&volume_parts, base_version_id);
+    let raws = stream::RawTables::load(&disks, base_version_id);
     let is_cbt = prev.is_some() as u64;
     let (rt, upd) = match trigger {
         Trigger::Server(rt) => {
@@ -687,7 +688,7 @@ fn run_locked(sess: &Session, trigger: Trigger) -> Result<()> {
         rt.running_task_id
     );
 
-    let outcome = run_inner(&job, &mut c, &task, start_time, &disks, &volume_parts, prev.as_deref(), version_id)
+    let outcome = run_inner(&job, &mut c, &task, start_time, &disks, &volume_parts, prev.as_deref(), &raws, version_id)
         .map(|complete| complete && !missed);
     let status = match &outcome {
         Ok(true) => "complete",
@@ -749,6 +750,7 @@ fn run_inner(
     disks: &[(Disk, Vec<Interval>)],
     volume_parts: &[Partition],
     prev: Option<&[Digests]>,
+    raws: &stream::RawTables,
     version_id: u64,
 ) -> Result<bool> {
     let sess = job.sess;
@@ -806,7 +808,8 @@ fn run_inner(
         )?;
         job.log(c, LOG_UPLOAD_SPEC_DONE, None);
 
-        stream::upload(job, c, disks, &plans, &volumes, prev, snapshot_time, (task.compression, task.encryption))?;
+        stream::upload(job, c, disks, &plans, &volumes, prev, snapshot_time, (task.compression, task.encryption), raws)?;
+        raws.save(disks, version_id);
         // The version is on the server: the digests become the base for the next incremental.
         for (p, v) in volume_parts.iter().zip(&volumes) {
             let path = cbt_path(p);

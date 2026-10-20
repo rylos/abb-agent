@@ -19,14 +19,68 @@ const MAX_UNUSED_RUN: u64 = 1 << 30;
 
 /// A piece of the stream, in the order it must be sent.
 pub enum Piece {
-    /// Disk bytes in `[start, end)` to read, reassemble, verify and send. With
-    /// `check` (volume, block) the block is sent only if the digest computed while reading it
-    /// differs from the previous backup's (ext); otherwise it goes as "used, unchanged".
-    Data { start: u64, end: u64, cbt: bool, check: Option<(usize, usize)> },
+    /// Disk bytes in `[start, end)` to read, reassemble, verify and send. With `check` the
+    /// piece is sent only if the digest computed while reading it differs from the previous
+    /// backup's; otherwise it goes as "used, unchanged".
+    Data { start: u64, end: u64, cbt: bool, check: Option<Check> },
     /// Piece without data.
     Run(Run),
     /// `log_report` entry for a volume (start or end).
     Log(u64, String),
+}
+
+/// How a piece read in full is compared with the previous backup.
+#[derive(Clone, Copy)]
+pub enum Check {
+    /// Block of an ext volume (volume, block).
+    Vol(usize, usize),
+    /// Area outside the volumes (EFI system partition, partition tables, free space): digest of
+    /// the piece, by disk offset, in [`RawTables`].
+    Raw,
+}
+
+/// Digests of the areas outside the volumes, by disk and offset: those of the previous backup
+/// and those computed by this one.
+#[derive(Default)]
+pub struct RawTables {
+    pub prev: Vec<std::collections::HashMap<u64, u64>>,
+    pub cur: Mutex<Vec<std::collections::HashMap<u64, u64>>>,
+}
+
+impl RawTables {
+    fn path(d: &Disk) -> std::path::PathBuf {
+        std::path::Path::new(crate::state::STATE_DIR).join("cbt").join(format!("{}.raw", d.image_name()))
+    }
+
+    /// The previous backup's digests, if they belong to `base_version_id`.
+    pub fn load(disks: &[(Disk, Vec<Interval>)], base_version_id: u64) -> RawTables {
+        let prev = disks
+            .iter()
+            .map(|(d, _)| {
+                let j: Option<serde_json::Value> = std::fs::read(Self::path(d)).ok().and_then(|b| serde_json::from_slice(&b).ok());
+                match j {
+                    Some(j) if j["version_id"].as_u64() == Some(base_version_id) => j["blocks"]
+                        .as_object()
+                        .map(|m| m.iter().filter_map(|(k, v)| Some((k.parse().ok()?, v.as_u64()?))).collect())
+                        .unwrap_or_default(),
+                    _ => Default::default(),
+                }
+            })
+            .collect();
+        RawTables { prev, cur: Mutex::new(vec![Default::default(); disks.len()]) }
+    }
+
+    /// Saves this backup's digests as the base for the next one.
+    pub fn save(&self, disks: &[(Disk, Vec<Interval>)], version_id: u64) {
+        let cur = self.cur.lock().unwrap();
+        for ((d, _), blocks) in disks.iter().zip(cur.iter()) {
+            let m: serde_json::Map<String, serde_json::Value> = blocks.iter().map(|(k, v)| (k.to_string(), (*v).into())).collect();
+            let j = serde_json::json!({ "version_id": version_id, "blocks": m });
+            if let Err(e) = std::fs::write(Self::path(d), j.to_string()) {
+                eprintln!("saving the digests of {}: {e}", d.name);
+            }
+        }
+    }
 }
 
 /// Message without data (possibly extended over contiguous pieces with the same flags).
@@ -71,8 +125,9 @@ pub fn plan_full(d: &Disk, intervals: &[Interval], volumes: &[Vol]) -> Vec<Piece
                 }
             };
         }
+        let raw = intervals.iter().filter(|i| i.start < we && i.end > w).all(|i| matches!(i.source, Source::Raw));
         out.push(if used {
-            Piece::Data { start: w, end: we, cbt: false, check: None }
+            Piece::Data { start: w, end: we, cbt: false, check: raw.then_some(Check::Raw) }
         } else {
             Piece::Run(Run { start: w, end: we, used: false, changed: true, cbt: false })
         });
@@ -99,7 +154,7 @@ pub fn plan_incremental(intervals: &[Interval], volumes: &[Vol], prev: &[Digests
                 let mut w = i.start;
                 while w < i.end {
                     let we = ((w / MIB + 1) * MIB).min(i.end);
-                    out.push(Piece::Data { start: w, end: we, cbt: false, check: None });
+                    out.push(Piece::Data { start: w, end: we, cbt: false, check: Some(Check::Raw) });
                     w = we;
                 }
             }
@@ -115,7 +170,7 @@ pub fn plan_incremental(intervals: &[Interval], volumes: &[Vol], prev: &[Digests
                         match vol.changed(old, k) {
                             Some(false) => Piece::Run(Run { start: s, end: e, used: true, changed: false, cbt: true }),
                             Some(true) => Piece::Data { start: s, end: e, cbt: true, check: None },
-                            None => Piece::Data { start: s, end: e, cbt: true, check: Some((v, k)) },
+                            None => Piece::Data { start: s, end: e, cbt: true, check: Some(Check::Vol(v, k)) },
                         }
                     });
                 }
@@ -256,7 +311,7 @@ fn parallel_ordered<T: Send, R>(
 }
 
 /// Data jobs of the plan: (disk, start, end, check).
-type DataJob = (usize, u64, u64, Option<(usize, usize)>);
+type DataJob = (usize, u64, u64, Option<Check>);
 
 fn data_jobs(plans: &[Vec<Piece>]) -> Vec<DataJob> {
     plans
@@ -276,13 +331,19 @@ fn produce(
     disks: &[(Disk, Vec<Interval>)],
     volumes: &[Vol],
     prev: Option<&[Digests]>,
+    raws: &RawTables,
     compress: bool,
     (n, start, end, check): DataJob,
 ) -> Result<Ready> {
     let t = Instant::now();
     let raw = build(&devs[n], &disks[n].1, volumes, start, end)?;
     let unchanged = match (check, prev) {
-        (Some((v, k)), Some(prev)) => volumes[v].unchanged(&prev[v], k),
+        (Some(Check::Vol(v, k)), Some(prev)) => volumes[v].unchanged(&prev[v], k),
+        (Some(Check::Raw), _) => {
+            let h = xxhash_rust::xxh3::xxh3_64(&raw).max(1);
+            raws.cur.lock().unwrap()[n].insert(start, h);
+            prev.is_some() && raws.prev[n].get(&start) == Some(&h)
+        }
         _ => false,
     };
     let len = raw.len() as u64;
@@ -309,6 +370,7 @@ pub fn upload(
     prev: Option<&[Digests]>,
     snapshot_time: Duration,
     (compress, encrypt): (bool, bool),
+    raws: &RawTables,
 ) -> Result<()> {
     let sess = job.sess;
     let devs = open_devices(disks)?;
@@ -328,7 +390,7 @@ pub fn upload(
     }
     parallel_ordered(
         jobs.len(),
-        |i| produce(&devs, disks, volumes, prev, compress, jobs[i]),
+        |i| produce(&devs, disks, volumes, prev, raws, compress, jobs[i]),
         |next| send_stream(job, logc, &mut up, disks, plans, snapshot_time, compress, next),
     )
 }
@@ -363,7 +425,7 @@ pub fn bench(disks: &[(Disk, Vec<Interval>)], volumes: &[Vol], limit: Option<u64
     let t = Instant::now();
     parallel_ordered(
         jobs.len(),
-        |i| produce(&devs, disks, volumes, None, true, jobs[i]),
+        |i| produce(&devs, disks, volumes, None, &RawTables::default(), true, jobs[i]),
         |next| {
             let (mut raw, mut packed) = (0u64, 0u64);
             for k in 0..jobs.len() {
@@ -436,13 +498,15 @@ fn send_stream(
                         o = e;
                     }
                 }
-                Piece::Data { start, end, cbt, .. } => {
+                Piece::Data { start, end, cbt, check } => {
                     let ready = next()?;
                     ctr.read_time += ready.read_time;
                     ctr.read_bytes += ready.len;
                     if ready.unchanged {
                         unchanged += 1;
-                        let r = Run { start: *start, end: *end, used: true, changed: false, cbt: *cbt };
+                        // Taken from the previous version: an area outside the volumes too.
+                        let cbt = *cbt || matches!(check, Some(Check::Raw));
+                        let r = Run { start: *start, end: *end, used: true, changed: false, cbt };
                         push_run(up, &image, &mut pending, r)?;
                         continue;
                     }
