@@ -68,7 +68,7 @@ impl Digests {
                         d.table[b as usize] = ALWAYS;
                     }
                 }
-                Kind::Tree => d.add(r.physical, r.logical ^ mix(r.generation)),
+                Kind::Tree => d.add(r.physical, r.logical ^ mix(r.generation ^ r.salt)),
                 Kind::Data => {}
             }
         }
@@ -81,6 +81,12 @@ impl Digests {
             let mut chunk: Option<(u64, u64, Vec<u64>)> = None; // (start, end, stripes)
             for (k, c) in data.as_chunks::<CSUM_SIZE>().0.iter().enumerate() {
                 let logical = key.offset + k as u64 * sector;
+                // Checksums of data left out of the image do not count.
+                let x = &map.excluded_data;
+                let i = x.partition_point(|d| d.0 + d.1 <= logical);
+                if x.get(i).is_some_and(|d| d.0 <= logical) {
+                    continue;
+                }
                 if !chunk.as_ref().is_some_and(|(s, e, _)| (*s..*e).contains(&logical)) {
                     let ch = fs.chunk_of(logical)?;
                     chunk = Some((ch.logical, ch.logical + ch.length, ch.stripes.clone()));
@@ -163,7 +169,7 @@ impl Digests {
             }
             match r.kind {
                 Kind::Tree if r.physical / BLOCK == block as u64 => {
-                    sum = sum.wrapping_add(mix(r.physical ^ mix(r.logical ^ mix(r.generation))));
+                    sum = sum.wrapping_add(mix(r.physical ^ mix(r.logical ^ mix(r.generation ^ r.salt))));
                 }
                 Kind::Data => {
                     let (rs, re) = (r.physical.max(start), (r.physical + r.len).min(end));

@@ -308,7 +308,9 @@ pub fn upload(
 
 /// Offline test: everything a full backup would send, read, reassembled, verified and
 /// compressed. Returns (bytes read, compressed bytes).
-pub fn bench(disks: &[(Disk, Vec<Interval>)], volumes: &[Vol], limit: Option<u64>) -> Result<(u64, u64)> {
+/// With `image`, the data of each disk is also written to `<image>.<disk>.img` (sparse), as the
+/// server would store it.
+pub fn bench(disks: &[(Disk, Vec<Interval>)], volumes: &[Vol], limit: Option<u64>, image: Option<&str>) -> Result<(u64, u64)> {
     let plans: Vec<Vec<Piece>> = disks.iter().map(|(d, iv)| plan_full(d, iv, volumes)).collect();
     let devs = open_devices(disks)?;
     let mut jobs = data_jobs(&plans);
@@ -319,6 +321,18 @@ pub fn bench(disks: &[(Disk, Vec<Interval>)], volumes: &[Vol], limit: Option<u64
             total <= limit
         });
     }
+    let files: Vec<Option<std::fs::File>> = disks
+        .iter()
+        .map(|(d, _)| {
+            image
+                .map(|i| {
+                    let f = std::fs::File::create(format!("{i}.{}.img", d.name))?;
+                    f.set_len(d.size)?;
+                    Ok::<_, std::io::Error>(f)
+                })
+                .transpose()
+        })
+        .collect::<std::io::Result<_>>()?;
     let t = Instant::now();
     parallel_ordered(
         jobs.len(),
@@ -327,6 +341,11 @@ pub fn bench(disks: &[(Disk, Vec<Interval>)], volumes: &[Vol], limit: Option<u64
             let (mut raw, mut packed) = (0u64, 0u64);
             for k in 0..jobs.len() {
                 let r = next()?;
+                if let Some(f) = &files[jobs[k].0] {
+                    let data = lz4_flex::block::decompress(&r.packed, r.len as usize)
+                        .map_err(|e| Error::Protocol(format!("lz4: {e}")))?;
+                    std::os::unix::fs::FileExt::write_all_at(f, &data, jobs[k].1)?;
+                }
                 raw += r.len;
                 packed += r.packed.len() as u64;
                 if k % 4096 == 4095 {

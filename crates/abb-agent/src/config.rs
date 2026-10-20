@@ -13,6 +13,7 @@ pub struct Config {
     /// Disks to back up (kernel names, e.g. "nvme0n1"); empty = the disk holding `/`.
     pub disks: Vec<String>,
     pub schedule: Schedule,
+    pub btrfs: Btrfs,
     pub ext: Ext,
     pub performance: Performance,
 }
@@ -35,6 +36,14 @@ impl Default for Schedule {
     fn default() -> Schedule {
         Schedule { on_boot: true, interval_hours: 0, retry_minutes: 60, wait_locks: Vec::new() }
     }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Btrfs {
+    /// Subvolumes to leave out of the image: paths from the top-level subvolume, `*` and `?`
+    /// allowed (e.g. "@games", "btrbk_snapshots/@games.*"). Nested subvolumes go with them.
+    pub exclude_subvolumes: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

@@ -4,7 +4,9 @@
 use crate::capture::{self, Capture, Pinned};
 use crate::disk::u64_at;
 use crate::snapshot;
-use crate::usedmap::UsedMap;
+use crate::exclude;
+use crate::usedmap::{Kind, UsedMap};
+use std::sync::Arc;
 use crate::{Error, Filesystem};
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
@@ -25,12 +27,14 @@ pub struct Prepared {
     /// Subvolumes that could not be snapshotted (e.g. active swapfile): their data in the image
     /// is not consistent.
     pub unpinned: Vec<PathBuf>,
+    /// Subvolumes left out of the image (paths from the top level).
+    pub excluded: Vec<PathBuf>,
     pub snapshot_time: Duration,
     mounted_by_us: bool,
 }
 
 /// Volume root, already mounted or mounted by us at `/run/abb-agent/top-<uuid>`.
-fn top_mount(dev: &Path, uuid: &str) -> Result<(PathBuf, bool), Error> {
+pub fn top_mount(dev: &Path, uuid: &str) -> Result<(PathBuf, bool), Error> {
     let dev = std::fs::canonicalize(dev)?;
     let info = std::fs::read_to_string("/proc/self/mountinfo")?;
     for l in info.lines() {
@@ -66,7 +70,16 @@ fn top_mount(dev: &Path, uuid: &str) -> Result<(PathBuf, bool), Error> {
 }
 
 /// `run_name`: name of this run's snapshot directory (e.g. "20261020T1530").
-pub fn prepare(dev: &Path, uuid: &str, run_name: &str) -> Result<Prepared, Error> {
+/// `exclude`: patterns of subvolume paths (from the top level) to leave out of the image.
+/// `before_snapshot` is called with the subvolumes that will be left out, before the snapshots
+/// are taken (so that what it writes ends up in the image).
+pub fn prepare(
+    dev: &Path,
+    uuid: &str,
+    run_name: &str,
+    exclude: &[String],
+    before_snapshot: &mut dyn FnMut(&[PathBuf]),
+) -> Result<Prepared, Error> {
     let t = Instant::now();
     let (top, mounted_by_us) = top_mount(dev, uuid)?;
     let run_dir = top.join(SNAP_DIR).join(run_name);
@@ -75,6 +88,8 @@ pub fn prepare(dev: &Path, uuid: &str, run_name: &str) -> Result<Prepared, Error
     snapshot::sync(&top)?;
     let fs = Filesystem::open(dev)?;
     let subvols = snapshot::list_subvolumes(&fs, &top)?;
+    let leaving: Vec<PathBuf> = exclude::matching(&subvols, Path::new(SNAP_DIR), exclude).into_iter().map(|s| s.path).collect();
+    before_snapshot(&leaving);
     let mut sources: Vec<(u64, PathBuf, String)> = vec![(TOPLEVEL_ID, top.clone(), "5.toplevel".into())];
     for s in subvols.iter().filter(|s| !s.path.starts_with(SNAP_DIR)) {
         let name = format!("{}.{}", s.id, s.path.to_string_lossy().replace('/', "_"));
@@ -101,6 +116,7 @@ pub fn prepare(dev: &Path, uuid: &str, run_name: &str) -> Result<Prepared, Error
     let after = snapshot::list_subvolumes(&fs, &top)?;
     let run_prefix = Path::new(SNAP_DIR).join(run_name);
     let mut pinned = Vec::new();
+    let mut snap_ids = Vec::new();
     let mut ours = Vec::new();
     for s in &after {
         if let Ok(rest) = s.path.strip_prefix(&run_prefix) {
@@ -116,16 +132,35 @@ pub fn prepare(dev: &Path, uuid: &str, run_name: &str) -> Result<Prepared, Error
                 .map(|(_, d)| u64_at(d, 303))
                 .ok_or_else(|| Error::Format(format!("ROOT_ITEM of {} missing", s.id)))?;
             pinned.push(Pinned { subvol: src, snapshot_transid: otransid });
+            snap_ids.push(s.id);
             ours.push(s.id);
         } else if s.path.starts_with(SNAP_DIR) {
             ours.push(s.id);
         }
     }
-    let cap = capture::capture(&fs, &pinned, &ours, &unpinned_ids)?;
+    let mut cap = capture::capture(&fs, &pinned, &ours, &unpinned_ids)?;
     // From here on the global trees (extent, csum, …) are read from the capture only.
     fs.use_capture(cap.nodes.clone());
-    let map = UsedMap::build(&fs)?;
-    Ok(Prepared { fs, cap, map, top, run_dir, unpinned, snapshot_time, mounted_by_us })
+    let mut map = UsedMap::build(&fs)?;
+    let mut excluded = Vec::new();
+    if !exclude.is_empty() {
+        let data = map.ranges.iter().filter(|r| r.kind == Kind::Data).map(|r| (r.logical, r.len));
+        match exclude::plan(&fs, &after, &pinned, &snap_ids, Path::new(SNAP_DIR), exclude, data) {
+            Ok(Some(ex)) => {
+                // The edited nodes are sent instead of the ones on disk.
+                let mut nodes = (*cap.nodes).clone();
+                nodes.extend(ex.nodes.iter().map(|(k, v)| (*k, v.clone())));
+                cap.nodes = Arc::new(nodes);
+                fs.use_capture(cap.nodes.clone());
+                map.apply_exclusion(&ex.data, &ex.nodes);
+                excluded = ex.subvolumes;
+            }
+            Ok(None) => {}
+            // Better a bigger backup than none: keep everything.
+            Err(e) => eprintln!("cannot leave subvolumes out ({e}): they are backed up too"),
+        }
+    }
+    Ok(Prepared { fs, cap, map, top, run_dir, unpinned, excluded, snapshot_time, mounted_by_us })
 }
 
 /// Deletes agent snapshots left over from previous runs: an interrupted backup, or a system
@@ -161,6 +196,13 @@ pub fn remove_stale(dev: &Path, uuid: &str) -> Result<usize, Error> {
         let _ = std::fs::remove_dir(&top);
     }
     result.map(|_| removed)
+}
+
+/// Unmounts a top level mounted by [`top_mount`].
+pub fn top_unmount(top: &Path) {
+    let c = CString::new(top.to_string_lossy().as_bytes()).unwrap();
+    unsafe { libc::umount2(c.as_ptr(), libc::MNT_DETACH) };
+    let _ = std::fs::remove_dir(top);
 }
 
 impl Prepared {

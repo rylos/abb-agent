@@ -1,0 +1,15 @@
+[Unit]
+Description=Recreate btrfs subvolumes left out of the abb-agent backup (after a restore)
+Documentation=https://github.com/rylos/abb-agent
+DefaultDependencies=no
+After=systemd-remount-fs.service
+Before=local-fs-pre.target local-fs.target
+Wants=local-fs-pre.target
+ConditionPathExists=/var/lib/abb-agent/excluded.json
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/abb-agent restore-fixup
+
+[Install]
+WantedBy=local-fs.target

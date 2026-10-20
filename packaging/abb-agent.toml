@@ -27,6 +27,14 @@ retry_minutes = 60
 # Example: wait_locks = ["/run/lock/backup-nas.lock"]
 wait_locks = []
 
+[btrfs]
+# Subvolumes to leave out of the image, as paths from the top-level subvolume (`*` and `?`
+# allowed). In the restored system they no longer exist: btrfs removes them on the first mount.
+# Their data is not sent unless other subvolumes (e.g. snapshots of them) still use it, so list
+# those snapshots too. Subvolumes nested inside an excluded one are excluded with it.
+# Example: exclude_subvolumes = ["@games", "btrbk_snapshots/@games.*"]
+exclude_subvolumes = []
+
 [ext]
 # ext2/3/4 filesystems mounted read-write cannot be imaged consistently without a snapshot.
 # false: they are skipped and the backup is reported as partial.

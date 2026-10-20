@@ -76,7 +76,14 @@ impl Vol {
         let name = crate::backup::alias(p);
         match p.fs {
             Fs::Btrfs => {
-                let prep = prepare(&p.device(), &p.fs_uuid, run_name)
+                let exclude = &crate::config::get().btrfs.exclude_subvolumes;
+                let uuid = p.fs_uuid.clone();
+                let mut record = |paths: &[std::path::PathBuf]| {
+                    if let Err(e) = crate::fixup::record(&uuid, paths) {
+                        eprintln!("recording excluded subvolumes: {e}");
+                    }
+                };
+                let prep = prepare(&p.device(), &p.fs_uuid, run_name, exclude, &mut record)
                     .map_err(|e| Error::Protocol(format!("preparing {name}: {e}")))?;
                 let digests = Digests::compute(&prep.fs, &prep.cap, &prep.map)
                     .map_err(|e| Error::Protocol(format!("digests of {name}: {e}")))?;
@@ -87,6 +94,9 @@ impl Vol {
                     prep.cap.data.len(),
                     prep.map.stats.physical_bytes as f64 / (1u64 << 30) as f64
                 );
+                for x in &prep.excluded {
+                    eprintln!("{name}: subvolume {} left out", x.display());
+                }
                 for u in &prep.unpinned {
                     eprintln!("{name}: {} not snapshotted (active swapfile?): inconsistent data, partial backup", u.display());
                 }

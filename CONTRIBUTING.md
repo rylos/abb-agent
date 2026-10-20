@@ -7,7 +7,7 @@ Thanks for helping. A few notes to make it smooth.
 | crate | role |
 |---|---|
 | `crates/abb-proto` | wire format and transport for the ABB agent protocol (TLS with certificate pinning) |
-| `crates/btrfs-image` | read-only btrfs parser on the raw device: chunk map, tree walks with verification, used-block map, snapshots, capture, change fingerprints |
+| `crates/btrfs-image` | read-only btrfs parser on the raw device: chunk map, tree walks with verification, used-block map, snapshots, capture, change fingerprints, copy-on-read tree edits for subvolume exclusion |
 | `crates/ext-image` | read-only ext2/3/4 used-block map |
 | `crates/abb-agent` | the agent: CLI, service, schedule, device description, upload stream |
 
@@ -26,6 +26,9 @@ argument:
   corrupted block.
 - `tests/ext.sh <dir>` checks the ext used-block map against `dumpe2fs` and `e2fsck` for ten
   filesystem variants.
+- `tests/exclude.sh <dir>` excludes a subvolume (with a nested one and a snapshot) under write
+  load; the image must pass `btrfs check`, drop the subvolumes on mount, and pass check and scrub
+  again with the other files intact.
 - `tests/coherence.sh <dir>` writes an image of a btrfs under write load and checks it with
   `btrfs check`, scrub and file hashes.
 

@@ -33,6 +33,10 @@ read-only snapshots and a bit of care.
 - **Incremental backups** (changed-block tracking) computed from btrfs metadata, without
   reading the data again. In-place writes such as NOCOW files and preallocated extents are
   detected too.
+- **Subvolume exclusion**: btrfs subvolumes (e.g. a games library or a package cache) can be
+  left out of the image. In the image they become deleted subvolumes that btrfs removes on the
+  first mount, so the restored filesystem stays consistent; their data is not sent. A small boot
+  unit recreates them empty after a restore, so mounts in `/etc/fstab` keep working.
 - **ext2/3/4**: used blocks from the block-group bitmaps. Unmounted and read-only volumes are
   imaged directly; read-write mounted ones are skipped or, if you allow it, frozen during the
   backup.
@@ -67,6 +71,7 @@ From source on any distribution (Rust 1.88 or newer):
 cargo build --release -p abb-agent
 sudo install -Dm755 target/release/abb-agent /usr/bin/abb-agent
 sudo install -Dm644 packaging/systemd/abb-agent.service /usr/lib/systemd/system/abb-agent.service
+sudo install -Dm644 packaging/systemd/abb-agent-fixup.service /usr/lib/systemd/system/abb-agent-fixup.service
 sudo install -Dm644 packaging/abb-agent.toml /etc/abb-agent.toml
 ```
 
@@ -88,6 +93,7 @@ sudo install -Dm644 packaging/abb-agent.toml /etc/abb-agent.toml
 
    ```sh
    sudo systemctl enable --now abb-agent
+   sudo systemctl enable abb-agent-fixup   # only needed if you exclude subvolumes
    ```
 
 Other commands:
@@ -123,7 +129,9 @@ For a bare-metal restore, boot the target machine from the ABB recovery media an
 whole disk. The target disk must be at least as large as the original.
 
 After a restore the agent removes, on its first start, the temporary snapshots that were part of
-the image. Your own btrfs snapshots (btrbk, snapper, …) are restored with everything else. The
+the image. Excluded subvolumes are gone in the restored system; `abb-agent-fixup` recreates them
+empty early at boot (it reads the list from `/var/lib/abb-agent`, which must be on the root
+filesystem). Your own btrfs snapshots (btrbk, snapper, …) are restored with everything else. The
 first backup after a restore is a full one.
 
 ## How it works

@@ -5,6 +5,7 @@ mod backup;
 mod config;
 mod control;
 mod disk;
+mod fixup;
 mod host;
 mod nodes;
 mod scheduler;
@@ -30,7 +31,8 @@ const USAGE: &str = "usage:
   abb-agent backup                                       back up now, in the foreground
   abb-agent config                                       configuration in effect (/etc/abb-agent.toml)
   abb-agent disks [disk]                                 disks, partitions and filesystems
-  abb-agent bench [disk…] [--freeze-ext] [--limit GiB]   offline test: snapshot, read,
+  abb-agent bench [disk…] [--freeze-ext] [--limit GiB] [--image PREFIX]
+                                                         offline test: snapshot, read,
                                                          verify and compress the whole disk
   abb-agent probe <server>                               server version, without pairing
   abb-agent version                                      agent version";
@@ -44,6 +46,8 @@ fn main() {
             println!("# {}", config::path());
             print!("{}", toml::to_string_pretty(cfg).unwrap_or_else(|e| die(e)));
         }
+        // Early at boot (abb-agent-fixup.service): recreate excluded subvolumes after a restore.
+        Some("restore-fixup") => fixup::run(),
         Some("version" | "--version" | "-V") => println!("abb-agent {}", env!("CARGO_PKG_VERSION")),
         Some("connect") => {
             let server = opt("-a").unwrap_or_else(|| usage());
@@ -85,10 +89,10 @@ fn main() {
             let limit = opt("--limit").map(|g| g.parse::<u64>().unwrap_or_else(|_| usage()) << 30);
             let names: Vec<String> = names
                 .into_iter()
-                .filter(|a| !a.starts_with("--") && Some(a) != opt("--limit").as_ref())
+                .filter(|a| !a.starts_with("--") && Some(a) != opt("--limit").as_ref() && Some(a) != opt("--image").as_ref())
                 .collect();
             let names = if names.is_empty() { vec![disk::system_disk().unwrap_or_else(|e| die(e))] } else { names };
-            backup::bench(names, freeze, limit).unwrap_or_else(|e| die(e));
+            backup::bench(names, freeze, limit, opt("--image").as_deref()).unwrap_or_else(|e| die(e));
         }
         Some("probe") => {
             let host = args.get(2).cloned().unwrap_or_else(|| usage());

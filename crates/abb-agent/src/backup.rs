@@ -725,7 +725,7 @@ fn run_inner(
 
 /// Offline test: prepares the disks' volumes, then reads, reassembles, verifies and compresses
 /// everything a full backup would send, and reports the timings.
-pub fn bench(names: Vec<String>, freeze_ext: bool, limit: Option<u64>) -> Result<()> {
+pub fn bench(names: Vec<String>, freeze_ext: bool, limit: Option<u64>, image: Option<&str>) -> Result<()> {
     let mut disks = Vec::new();
     let mut volume_parts = Vec::new();
     for n in names {
@@ -742,7 +742,7 @@ pub fn bench(names: Vec<String>, freeze_ext: bool, limit: Option<u64>) -> Result
     let volumes = prepare_volumes(&volume_parts, &format!("abb-bench-{}", now()), |_, _| {})?;
     eprintln!("preparation and digests: {:.1}s ({} workers)", t.elapsed().as_secs_f64(), stream::workers());
     let t = Instant::now();
-    let result = stream::bench(&disks, &volumes, limit);
+    let result = stream::bench(&disks, &volumes, limit, image);
     volumes.into_iter().for_each(Vol::cleanup);
     let (raw, packed) = result?;
     let s = t.elapsed().as_secs_f64();

@@ -9,6 +9,8 @@ pub mod capture;
 pub mod cbt;
 pub mod device;
 pub mod disk;
+pub mod edit;
+pub mod exclude;
 pub mod image;
 pub mod prepare;
 pub mod snapshot;

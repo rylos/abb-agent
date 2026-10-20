@@ -22,6 +22,9 @@ pub struct Range {
     pub logical: u64,
     /// Transaction that allocated the extent (from the extent item; 0 for [`Kind::Reserved`]).
     pub generation: u64,
+    /// Non-zero when the bytes sent for this range differ from the disk (tree nodes edited for
+    /// the image): mixed into the change fingerprints.
+    pub salt: u64,
 }
 
 #[derive(Default, Debug)]
@@ -34,6 +37,8 @@ pub struct Stats {
 }
 
 pub struct UsedMap {
+    /// Data extents left out of the image (excluded subvolumes): (logical, length), sorted.
+    pub excluded_data: Vec<(u64, u64)>,
     /// Physical ranges sorted by offset (not merged: each keeps its own kind).
     pub ranges: Vec<Range>,
     pub stats: Stats,
@@ -45,10 +50,10 @@ impl UsedMap {
         let mut ranges = Vec::new();
         let mut stats = Stats::default();
 
-        ranges.push(Range { physical: 0, len: 1 << 20, kind: Kind::Reserved, logical: 0, generation: 0 });
+        ranges.push(Range { physical: 0, len: 1 << 20, kind: Kind::Reserved, logical: 0, generation: 0, salt: 0 });
         for &m in &SUPER_MIRRORS[1..] {
             if m + SUPER_SIZE as u64 <= fs.sb.total_bytes {
-                ranges.push(Range { physical: m, len: SUPER_SIZE as u64, kind: Kind::Reserved, logical: 0, generation: 0 });
+                ranges.push(Range { physical: m, len: SUPER_SIZE as u64, kind: Kind::Reserved, logical: 0, generation: 0, salt: 0 });
             }
         }
 
@@ -79,13 +84,25 @@ impl UsedMap {
                 }
             }
             for physical in fs.physical(logical)? {
-                ranges.push(Range { physical, len, kind, logical, generation });
+                ranges.push(Range { physical, len, kind, logical, generation, salt: 0 });
             }
         }
 
         ranges.sort_by_key(|r| r.physical);
         stats.physical_bytes = ranges.iter().map(|r| r.len).sum();
-        Ok(UsedMap { ranges, stats })
+        Ok(UsedMap { ranges, stats, excluded_data: Vec::new() })
+    }
+
+    /// Leaves out data extents (sent as unused) and marks edited tree nodes.
+    pub fn apply_exclusion(&mut self, data: &[(u64, u64)], edited: &std::collections::HashMap<u64, Vec<u8>>) {
+        self.ranges.retain(|r| r.kind != Kind::Data || data.binary_search_by_key(&r.logical, |d| d.0).is_err());
+        for r in self.ranges.iter_mut().filter(|r| r.kind == Kind::Tree) {
+            if let Some(n) = edited.get(&r.logical) {
+                r.salt = (crc32c::crc32c(n) as u64) << 32 | crc32c::crc32c_append(0x5bd1_e995, n) as u64 | 1;
+            }
+        }
+        self.stats.physical_bytes = self.ranges.iter().map(|r| r.len).sum();
+        self.excluded_data = data.to_vec();
     }
 
     /// Bitmap of `block`-byte blocks: true if the block contains at least one used byte.

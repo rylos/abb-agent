@@ -23,6 +23,8 @@ const IOC_SNAP_CREATE_V2: libc::c_ulong = 0x5000_9417;
 const IOC_SNAP_DESTROY: libc::c_ulong = 0x5000_940f;
 // _IOWR(0x94, 18, struct btrfs_ioctl_ino_lookup_args), sizeof = 4096
 const IOC_INO_LOOKUP: libc::c_ulong = 0xd000_9412;
+// _IOW(0x94, 14, struct btrfs_ioctl_vol_args), sizeof = 4096
+const IOC_SUBVOL_CREATE: libc::c_ulong = 0x5000_940e;
 /// _IO(0x94, 8)
 const IOC_SYNC: libc::c_ulong = 0x9408;
 
@@ -136,6 +138,21 @@ pub fn sync(top: &Path) -> Result<(), Error> {
     let f = open_dir(top)?;
     if unsafe { libc::ioctl(f.as_raw_fd(), IOC_SYNC) } < 0 {
         return Err(os_err("BTRFS_IOC_SYNC"));
+    }
+    Ok(())
+}
+
+/// Creates the empty subvolume `name` in `parent_dir`.
+pub fn create_subvolume(parent_dir: &Path, name: &str) -> Result<(), Error> {
+    let dir = open_dir(parent_dir)?;
+    let mut args = VolArgs { fd: 0, name: [0; 4088] };
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes.len() >= args.name.len() || bytes.contains(&b'/') {
+        return Err(Error::Format(format!("invalid subvolume name {name:?}")));
+    }
+    args.name[..bytes.len()].copy_from_slice(bytes);
+    if unsafe { libc::ioctl(dir.as_raw_fd(), IOC_SUBVOL_CREATE, &args) } < 0 {
+        return Err(os_err(&format!("creating subvolume {name}")));
     }
     Ok(())
 }
