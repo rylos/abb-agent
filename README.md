@@ -352,6 +352,18 @@ Things that do not work yet, or have not been tested:
 See [CONTRIBUTING.md](CONTRIBUTING.md). Bug reports with `abb-agent disks` output and the
 journal of the service (`journalctl -u abb-agent`) are very welcome.
 
+## Buy me a beer
+
+If abb-agent saves you a backup, or a weekend, you can buy me a beer 🍺 at this Ethereum
+address:
+
+```
+0xF4dd2D015b913E30429974c2b82e15df5b92fB19
+```
+
+ETH or any token on Ethereum and on the networks that use the same addresses (Base, Arbitrum,
+Optimism, Polygon, BNB Chain…), e.g. USDC or USDT. Thank you!
+
 ## License
 
 GPL-3.0-or-later. See [LICENSE](LICENSE).
