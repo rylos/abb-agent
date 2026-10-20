@@ -4,7 +4,8 @@
 //! inode tables), as the kernel does when it initializes the bitmap.
 
 use btrfs_image::device::Device;
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 const SB_OFFSET: u64 = 1024;
 const MAGIC: u16 = 0xEF53;
@@ -17,6 +18,10 @@ const RO_COMPAT_GDT_CSUM: u32 = 0x10;
 const RO_COMPAT_BIGALLOC: u32 = 0x200;
 const RO_COMPAT_METADATA_CSUM: u32 = 0x400;
 const BG_BLOCK_UNINIT: u16 = 0x2;
+const BG_INODE_UNINIT: u16 = 0x1;
+const INODE_EXTENTS: u32 = 0x80000;
+const INODE_INLINE_DATA: u32 = 0x1000_0000;
+const EXTENT_MAGIC: u16 = 0xF30A;
 
 #[derive(Debug)]
 pub enum Error {
@@ -52,6 +57,7 @@ fn u32_at(b: &[u8], o: usize) -> u32 {
 }
 
 struct Super {
+    first_ino: u64,
     blocks: u64,
     first_data_block: u64,
     block_size: u64,
@@ -80,6 +86,7 @@ impl Super {
             return Err(Error::Format(format!("s_log_block_size {log}")));
         }
         let s = Super {
+            first_ino: if u32_at(b, 0x4C) == 0 { 11 } else { u32_at(b, 0x54) as u64 },
             blocks: u32_at(b, 0x4) as u64 | if is64 { (u32_at(b, 0x150) as u64) << 32 } else { 0 },
             first_data_block: u32_at(b, 0x14) as u64,
             block_size: 1024 << log,
@@ -175,6 +182,21 @@ impl Super {
     }
 }
 
+/// What an incremental needs to know about the inodes: a signature of every inode in use, the
+/// blocks each one owns, and the inode table blocks that hold no inode in use.
+#[derive(Default)]
+pub struct Inodes {
+    /// Inode number → (ctime, mtime, size, generation and flags): if it is the same as in the
+    /// previous backup, the file and its blocks did not change (the approach of rustic and
+    /// restic: ctime cannot be set by a program, any change of content or mapping updates it).
+    pub sigs: HashMap<u32, [u64; 4]>,
+    /// Byte ranges owned by an inode: its data and the blocks of its mapping (extent tree
+    /// nodes, indirect blocks), as (start, length, inode), sorted.
+    pub owned: Vec<(u64, u64, u32)>,
+    /// Inode table blocks with no inode in use: (start, length, first inode, inode count).
+    pub free_itable: Vec<(u64, u64, u32, u32)>,
+}
+
 /// An ext filesystem read from the device.
 pub struct ExtFs {
     pub block_size: u64,
@@ -185,6 +207,9 @@ pub struct ExtFs {
     /// Last superblock write time (to detect a changed filesystem).
     pub wtime: u32,
     pub groups: u64,
+    path: PathBuf,
+    sb: Super,
+    descs: Vec<u8>,
 }
 
 impl ExtFs {
@@ -262,7 +287,63 @@ impl ExtFs {
                 }
             }
         }
-        Ok(ExtFs { block_size: bs, size: sb.blocks * bs, ranges, wtime: sb.wtime, groups: ngroups })
+        Ok(ExtFs { block_size: bs, size: sb.blocks * bs, ranges, wtime: sb.wtime, groups: ngroups, path: path.to_path_buf(), sb, descs })
+    }
+
+    /// Reads the inode tables (only the blocks holding inodes in use) and the mapping of every
+    /// inode. Special inodes (journal, resize…) are left out: their blocks are always read.
+    pub fn inodes(&self) -> Result<Inodes, Error> {
+        let sb = &self.sb;
+        let bs = sb.block_size;
+        let dev = Device::open(&self.path)?;
+        let uninit_ok = sb.ro_compat & (RO_COMPAT_GDT_CSUM | RO_COMPAT_METADATA_CSUM) != 0;
+        let per_block = bs / sb.inode_size;
+        let itable_blocks = (sb.inodes_per_group * sb.inode_size).div_ceil(bs);
+        let mut out = Inodes::default();
+        let mut bitmap = vec![0u8; bs as usize];
+        for g in 0..sb.groups() {
+            let d = &self.descs[(g * sb.desc_size) as usize..((g + 1) * sb.desc_size) as usize];
+            let hi = |o: usize| if sb.desc_size >= 64 { (u32_at(d, o) as u64) << 32 } else { 0 };
+            let hi16 = |o: usize| if sb.desc_size >= 64 { (u16_at(d, o) as u64) << 16 } else { 0 };
+            let inode_bitmap = u32_at(d, 0x4) as u64 | hi(0x24);
+            let table = u32_at(d, 0x8) as u64 | hi(0x28);
+            let flags = u16_at(d, 0x12);
+            let first_ino = (g * sb.inodes_per_group + 1) as u32;
+            // Inodes possibly in use in this group.
+            let in_use = if uninit_ok && flags & BG_INODE_UNINIT != 0 {
+                0
+            } else {
+                let unused = if uninit_ok { u16_at(d, 0x1C) as u64 | hi16(0x32) } else { 0 };
+                sb.inodes_per_group.saturating_sub(unused)
+            };
+            if in_use > 0 {
+                dev.read_exact_at(&mut bitmap, inode_bitmap * bs)?;
+            }
+            let used = |i: u64| i < in_use && bitmap[(i / 8) as usize] & (1 << (i % 8)) != 0;
+            let mut block = vec![0u8; bs as usize];
+            for b in 0..itable_blocks {
+                let range = b * per_block..((b + 1) * per_block).min(sb.inodes_per_group);
+                if !range.clone().any(used) {
+                    out.free_itable.push(((table + b) * bs, bs, first_ino + range.start as u32, (range.end - range.start) as u32));
+                    continue;
+                }
+                dev.read_exact_at(&mut block, (table + b) * bs)?;
+                for i in range.filter(|&i| used(i)) {
+                    let ino = first_ino + i as u32;
+                    if (ino as u64) < sb.first_ino && ino != 2 {
+                        continue;
+                    }
+                    let o = ((i % per_block) * sb.inode_size) as usize;
+                    let raw = &block[o..o + sb.inode_size as usize];
+                    if let Some((sig, owned)) = inode(raw, sb, &dev) {
+                        out.sigs.insert(ino, sig);
+                        out.owned.extend(owned.into_iter().map(|(s, l)| (s * bs, l * bs, ino)));
+                    }
+                }
+            }
+        }
+        out.owned.sort_unstable();
+        Ok(out)
     }
 
     pub fn used_bytes(&self) -> u64 {
@@ -298,4 +379,100 @@ impl ExtFs {
         let k = self.ranges.partition_point(|(s, l)| s + l <= start);
         self.ranges.get(k).is_some_and(|(s, _)| *s < end)
     }
+}
+
+/// Signature and owned blocks (first block, count) of an inode in use; `None` if it cannot be
+/// read with confidence (its blocks are then always read).
+fn inode(raw: &[u8], sb: &Super, dev: &Device) -> Option<([u64; 4], Vec<(u64, u64)>)> {
+    let mode = u16_at(raw, 0) as u32;
+    if mode == 0 || u16_at(raw, 0x1A) == 0 {
+        return None;
+    }
+    let extra = if raw.len() > 0x80 { u16_at(raw, 0x80) as usize } else { 0 };
+    let field = |o: usize| if extra >= o + 4 - 0x80 && raw.len() >= o + 4 { u32_at(raw, o) as u64 } else { 0 };
+    let flags = u32_at(raw, 0x20);
+    let size = u32_at(raw, 4) as u64 | (u32_at(raw, 0x6C) as u64) << 32;
+    let sig = [
+        (u32_at(raw, 0xC) as u64) << 32 | field(0x84),
+        (u32_at(raw, 0x10) as u64) << 32 | field(0x88),
+        size,
+        (u32_at(raw, 0x64) as u64) << 32 | flags as u64,
+    ];
+    let kind = mode & 0xF000;
+    let mut owned = Vec::new();
+    // Device files, FIFOs and sockets own no block; neither do inline data and fast symlinks.
+    let has_blocks = matches!(kind, 0x8000 | 0x4000 | 0xA000) && flags & INODE_INLINE_DATA == 0 && u32_at(raw, 0x1C) != 0;
+    if has_blocks {
+        let iblock = &raw[0x28..0x28 + 60];
+        let ok = if flags & INODE_EXTENTS != 0 {
+            extents(iblock, sb, dev, &mut owned, 0)
+        } else {
+            indirect(iblock, sb, dev, &mut owned)
+        };
+        if !ok {
+            return None;
+        }
+    }
+    Some((sig, owned))
+}
+
+fn extents(node: &[u8], sb: &Super, dev: &Device, owned: &mut Vec<(u64, u64)>, level: u32) -> bool {
+    if u16_at(node, 0) != EXTENT_MAGIC || level > 5 {
+        return false;
+    }
+    let (entries, depth) = (u16_at(node, 2) as usize, u16_at(node, 6));
+    if 12 + entries * 12 > node.len() {
+        return false;
+    }
+    for e in 0..entries {
+        let x = &node[12 + e * 12..24 + e * 12];
+        if depth == 0 {
+            let len = u16_at(x, 4) as u64;
+            let len = if len > 32768 { len - 32768 } else { len };
+            let start = (u16_at(x, 6) as u64) << 32 | u32_at(x, 8) as u64;
+            if start + len > sb.blocks {
+                return false;
+            }
+            owned.push((start, len));
+        } else {
+            let child = (u16_at(x, 8) as u64) << 32 | u32_at(x, 4) as u64;
+            if child >= sb.blocks {
+                return false;
+            }
+            let mut buf = vec![0u8; sb.block_size as usize];
+            if dev.read_exact_at(&mut buf, child * sb.block_size).is_err() {
+                return false;
+            }
+            owned.push((child, 1));
+            if !extents(&buf, sb, dev, owned, level + 1) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// ext2/3 block map: 12 direct blocks, then single, double and triple indirect blocks.
+fn indirect(iblock: &[u8], sb: &Super, dev: &Device, owned: &mut Vec<(u64, u64)>) -> bool {
+    fn walk(b: u64, depth: u32, sb: &Super, dev: &Device, owned: &mut Vec<(u64, u64)>) -> bool {
+        if b == 0 {
+            return true;
+        }
+        if b >= sb.blocks {
+            return false;
+        }
+        match owned.last_mut() {
+            Some((s, l)) if *s + *l == b => *l += 1,
+            _ => owned.push((b, 1)),
+        }
+        if depth == 0 {
+            return true;
+        }
+        let mut buf = vec![0u8; sb.block_size as usize];
+        if dev.read_exact_at(&mut buf, b * sb.block_size).is_err() {
+            return false;
+        }
+        (0..buf.len() / 4).all(|i| walk(u32_at(&buf, i * 4) as u64, depth - 1, sb, dev, owned))
+    }
+    (0..15).all(|i| walk(u32_at(iblock, i * 4) as u64, i.saturating_sub(11) as u32, sb, dev, owned))
 }

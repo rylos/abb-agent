@@ -24,6 +24,25 @@ fn main() {
         fs.used_bytes() / fs.block_size,
         fs.ranges.len()
     );
+    if args.iter().any(|a| a == "--inodes") {
+        let t = std::time::Instant::now();
+        let i = fs.inodes().unwrap_or_else(|e| {
+            eprintln!("error: {e}");
+            std::process::exit(1)
+        });
+        let owned: u64 = i.owned.iter().map(|o| o.1).sum();
+        // Owned blocks must all be in use.
+        let outside: u64 = i.owned.iter().filter(|o| !fs.any_used(o.0, o.0 + o.1)).map(|o| o.1).sum();
+        println!(
+            "inodes in use {}, owned {:.1} MiB in {} ranges ({} B outside the used blocks), free inode table blocks {}, in {:.2}s",
+            i.sigs.len(),
+            owned as f64 / 1048576.0,
+            i.owned.len(),
+            outside,
+            i.free_itable.len(),
+            t.elapsed().as_secs_f64()
+        );
+    }
     if let Some(i) = args.iter().position(|a| a == "--image") {
         let out = std::fs::File::create(&args[i + 1]).expect("image file");
         out.set_len(fs.size).unwrap();

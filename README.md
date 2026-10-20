@@ -113,7 +113,9 @@ read-only snapshots and a bit of care.
   unit recreates them empty after a restore, so mounts in `/etc/fstab` keep working.
 - **ext2/3/4**: used blocks from the block-group bitmaps. Unmounted and read-only volumes are
   imaged directly; read-write mounted ones are skipped or, if you allow it, frozen during the
-  backup.
+  backup. Incrementals read only what may have changed: the inode tables are compared with the
+  previous backup's (ctime, mtime, size, generation, as rustic and restic do for files), and the
+  blocks of unchanged files are not read again.
 - Schedule decided by the agent: after every boot and every N hours, with retries. Backups
   can also be started from the ABB console.
 - Parallel read, verification and LZ4 compression (several GB/s on NVMe).
@@ -319,7 +321,9 @@ restore is a full one.
    previous version are not sent.
 
 ext volumes follow the same scheme, using the block bitmaps instead of the extent tree. Their
-fingerprints are computed while reading.
+fingerprints are computed while reading; in an incremental, the blocks owned by files whose inode
+did not change keep the previous fingerprint and are not read (a file changed behind the
+filesystem's back, by writing to the block device directly, would not be seen).
 
 ## Known limitations
 

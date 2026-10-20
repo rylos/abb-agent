@@ -58,6 +58,10 @@ pub struct ExtVol {
     pub fs: ExtFs,
     /// Digests of the 64 KiB blocks, computed from the data while it is sent.
     table: Vec<AtomicU64>,
+    /// Inodes in use and the blocks they own (for incrementals without reading unchanged files).
+    inodes: Option<ext_image::Inodes>,
+    /// Blocks known unchanged from the inodes (bitset over 64 KiB blocks).
+    skip: Vec<u64>,
     _freeze: Option<Freeze>,
 }
 
@@ -115,7 +119,8 @@ impl Vol {
                     if freeze.is_some() { ", frozen until the upload ends" } else { "" }
                 );
                 let n = fs.size.div_ceil(cbt::BLOCK) as usize;
-                Ok(Vol::Ext(ExtVol { fs, table: (0..n).map(|_| AtomicU64::new(0)).collect(), _freeze: freeze }))
+                let inodes = fs.inodes().map_err(|e| eprintln!("{name}: reading the inodes: {e}")).ok();
+                Ok(Vol::Ext(ExtVol { fs, table: (0..n).map(|_| AtomicU64::new(0)).collect(), inodes, skip: vec![], _freeze: freeze }))
             }
             _ => Err(Error::Protocol(format!("{name}: unsupported filesystem"))),
         }
@@ -213,6 +218,81 @@ impl Vol {
         Ok(true)
     }
 
+    /// ext: with the inodes of the previous backup, finds the 64 KiB blocks that need not be
+    /// read: every used byte in them belongs to a file whose inode did not change (same ctime,
+    /// mtime, size, generation and flags, as rustic and restic decide), or to an inode table
+    /// block whose inodes were and are all free. Returns how many.
+    pub fn plan_skip(&mut self, prev: &std::collections::HashMap<u32, [u64; 4]>) -> usize {
+        let Vol::Ext(x) = self else { return 0 };
+        let Some(inodes) = &x.inodes else { return 0 };
+        let mut safe: Vec<(u64, u64)> = inodes
+            .owned
+            .iter()
+            .filter(|(_, _, ino)| prev.get(ino).is_some_and(|p| Some(p) == inodes.sigs.get(ino)))
+            .map(|&(s, l, _)| (s, l))
+            .chain(
+                inodes
+                    .free_itable
+                    .iter()
+                    .filter(|&&(_, _, first, n)| (first..first + n).all(|i| !prev.contains_key(&i)))
+                    .map(|&(s, l, _, _)| (s, l)),
+            )
+            .collect();
+        safe.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(safe.len());
+        for (s, l) in safe {
+            match merged.last_mut() {
+                Some((ms, ml)) if s <= *ms + *ml => *ml = (s + l).max(*ms + *ml) - *ms,
+                _ => merged.push((s, l)),
+            }
+        }
+        let n = x.table.len();
+        x.skip = vec![0u64; n.div_ceil(64)];
+        let mut count = 0;
+        let mut j = 0;
+        let mut k = 0usize;
+        // Walk the used ranges block by block; a block is safe if all its used bytes are.
+        let mut ok = vec![true; n];
+        let mut any = vec![false; n];
+        for &(s, l) in &x.fs.ranges {
+            let mut p = s;
+            while p < s + l {
+                let b = (p / cbt::BLOCK) as usize;
+                let e = ((b as u64 + 1) * cbt::BLOCK).min(s + l);
+                any[b] = true;
+                while j < merged.len() && merged[j].0 + merged[j].1 <= p {
+                    j += 1;
+                }
+                if !(j < merged.len() && merged[j].0 <= p && merged[j].0 + merged[j].1 >= e) {
+                    ok[b] = false;
+                }
+                p = e;
+            }
+        }
+        while k < n {
+            if any[k] && ok[k] {
+                x.skip[k / 64] |= 1 << (k % 64);
+                count += 1;
+            }
+            k += 1;
+        }
+        count
+    }
+
+    /// ext: block `k` is unchanged from the inodes; takes its digest from the previous backup.
+    pub fn skip_block(&self, prev: &Digests, k: usize) -> bool {
+        match self {
+            Vol::Ext(x) if x.skip.get(k / 64).is_some_and(|w| w & (1 << (k % 64)) != 0) => match prev.table.get(k) {
+                Some(&d) if d != 0 => {
+                    x.table[k].store(d, Ordering::Relaxed);
+                    true
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
     /// For ext after `fill`: the digest of block `k` equals the previous backup's.
     pub fn unchanged(&self, prev: &Digests, k: usize) -> bool {
         match self {
@@ -229,7 +309,14 @@ impl Vol {
             }
             Vol::Ext(x) => {
                 let d = Digests::from_table(x.table.iter().map(|a| a.load(Ordering::Relaxed)).collect());
-                d.save(path, &CbtMeta::new(version_id, x.fs.wtime as u64, partition_offset, &d))
+                d.save(path, &CbtMeta::new(version_id, x.fs.wtime as u64, partition_offset, &d))?;
+                match &x.inodes {
+                    Some(i) => save_inodes(&path.with_extension("inodes"), version_id, &i.sigs),
+                    None => {
+                        let _ = std::fs::remove_file(path.with_extension("inodes"));
+                        Ok(())
+                    }
+                }
             }
         }
     }
@@ -246,4 +333,39 @@ impl Vol {
             eprintln!("snapshot cleanup: {e}");
         }
     }
+}
+
+/// Inode signatures of a backup, with its version: (inode, signature) little endian.
+fn save_inodes(path: &std::path::Path, version_id: u64, sigs: &std::collections::HashMap<u32, [u64; 4]>) -> std::io::Result<()> {
+    let mut out = Vec::with_capacity(8 + sigs.len() * 36);
+    out.extend(version_id.to_le_bytes());
+    for (ino, s) in sigs {
+        out.extend(ino.to_le_bytes());
+        for v in s {
+            out.extend(v.to_le_bytes());
+        }
+    }
+    let raw = lz4_flex::block::compress_prepend_size(&out);
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, raw)?;
+    std::fs::rename(tmp, path)
+}
+
+/// The signatures saved by `save_inodes`, if they belong to `version_id`.
+pub fn load_inodes(path: &std::path::Path, version_id: u64) -> Option<std::collections::HashMap<u32, [u64; 4]>> {
+    let raw = lz4_flex::block::decompress_size_prepended(&std::fs::read(path).ok()?).ok()?;
+    if raw.len() < 8 || u64::from_le_bytes(raw[..8].try_into().ok()?) != version_id || (raw.len() - 8) % 36 != 0 {
+        return None;
+    }
+    let u64_at = |o: usize| u64::from_le_bytes(raw[o..o + 8].try_into().unwrap());
+    Some(
+        raw[8..]
+            .chunks(36)
+            .enumerate()
+            .map(|(i, c)| {
+                let o = 8 + i * 36;
+                (u32::from_le_bytes(c[..4].try_into().unwrap()), [u64_at(o + 4), u64_at(o + 12), u64_at(o + 20), u64_at(o + 28)])
+            })
+            .collect(),
+    )
 }

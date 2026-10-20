@@ -765,10 +765,21 @@ fn run_inner(
     };
     // The post script runs right after the snapshots, whether they succeeded or not.
     let post = scripts::run(job, c, &task.scripts, Hook::Post, version_id);
-    let volumes = volumes?;
+    let mut volumes = volumes?;
     if let Err(e) = post {
         volumes.into_iter().for_each(Vol::cleanup);
         return Err(e);
+    }
+    // ext: blocks of unchanged files need not be read again.
+    if prev.is_some() {
+        for (p, v) in volume_parts.iter().zip(volumes.iter_mut()).filter(|(p, _)| matches!(p.fs, Fs::Ext(_))) {
+            // The CBT table of this volume belongs to the base version (checked when loaded).
+            let Ok((_, meta)) = Digests::load(&cbt_path(p)) else { continue };
+            if let Some(sigs) = crate::volume::load_inodes(&cbt_path(p).with_extension("inodes"), meta.version_id) {
+                let n = v.plan_skip(&sigs);
+                eprintln!("{}: {n} blocks of 64 KiB belong to unchanged files, not read", alias(p));
+            }
+        }
     }
     let snapshot_time = t.elapsed();
     let result = (|| -> Result<bool> {

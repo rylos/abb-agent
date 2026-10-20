@@ -213,6 +213,7 @@ pub fn plan_incremental(intervals: &[Interval], volumes: &[Vol], prev: &[Digests
                         match vol.changed(old, k) {
                             Some(false) => Piece::Run(Run { start: s, end: e, used: true, changed: false, cbt: true }),
                             Some(true) => Piece::Data { start: s, end: e, cbt: true, check: None },
+                            None if vol.skip_block(old, k) => Piece::Run(Run { start: s, end: e, used: true, changed: false, cbt: true }),
                             None => Piece::Data { start: s, end: e, cbt: true, check: Some(Check::Vol(v, k)) },
                         }
                     });
