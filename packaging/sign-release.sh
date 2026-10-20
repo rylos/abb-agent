@@ -11,7 +11,8 @@ cd "$(dirname "$0")/.."
 
 git fetch -q --tags --force origin
 commit=$(git rev-parse "$tag^{commit}")
-git -c user.signingkey=$key tag -s -f "$tag" "$commit" -m "abb-agent $version"
+# The tagger must be an address GitHub verifies for the account (the old-style noreply one).
+git -c user.signingkey=$key -c user.email=rylos@users.noreply.github.com tag -s -f "$tag" "$commit" -m "abb-agent $version"
 git tag -v "$tag"
 git push -f origin "$tag"
 
