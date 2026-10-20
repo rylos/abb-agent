@@ -7,7 +7,7 @@ pkgdesc="Synology Active Backup for Business agent for any Linux distro and kern
 arch=('x86_64')
 url="https://github.com/rylos/abb-agent"
 license=('GPL-3.0-or-later')
-depends=('gcc-libs' 'glibc')
+depends=('glibc' 'libgcc')
 provides=("$_pkgname=$pkgver")
 conflicts=("$_pkgname" "$_pkgname-git")
 backup=('etc/abb-agent.toml')
@@ -16,7 +16,7 @@ source_x86_64=("$_pkgname-$pkgver-x86_64.tar.gz::$url/releases/download/v$pkgver
 sha256sums_x86_64=('SKIP')
 
 package() {
-  cd "$_pkgname-$pkgver-x86_64"
+  cd "$_pkgname-$pkgver-$CARCH"
   install -Dm755 abb-agent "$pkgdir/usr/bin/abb-agent"
   install -Dm755 abb-restore "$pkgdir/usr/bin/abb-restore"
   install -Dm644 abb-agent.service "$pkgdir/usr/lib/systemd/system/abb-agent.service"
