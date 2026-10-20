@@ -223,6 +223,23 @@ restore is a full one.
 ext volumes follow the same scheme, using the block bitmaps instead of the extent tree. Their
 fingerprints are computed while reading.
 
+## Known limitations
+
+Things that do not work yet, or have not been tested:
+
+- **Tested on Arch Linux only**, with ABB 3.2.1 on DSM 7.4. Other distributions (Debian, Fedora,
+  openSUSE…) and other ABB versions should work but have not been tried.
+- **Backup:** XFS, LVM, LUKS, md-raid and multi-device btrfs are left out of the image (the backup
+  is reported as partial). MBR disks are not supported. btrfs quota groups are not updated for
+  excluded subvolumes.
+- **Restore to a smaller disk** works only if the partitions already fit on it: filesystems are not
+  shrunk.
+- **Restore of MBR disks** is not handled beyond writing the image as it is (untested).
+- After a restore onto **different hardware** the initramfs is not regenerated, and no UEFI NVRAM
+  boot entry is created (the fallback path `\EFI\BOOT\` is used instead).
+- The agent identifies itself as the official agent version it was written against; a future ABB
+  release may change the protocol.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Bug reports with `abb-agent disks` output and the
