@@ -1,5 +1,6 @@
 //! Volumes imaged consistently: btrfs (agent snapshot, verified against the checksums) and
-//! ext2/3/4 (unmounted, mounted read-only, or frozen for the whole upload).
+//! ext2/3/4 (unmounted, read-only, or mounted read-write: frozen just long enough to capture
+//! the metadata, or for the whole upload if configured so).
 
 use crate::disk::{Fs, Partition};
 use abb_proto::transport::{Error, Result};
@@ -13,8 +14,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const FIFREEZE: libc::c_ulong = 0xC004_5877;
 const FITHAW: libc::c_ulong = 0xC004_5878;
 
-/// Paths that cannot be on a frozen filesystem: the agent writes there (state, digests,
-/// logs via journald) and would hang.
+/// Paths that cannot be on a filesystem frozen for long: the agent writes there (state,
+/// digests, logs via journald) and would hang.
 const NEVER_FROZEN: &[&str] = &["/", "/var", "/var/log", "/var/lib/abb-agent", "/tmp", "/run"];
 
 /// Frozen filesystem (FIFREEZE): thawed when dropped.
@@ -23,13 +24,14 @@ struct Freeze {
 }
 
 impl Freeze {
+    /// Whether the filesystem at `mount` holds a path the agent or the system writes to all the
+    /// time: it can only be frozen for an instant.
+    fn holds_live_paths(mount: &str) -> bool {
+        let Ok(dev) = std::fs::metadata(mount).map(|m| m.dev()) else { return true };
+        NEVER_FROZEN.iter().any(|p| std::fs::metadata(p).is_ok_and(|m| m.dev() == dev))
+    }
+
     fn new(mount: &str) -> Result<Freeze> {
-        let dev = std::fs::metadata(mount)?.dev();
-        for p in NEVER_FROZEN {
-            if std::fs::metadata(p).is_ok_and(|m| m.dev() == dev) {
-                return Err(Error::Protocol(format!("{mount}: contains {p}, cannot be frozen")));
-            }
-        }
         let dir = std::fs::File::open(mount)?;
         let mut arg: libc::c_int = 0;
         if unsafe { libc::ioctl(std::os::fd::AsRawFd::as_raw_fd(&dir), FIFREEZE, &mut arg) } != 0 {
@@ -48,11 +50,7 @@ impl Drop for Freeze {
     }
 }
 
-/// An ext can be read consistently if it is unmounted, mounted read-only, or (with
-/// `freeze`) can be frozen.
-pub fn ext_readable(p: &Partition, freeze: bool) -> bool {
-    p.mount_path.is_empty() || p.read_only || freeze
-}
+
 
 pub struct ExtVol {
     pub fs: ExtFs,
@@ -62,6 +60,11 @@ pub struct ExtVol {
     inodes: Option<ext_image::Inodes>,
     /// Blocks known unchanged from the inodes (bitset over 64 KiB blocks).
     skip: Vec<u64>,
+    /// Metadata read while the filesystem was frozen for an instant (mounted read-write): it
+    /// replaces what is on the device, so that the image is consistent. Sorted by offset.
+    overlay: Vec<(u64, Vec<u8>)>,
+    /// Mount point, for a filesystem read while in use.
+    mount: Option<String>,
     _freeze: Option<Freeze>,
 }
 
@@ -110,9 +113,45 @@ impl Vol {
                 Ok(Vol::Btrfs { prep, digests })
             }
             Fs::Ext(_) => {
-                // Freeze first, then read the map: it must hold for the whole upload.
-                let freeze = if p.mount_path.is_empty() || p.read_only { None } else { Some(Freeze::new(&p.mount_path)?) };
-                let fs = ExtFs::open(&p.device()).map_err(|e| Error::Protocol(format!("{name}: {e}")))?;
+                let n_err = |e: ext_image::Error| Error::Protocol(format!("{name}: {e}"));
+                let mounted_rw = !(p.mount_path.is_empty() || p.read_only);
+                let whole = mounted_rw && crate::config::get().ext.freeze_mounted && !Freeze::holds_live_paths(&p.mount_path);
+                if mounted_rw && !whole {
+                    // Frozen just long enough to read the metadata: nothing is logged or written
+                    // until it is thawed.
+                    let t = std::time::Instant::now();
+                    let guard = Freeze::new(&p.mount_path)?;
+                    let captured = (|| -> std::result::Result<_, ext_image::Error> {
+                        let fs = ExtFs::open(&p.device())?;
+                        let inodes = fs.inodes()?;
+                        let meta = fs.metadata_ranges(&inodes);
+                        let overlay = fs.read_ranges(&meta)?;
+                        Ok((fs, inodes, overlay))
+                    })();
+                    drop(guard);
+                    let frozen = t.elapsed();
+                    let (fs, inodes, overlay) = captured.map_err(n_err)?;
+                    let bytes: usize = overlay.iter().map(|o| o.1.len()).sum();
+                    eprintln!(
+                        "{name}: ext, {:.1} GiB used, frozen {:.2}s to read {:.1} MiB of metadata, files read while in use",
+                        fs.used_bytes() as f64 / (1u64 << 30) as f64,
+                        frozen.as_secs_f64(),
+                        bytes as f64 / (1u64 << 20) as f64
+                    );
+                    let n = fs.size.div_ceil(cbt::BLOCK) as usize;
+                    return Ok(Vol::Ext(ExtVol {
+                        fs,
+                        table: (0..n).map(|_| AtomicU64::new(0)).collect(),
+                        inodes: Some(inodes),
+                        skip: vec![],
+                        overlay,
+                        mount: Some(p.mount_path.clone()),
+                        _freeze: None,
+                    }));
+                }
+                // Unmounted or read-only, or frozen for the whole upload: read as it is.
+                let freeze = if whole { Some(Freeze::new(&p.mount_path)?) } else { None };
+                let fs = ExtFs::open(&p.device()).map_err(n_err)?;
                 eprintln!(
                     "{name}: ext, {:.1} GiB used{}",
                     fs.used_bytes() as f64 / (1u64 << 30) as f64,
@@ -120,7 +159,7 @@ impl Vol {
                 );
                 let n = fs.size.div_ceil(cbt::BLOCK) as usize;
                 let inodes = fs.inodes().map_err(|e| eprintln!("{name}: reading the inodes: {e}")).ok();
-                Ok(Vol::Ext(ExtVol { fs, table: (0..n).map(|_| AtomicU64::new(0)).collect(), inodes, skip: vec![], _freeze: freeze }))
+                Ok(Vol::Ext(ExtVol { fs, table: (0..n).map(|_| AtomicU64::new(0)).collect(), inodes, skip: vec![], overlay: vec![], mount: None, _freeze: freeze }))
             }
             _ => Err(Error::Protocol(format!("{name}: unsupported filesystem"))),
         }
@@ -177,7 +216,17 @@ impl Vol {
     pub fn fill(&self, vs: u64, seg: &mut [u8]) -> std::result::Result<bool, String> {
         let any = match self {
             Vol::Btrfs { prep, .. } => fill_window(&prep.fs, &prep.cap, &prep.map, vs, seg).map_err(|e| e.to_string())?,
-            Vol::Ext(x) => x.fs.fill_window(vs, seg),
+            Vol::Ext(x) => {
+                let any = x.fs.fill_window(vs, seg);
+                // Metadata captured while frozen replaces what is on the device now.
+                let ve = vs + seg.len() as u64;
+                let first = x.overlay.partition_point(|(s, d)| s + d.len() as u64 <= vs);
+                for (s, d) in x.overlay[first..].iter().take_while(|(s, _)| *s < ve) {
+                    let (a, b) = ((*s).max(vs), (s + d.len() as u64).min(ve));
+                    seg[(a - vs) as usize..(b - vs) as usize].copy_from_slice(&d[(a - s) as usize..(b - s) as usize]);
+                }
+                any
+            }
         };
         if !any {
             seg.fill(0);
@@ -277,6 +326,53 @@ impl Vol {
             k += 1;
         }
         count
+    }
+
+    /// ext read while in use: how many files changed after the metadata was captured (their
+    /// content in this version may be inconsistent; the next backup reads them again).
+    pub fn changed_while_read(&self) -> Option<usize> {
+        let Vol::Ext(x) = self else { return None };
+        if x.overlay.is_empty() {
+            return None;
+        }
+        let then = &x.inodes.as_ref()?.sigs;
+        // The inode tables on the device lag behind the journal: ask the kernel instead, by
+        // inode number and generation (ext's file handle).
+        let dir = std::fs::File::open(x.mount.as_ref()?).ok()?;
+        #[repr(C)]
+        struct Handle {
+            bytes: u32,
+            kind: i32,
+            ino: u32,
+            generation: u32,
+        }
+        const FILEID_INO32_GEN: i32 = 1;
+        let mut changed = 0;
+        for (&ino, sig) in then {
+            let mut h = Handle { bytes: 8, kind: FILEID_INO32_GEN, ino, generation: (sig[3] >> 32) as u32 };
+            let fd = unsafe {
+                libc::open_by_handle_at(
+                    std::os::fd::AsRawFd::as_raw_fd(&dir),
+                    &mut h as *mut Handle as *mut libc::file_handle,
+                    libc::O_PATH,
+                )
+            };
+            if fd < 0 {
+                changed += 1;
+                continue;
+            }
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            let ok = unsafe { libc::fstat(fd, &mut st) } == 0;
+            unsafe { libc::close(fd) };
+            let same = ok
+                && st.st_ctime as u64 == sig[0] >> 32
+                && st.st_ctime_nsec as u64 == (sig[0] & 0xffff_ffff) >> 2
+                && st.st_size as u64 == sig[2];
+            if !same {
+                changed += 1;
+            }
+        }
+        Some(changed)
     }
 
     /// ext: block `k` is unchanged from the inodes; takes its digest from the previous backup.

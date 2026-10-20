@@ -42,6 +42,16 @@ fn main() {
             i.free_itable.len(),
             t.elapsed().as_secs_f64()
         );
+        let meta = fs.metadata_ranges(&i);
+        let file: u64 = i.file_data.iter().map(|r| r.1).sum();
+        let journal: u64 = i.journal.iter().map(|r| r.1).sum();
+        println!(
+            "file data {:.1} MiB, journal {:.1} MiB, metadata to capture {:.1} MiB in {} ranges",
+            file as f64 / 1048576.0,
+            journal as f64 / 1048576.0,
+            meta.iter().map(|r| r.1).sum::<u64>() as f64 / 1048576.0,
+            meta.len()
+        );
     }
     if let Some(i) = args.iter().position(|a| a == "--image") {
         let out = std::fs::File::create(&args[i + 1]).expect("image file");

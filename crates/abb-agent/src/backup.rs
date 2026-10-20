@@ -9,7 +9,7 @@ use crate::scripts::{self, Hook};
 use crate::state::LastRun;
 use crate::task::TaskInfo;
 use crate::stream::{self, MIB, Piece};
-use crate::volume::{self, Vol};
+use crate::volume::Vol;
 use abb_proto::transport::{Error, Result};
 use abb_proto::{Connection, Value};
 use btrfs_image::cbt::Digests;
@@ -127,9 +127,8 @@ pub struct Interval {
     pub source: Source,
 }
 
-/// Disk intervals and volumes to prepare. A read-write mounted ext is backed up only with
-/// `freeze_ext` (frozen for the whole upload), otherwise it is excluded (partial backup).
-fn plan(d: &Disk, volumes: &mut Vec<Partition>, freeze_ext: bool, sel: &Selection) -> Vec<Interval> {
+/// Disk intervals and volumes to prepare.
+fn plan(d: &Disk, volumes: &mut Vec<Partition>, sel: &Selection) -> Vec<Interval> {
     let mut out = Vec::new();
     let mut pos = 0;
     let gap = |s: u64, e: u64| Interval { start: s, end: e, kind: 3, part: None, source: Source::Raw };
@@ -137,7 +136,7 @@ fn plan(d: &Disk, volumes: &mut Vec<Partition>, freeze_ext: bool, sel: &Selectio
         if p.offset > pos {
             out.push(gap(pos, p.offset));
         }
-        let vol = matches!(p.fs, Fs::Btrfs) || (matches!(p.fs, Fs::Ext(_)) && volume::ext_readable(p, freeze_ext));
+        let vol = matches!(p.fs, Fs::Btrfs | Fs::Ext(_));
         let (kind, source) = if p.fs == Fs::Swap {
             (5, Source::Excluded(Skip::Swap))
         } else if !sel.selects(p) {
@@ -521,7 +520,7 @@ fn scan_disks(sel: &Selection) -> Result<(Scan, bool)> {
             Err(e) => return Err(Error::Protocol(format!("{n}: {e}"))),
         };
         let mut parts = Vec::new();
-        let iv = plan(&d, &mut parts, cfg.ext.freeze_mounted, sel);
+        let iv = plan(&d, &mut parts, sel);
         let wanted = *sel == Selection::WholeDevice
             || iv.iter().any(|i| i.part.is_some() && !matches!(i.source, Source::Excluded(_)));
         if !wanted {
@@ -824,6 +823,11 @@ fn run_inner(
 
         stream::upload(job, c, disks, &plans, &volumes, prev, snapshot_time, (task.compression, task.encryption), raws)?;
         raws.save(disks, version_id);
+        for (p, v) in volume_parts.iter().zip(&volumes) {
+            if let Some(n) = v.changed_while_read().filter(|&n| n > 0) {
+                eprintln!("{}: {n} files changed while the backup read them: their content in this version may be inconsistent, the next backup reads them again", alias(p));
+            }
+        }
         // The version is on the server: the digests become the base for the next incremental.
         for (p, v) in volume_parts.iter().zip(&volumes) {
             let path = cbt_path(p);
@@ -840,12 +844,12 @@ fn run_inner(
 
 /// Offline test: prepares the disks' volumes, then reads, reassembles, verifies and compresses
 /// everything a full backup would send, and reports the timings.
-pub fn bench(names: Vec<String>, freeze_ext: bool, limit: Option<u64>, image: Option<&str>) -> Result<()> {
+pub fn bench(names: Vec<String>, limit: Option<u64>, image: Option<&str>) -> Result<()> {
     let mut disks = Vec::new();
     let mut volume_parts = Vec::new();
     for n in names {
         let d = disk::scan(&n)?;
-        let iv = plan(&d, &mut volume_parts, freeze_ext, &Selection::WholeDevice);
+        let iv = plan(&d, &mut volume_parts, &Selection::WholeDevice);
         disks.push((d, iv));
     }
     for (d, iv) in &disks {

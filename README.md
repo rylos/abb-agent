@@ -24,7 +24,7 @@ no kernel module and no Synology binaries.
 | filesystem | backup | incremental | notes |
 |---|---|---|---|
 | **btrfs** | ✅ | ✅ | single device, any subvolume layout (`@`, `@home`, snapper, btrbk…) |
-| **ext4** | ✅ | ✅ | read-write mounted volumes are skipped, or frozen if you allow it |
+| **ext4** | ✅ | ✅ | mounted read-write too, the root filesystem included: frozen for an instant to capture the metadata |
 | **ext3**, **ext2** | ✅ | ✅ | as ext4 |
 | vfat (EFI system partition), BIOS boot | ✅ | ✅ | copied as they are |
 | XFS, LVM, LUKS, md-raid, multi-device btrfs | ❌ | | left out, the backup is reported as partial |
@@ -111,11 +111,16 @@ read-only snapshots and a bit of care.
   left out of the image. In the image they become deleted subvolumes that btrfs removes on the
   first mount, so the restored filesystem stays consistent; their data is not sent. A small boot
   unit recreates them empty after a restore, so mounts in `/etc/fstab` keep working.
-- **ext2/3/4**: used blocks from the block-group bitmaps. Unmounted and read-only volumes are
-  imaged directly; read-write mounted ones are skipped or, if you allow it, frozen during the
-  backup. Incrementals read only what may have changed: the inode tables are compared with the
-  previous backup's (ctime, mtime, size, generation, as rustic and restic do for files), and the
-  blocks of unchanged files are not read again.
+- **ext2/3/4**, mounted or not, root filesystem included: used blocks from the block-group
+  bitmaps. A volume mounted read-write is frozen for an instant (typically well under a second)
+  while its metadata (bitmaps, inode tables, directories, extent trees) is read into memory, then
+  thawed; file data is read with the system running. The image is always a consistent
+  filesystem; only files written during the backup may have mixed content (the same guarantee as
+  file-level tools like rustic or restic), and the log counts them. `freeze_mounted = true`
+  keeps the volume frozen for the whole upload instead. Incrementals read only what may have
+  changed: the inode tables are compared with the previous backup's (ctime, mtime, size,
+  generation, as rustic and restic do for files), and the blocks of unchanged files are not read
+  again.
 - Schedule decided by the agent: after every boot and every N hours, with retries. Backups
   can also be started from the ABB console.
 - Parallel read, verification and LZ4 compression (several GB/s on NVMe).
@@ -211,7 +216,7 @@ cargo build --release --target x86_64-unknown-linux-musl -p abb-restore
 | `server error 0x1005: Requires OTP` | the account has two-factor authentication: enter the code when asked, or pass `--otp <code>` |
 | `server error 0x100f: Create Task Failed due to invalid parameters` | the default template's destination does not exist: fix it in ABB → *Settings* → *Template*, then connect again |
 | `permission denied: run it with sudo` | the agent's state is readable by root only |
-| backup ends with `partial` | a volume could not be backed up (unsupported filesystem, read-write mounted ext volume…): see `journalctl -u abb-agent` |
+| backup ends with `partial` | a volume could not be backed up (unsupported filesystem…): see `journalctl -u abb-agent` |
 
 Other commands:
 

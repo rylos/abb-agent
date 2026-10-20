@@ -43,10 +43,12 @@
 # exclude_subvolumes = []
 
 # [ext]
-# ext2/3/4 filesystems mounted read-write cannot be imaged consistently without a snapshot.
-# false: they are skipped and the backup is reported as partial.
-# true: they are frozen (fsfreeze) from the start of the backup until the upload ends, so
-# writers to them block meanwhile. Never applied to filesystems holding /, /var or /tmp.
+# ext2/3/4 filesystems mounted read-write (the root filesystem too) are frozen for an instant
+# while their metadata is read, then the files are read with the system running: the image is a
+# consistent filesystem, files written during the backup may have mixed content (logged).
+# true: frozen from the start of the backup until the upload ends instead, so that files are
+# consistent too; writers block meanwhile. Not applied to filesystems holding /, /var or /tmp,
+# which are always frozen only for an instant.
 # freeze_mounted = false
 
 # [performance]

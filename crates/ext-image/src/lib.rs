@@ -195,6 +195,11 @@ pub struct Inodes {
     pub owned: Vec<(u64, u64, u32)>,
     /// Inode table blocks with no inode in use: (start, length, first inode, inode count).
     pub free_itable: Vec<(u64, u64, u32, u32)>,
+    /// Data of regular files, as byte ranges (start, length), sorted: everything else in use is
+    /// metadata.
+    pub file_data: Vec<(u64, u64)>,
+    /// Blocks of the journal (inode 8), as byte ranges.
+    pub journal: Vec<(u64, u64)>,
 }
 
 /// An ext filesystem read from the device.
@@ -330,12 +335,19 @@ impl ExtFs {
                 dev.read_exact_at(&mut block, (table + b) * bs)?;
                 for i in range.filter(|&i| used(i)) {
                     let ino = first_ino + i as u32;
+                    let o = ((i % per_block) * sb.inode_size) as usize;
+                    let raw = &block[o..o + sb.inode_size as usize];
+                    if ino == 8 {
+                        if let Some((_, owned, _)) = inode(raw, sb, &dev, true) {
+                            out.journal = owned.into_iter().map(|(s, l)| (s * bs, l * bs)).collect();
+                        }
+                        continue;
+                    }
                     if (ino as u64) < sb.first_ino && ino != 2 {
                         continue;
                     }
-                    let o = ((i % per_block) * sb.inode_size) as usize;
-                    let raw = &block[o..o + sb.inode_size as usize];
-                    if let Some((sig, owned)) = inode(raw, sb, &dev) {
+                    if let Some((sig, owned, data)) = inode(raw, sb, &dev, false) {
+                        out.file_data.extend(data.into_iter().map(|(s, l)| (s * bs, l * bs)));
                         out.sigs.insert(ino, sig);
                         out.owned.extend(owned.into_iter().map(|(s, l)| (s * bs, l * bs, ino)));
                     }
@@ -343,7 +355,62 @@ impl ExtFs {
             }
         }
         out.owned.sort_unstable();
+        out.file_data.sort_unstable();
         Ok(out)
+    }
+
+    /// Byte ranges to capture while the filesystem is frozen, so that the image is consistent
+    /// even if the rest is read with the filesystem in use: everything in use except the data of
+    /// regular files, the inode table blocks without inodes in use and the journal past its
+    /// superblock (empty once frozen).
+    pub fn metadata_ranges(&self, inodes: &Inodes) -> Vec<(u64, u64)> {
+        let mut skip: Vec<(u64, u64)> = inodes.file_data.clone();
+        skip.extend(inodes.free_itable.iter().map(|&(s, l, _, _)| (s, l)));
+        let mut journal = inodes.journal.clone();
+        journal.sort_unstable();
+        if let Some(first) = journal.first_mut() {
+            // Keep the journal superblock.
+            first.0 += self.block_size;
+            first.1 -= self.block_size;
+        }
+        skip.extend(journal.into_iter().filter(|r| r.1 > 0));
+        skip.sort_unstable();
+        let mut out = Vec::new();
+        let mut j = 0;
+        for &(s, l) in &self.ranges {
+            let mut p = s;
+            let end = s + l;
+            while p < end {
+                while j < skip.len() && skip[j].0 + skip[j].1 <= p {
+                    j += 1;
+                }
+                match skip.get(j) {
+                    Some(&(ks, kl)) if ks <= p => p = (ks + kl).min(end),
+                    Some(&(ks, _)) if ks < end => {
+                        out.push((p, ks - p));
+                        p = ks;
+                    }
+                    _ => {
+                        out.push((p, end - p));
+                        p = end;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Reads byte ranges of the filesystem.
+    pub fn read_ranges(&self, ranges: &[(u64, u64)]) -> Result<Vec<(u64, Vec<u8>)>, Error> {
+        let dev = Device::open(&self.path)?;
+        ranges
+            .iter()
+            .map(|&(s, l)| {
+                let mut buf = vec![0u8; l as usize];
+                dev.read_exact_at(&mut buf, s)?;
+                Ok((s, buf))
+            })
+            .collect()
     }
 
     pub fn used_bytes(&self) -> u64 {
@@ -383,7 +450,7 @@ impl ExtFs {
 
 /// Signature and owned blocks (first block, count) of an inode in use; `None` if it cannot be
 /// read with confidence (its blocks are then always read).
-fn inode(raw: &[u8], sb: &Super, dev: &Device) -> Option<([u64; 4], Vec<(u64, u64)>)> {
+fn inode(raw: &[u8], sb: &Super, dev: &Device, journal: bool) -> Option<([u64; 4], Vec<(u64, u64)>, Vec<(u64, u64)>)> {
     let mode = u16_at(raw, 0) as u32;
     if mode == 0 || u16_at(raw, 0x1A) == 0 {
         return None;
@@ -401,22 +468,32 @@ fn inode(raw: &[u8], sb: &Super, dev: &Device) -> Option<([u64; 4], Vec<(u64, u6
     let kind = mode & 0xF000;
     let mut owned = Vec::new();
     // Device files, FIFOs and sockets own no block; neither do inline data and fast symlinks.
-    let has_blocks = matches!(kind, 0x8000 | 0x4000 | 0xA000) && flags & INODE_INLINE_DATA == 0 && u32_at(raw, 0x1C) != 0;
+    let has_blocks = (journal || matches!(kind, 0x8000 | 0x4000 | 0xA000)) && flags & INODE_INLINE_DATA == 0 && u32_at(raw, 0x1C) != 0;
+    let mut data = Vec::new();
     if has_blocks {
         let iblock = &raw[0x28..0x28 + 60];
+        let mut leaves = Vec::new();
         let ok = if flags & INODE_EXTENTS != 0 {
-            extents(iblock, sb, dev, &mut owned, 0)
+            extents(iblock, sb, dev, &mut owned, &mut leaves, 0)
         } else {
-            indirect(iblock, sb, dev, &mut owned)
+            indirect(iblock, sb, dev, &mut owned, &mut leaves)
         };
         if !ok {
             return None;
         }
+        if journal {
+            return Some((sig, leaves, Vec::new()));
+        }
+        // Data blocks of regular files; those of directories and symlinks are metadata.
+        if kind == 0x8000 {
+            data = leaves.clone();
+        }
+        owned.extend(leaves);
     }
-    Some((sig, owned))
+    Some((sig, owned, data))
 }
 
-fn extents(node: &[u8], sb: &Super, dev: &Device, owned: &mut Vec<(u64, u64)>, level: u32) -> bool {
+fn extents(node: &[u8], sb: &Super, dev: &Device, owned: &mut Vec<(u64, u64)>, leaves: &mut Vec<(u64, u64)>, level: u32) -> bool {
     if u16_at(node, 0) != EXTENT_MAGIC || level > 5 {
         return false;
     }
@@ -433,7 +510,7 @@ fn extents(node: &[u8], sb: &Super, dev: &Device, owned: &mut Vec<(u64, u64)>, l
             if start + len > sb.blocks {
                 return false;
             }
-            owned.push((start, len));
+            leaves.push((start, len));
         } else {
             let child = (u16_at(x, 8) as u64) << 32 | u32_at(x, 4) as u64;
             if child >= sb.blocks {
@@ -444,7 +521,7 @@ fn extents(node: &[u8], sb: &Super, dev: &Device, owned: &mut Vec<(u64, u64)>, l
                 return false;
             }
             owned.push((child, 1));
-            if !extents(&buf, sb, dev, owned, level + 1) {
+            if !extents(&buf, sb, dev, owned, leaves, level + 1) {
                 return false;
             }
         }
@@ -453,26 +530,30 @@ fn extents(node: &[u8], sb: &Super, dev: &Device, owned: &mut Vec<(u64, u64)>, l
 }
 
 /// ext2/3 block map: 12 direct blocks, then single, double and triple indirect blocks.
-fn indirect(iblock: &[u8], sb: &Super, dev: &Device, owned: &mut Vec<(u64, u64)>) -> bool {
-    fn walk(b: u64, depth: u32, sb: &Super, dev: &Device, owned: &mut Vec<(u64, u64)>) -> bool {
+fn indirect(iblock: &[u8], sb: &Super, dev: &Device, owned: &mut Vec<(u64, u64)>, leaves: &mut Vec<(u64, u64)>) -> bool {
+    fn add(v: &mut Vec<(u64, u64)>, b: u64) {
+        match v.last_mut() {
+            Some((s, l)) if *s + *l == b => *l += 1,
+            _ => v.push((b, 1)),
+        }
+    }
+    fn walk(b: u64, depth: u32, sb: &Super, dev: &Device, owned: &mut Vec<(u64, u64)>, leaves: &mut Vec<(u64, u64)>) -> bool {
         if b == 0 {
             return true;
         }
         if b >= sb.blocks {
             return false;
         }
-        match owned.last_mut() {
-            Some((s, l)) if *s + *l == b => *l += 1,
-            _ => owned.push((b, 1)),
-        }
         if depth == 0 {
+            add(leaves, b);
             return true;
         }
+        add(owned, b);
         let mut buf = vec![0u8; sb.block_size as usize];
         if dev.read_exact_at(&mut buf, b * sb.block_size).is_err() {
             return false;
         }
-        (0..buf.len() / 4).all(|i| walk(u32_at(&buf, i * 4) as u64, depth - 1, sb, dev, owned))
+        (0..buf.len() / 4).all(|i| walk(u32_at(&buf, i * 4) as u64, depth - 1, sb, dev, owned, leaves))
     }
-    (0..15).all(|i| walk(u32_at(iblock, i * 4) as u64, i.saturating_sub(11) as u32, sb, dev, owned))
+    (0..15).all(|i| walk(u32_at(iblock, i * 4) as u64, i.saturating_sub(11) as u32, sb, dev, owned, leaves))
 }

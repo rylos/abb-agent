@@ -35,7 +35,7 @@ const USAGE: &str = "usage:
   abb-agent cleanup                                      delete snapshots left by an interrupted backup
   abb-agent config                                       configuration in effect (/etc/abb-agent.toml)
   abb-agent disks [disk]                                 disks, partitions and filesystems
-  abb-agent bench [disk…] [--freeze-ext] [--limit GiB] [--image PREFIX]
+  abb-agent bench [disk…] [--limit GiB] [--image PREFIX]
                                                          offline test: snapshot, read,
                                                          verify and compress the whole disk
   abb-agent probe <server>                               server version, without pairing
@@ -103,14 +103,13 @@ fn main() {
         }
         Some("bench") => {
             let names = args[2..].to_vec();
-            let freeze = cfg.ext.freeze_mounted || args.iter().any(|a| a == "--freeze-ext");
             let limit = opt("--limit").map(|g| g.parse::<u64>().unwrap_or_else(|_| usage()) << 30);
             let names: Vec<String> = names
                 .into_iter()
                 .filter(|a| !a.starts_with("--") && Some(a) != opt("--limit").as_ref() && Some(a) != opt("--image").as_ref())
                 .collect();
             let names = if names.is_empty() { vec![disk::system_disk().unwrap_or_else(|e| die(e))] } else { names };
-            backup::bench(names, freeze, limit, opt("--image").as_deref()).unwrap_or_else(|e| die(e));
+            backup::bench(names, limit, opt("--image").as_deref()).unwrap_or_else(|e| die(e));
         }
         Some("probe") => {
             let host = args.get(2).cloned().unwrap_or_else(|| usage());
