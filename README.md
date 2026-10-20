@@ -174,6 +174,18 @@ sudo install -Dm644 packaging/systemd/abb-agent-fixup.service /usr/lib/systemd/s
 sudo install -Dm644 packaging/abb-agent.toml /etc/abb-agent.toml
 ```
 
+### Verifying a release
+
+Tags and release files are signed with the release key
+`B903 BF2C D82C 9EA4 5C9F  B35D E2E8 944F 0967 6A61` (Marco Ziliani (rylos)), also in
+[`packaging/release-key.asc`](packaging/release-key.asc) and on GitHub:
+
+```sh
+curl -s https://github.com/rylos.gpg | gpg --import
+gpg --verify abb-restore-<version>-x86_64.asc abb-restore-<version>-x86_64
+git tag -v v<version>
+```
+
 ### abb-restore for a live system
 
 Each release also has `abb-restore-<version>-x86_64`, a static binary with no dependencies: copy it
