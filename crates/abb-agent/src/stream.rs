@@ -184,10 +184,25 @@ pub fn plan_incremental(intervals: &[Interval], volumes: &[Vol], prev: &[Digests
             }
             Source::Vol(v) => {
                 let (vol, old) = (&volumes[v], &prev[v]);
-                for k in 0..(i.end - i.start).div_ceil(cbt::BLOCK) {
+                let blocks = (i.end - i.start).div_ceil(cbt::BLOCK);
+                let per_mib = MIB / cbt::BLOCK;
+                let btrfs = vol.changed(old, 0).is_some();
+                let mut whole = false;
+                for k in 0..blocks {
                     let s = i.start + k * cbt::BLOCK;
                     let e = (s + cbt::BLOCK).min(i.end);
+                    // A MiB holding data is described as a whole, as by a full backup: what did
+                    // not change in it goes as "used, unchanged", without splitting it at every
+                    // free 64 KiB block (hundreds of thousands of messages on a big fragmented
+                    // btrfs). Freed blocks keep their old content, which nothing reads.
+                    if k % per_mib == 0 {
+                        whole = btrfs && (k..(k + per_mib).min(blocks)).any(|b| vol.block_used(b as usize));
+                    }
                     let k = k as usize;
+                    if whole && !(vol.block_used(k) && vol.changed(old, k) == Some(true)) {
+                        out.push(Piece::Run(Run { start: s, end: e, used: true, changed: false, cbt: true }));
+                        continue;
+                    }
                     out.push(if !vol.block_used(k) {
                         Piece::Run(Run { start: s, end: e, used: false, changed: old.used(k), cbt: true })
                     } else {
