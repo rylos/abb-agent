@@ -227,7 +227,10 @@ pub fn alias(p: &Partition) -> String {
     if p.mount_path.is_empty() { format!("/dev/{}", p.name) } else { p.mount_path.clone() }
 }
 
-fn spec(sess: &Session, disks: &[(Disk, Vec<Interval>)], used: &[u64], start_time: u64, run_name: &str) -> Json {
+/// `used`: bytes of each disk in use; `transfer`: bytes that this backup reads and sends (all
+/// of the used ones for a full backup, the changed ones for an incremental), the total of the
+/// console's progress bar.
+fn spec(sess: &Session, disks: &[(Disk, Vec<Interval>)], used: &[u64], transfer: &[u64], incremental: bool, start_time: u64, run_name: &str) -> Json {
     let mut disk_layout = serde_json::Map::new();
     let mut mount_map = serde_json::Map::new();
     let mut images = Vec::new();
@@ -289,13 +292,13 @@ fn spec(sess: &Session, disks: &[(Disk, Vec<Interval>)], used: &[u64], start_tim
         let excluded_length: u64 =
             intervals.iter().filter(|i| i.kind == 2 || i.kind == 3).map(|i| i.end - i.start).sum();
         images.push(json!({
-            "changed_length": d.size.to_string(),
+            "changed_length": if incremental { transfer[n] } else { d.size }.to_string(),
             "excluded_length": excluded_length.to_string(),
             "image_name": d.image_name(),
             "length": d.size.to_string(),
             "original_used_length": used[n].to_string(),
-            "transfer_length": used[n].to_string(),
-            "transfer_length_4k": used[n].to_string(),
+            "transfer_length": transfer[n].to_string(),
+            "transfer_length_4k": transfer[n].to_string(),
             "used_length": d.size.to_string(),
         }));
         let ivs: Vec<Json> = intervals
@@ -727,8 +730,19 @@ fn run_inner(
     let snapshot_time = t.elapsed();
     let result = (|| -> Result<bool> {
         let used: Vec<u64> = disks.iter().map(|(d, iv)| used_estimate(iv, &volumes, d)).collect();
+        let plans: Vec<Vec<Piece>> = disks
+            .iter()
+            .map(|(d, iv)| match prev {
+                Some(prev) => stream::plan_incremental(iv, &volumes, prev),
+                None => stream::plan_full(d, iv, &volumes),
+            })
+            .collect();
+        let transfer: Vec<u64> = plans
+            .iter()
+            .map(|p| p.iter().map(|x| if let Piece::Data { start, end, .. } = x { end - start } else { 0 }).sum())
+            .collect();
         job.log(c, LOG_UPLOAD_SPEC_START, None);
-        let spec = spec(sess, disks, &used, start_time, &job.run_name);
+        let spec = spec(sess, disks, &used, &transfer, prev.is_some(), start_time, &job.run_name);
         let mut spec_bytes = serde_json::to_string_pretty(&spec).unwrap().into_bytes();
         spec_bytes.push(b'\n');
         sess.call(
@@ -744,13 +758,6 @@ fn run_inner(
         )?;
         job.log(c, LOG_UPLOAD_SPEC_DONE, None);
 
-        let plans: Vec<Vec<Piece>> = disks
-            .iter()
-            .map(|(d, iv)| match prev {
-                Some(prev) => stream::plan_incremental(iv, &volumes, prev),
-                None => stream::plan_full(d, iv, &volumes),
-            })
-            .collect();
         stream::upload(job, c, disks, &plans, &volumes, prev, snapshot_time)?;
         // The version is on the server: the digests become the base for the next incremental.
         for (p, v) in volume_parts.iter().zip(&volumes) {
