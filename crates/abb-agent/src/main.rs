@@ -191,6 +191,12 @@ fn status() {
         }
     }
     let running = sess.running_tasks(&mut c).unwrap_or_else(|e| die(e));
+    if let Ok(offered) = offered_agent(&sess)
+        && offered > our_version()
+    {
+        let (a, b, c, d) = offered;
+        println!("the NAS offers the official agent {a}.{b}.{c}-{d}: the console may show an update; update abb-agent with the package manager instead");
+    }
     let last = state::LastRun::load();
     let sc = &config::get().schedule;
     println!(
@@ -399,6 +405,7 @@ fn daemon() {
                 "act_client" => nodes::answer(&sess, ev),
                 // The server finished processing a version (verification included).
                 "get_running_task_result" => fetch_result(&sess),
+                "update_agent" => update_agent(&sess),
                 _ => {}
             }
         }
@@ -421,6 +428,57 @@ fn daemon() {
 
 /// Final status of our last backup on the server. A version the server rejects after the
 /// upload (e.g. its verification failed) counts as a failed backup, so it is retried.
+/// Version of the official agent the server offers (`query_server_info`), as (major, minor,
+/// mini, build).
+fn offered_agent(sess: &Session) -> Result<(u64, u64, u64, u64), String> {
+    let r = sess.connect().and_then(|mut c| sess.call(&mut c, "query_server_info", vec![])).map_err(|e| e.to_string())?;
+    let v = r.get("package_version").ok_or("no package_version in the reply")?;
+    let num = |k: &str| match v.get(k) {
+        Some(x) => x.as_int().or_else(|| x.as_str().and_then(|s| s.trim().parse().ok())).unwrap_or(0),
+        None => 0,
+    };
+    // The official agent keeps the last four digits of the server build (25059 → 5059).
+    Ok((num("major"), num("minor"), num("mini"), num("build") % 10000))
+}
+
+fn our_version() -> (u64, u64, u64, u64) {
+    use abb_proto::transport::*;
+    (AGENT_MAJOR, AGENT_MINOR, AGENT_MINI, AGENT_BUILD.parse().unwrap_or(0))
+}
+
+/// "Update agent" from the ABB console. The official agent downloads Synology's package and
+/// installs it; this one never does (it would replace abb-agent): it tells the console and the
+/// journal to update with the package manager, then closes the request as the official agent
+/// does.
+fn update_agent(sess: &Session) {
+    match offered_agent(sess) {
+        Ok(offered) if offered > our_version() => {
+            let (a, b, c, d) = offered;
+            eprintln!(
+                "update requested from the ABB console (the NAS offers the official agent {a}.{b}.{c}-{d}): abb-agent is not updated this way, update it with the package manager of the distribution"
+            );
+            let entry = Value::map([
+                ("log_time", Value::Int(host::now())),
+                // PC_UPDATE_AGENT_ERROR: "the agent could not be updated" in the console log.
+                ("log_type", Value::Int(7016)),
+                ("other_params", Value::str("null\n")),
+            ]);
+            let r = sess.connect().and_then(|mut c| {
+                sess.call(&mut c, "log_report", vec![("subaction", Value::str("activity_log")), ("logs", Value::Array(vec![entry]))])
+            });
+            if let Err(e) = r {
+                eprintln!("log_report 7016: {e}");
+            }
+        }
+        Ok(_) => eprintln!("update requested from the ABB console: abb-agent is as new as the agent the NAS offers"),
+        Err(e) => eprintln!("query_server_info: {e}"),
+    }
+    let r = sess.connect().and_then(|mut c| sess.call(&mut c, "download_installer", vec![("subaction", Value::str("finish_update"))]));
+    if let Err(e) = r {
+        eprintln!("finish_update: {e}");
+    }
+}
+
 fn fetch_result(sess: &Session) {
     let mut last = state::LastRun::load();
     if last.result_id == 0 {
