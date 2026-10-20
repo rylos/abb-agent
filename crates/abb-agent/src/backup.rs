@@ -258,7 +258,7 @@ fn spec(sess: &Session, disks: &[(Disk, Vec<Interval>)], used: &[u64], start_tim
                         "image_path": d.image_name(),
                         "is_mbr": false,
                         "is_primary_partition": false,
-                        "is_system": true,
+                        "is_system": is_system(p),
                         "length": p.length.to_string(),
                         "mount_path": p.mount_path,
                         "object_id": 0,
