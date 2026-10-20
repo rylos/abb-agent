@@ -196,6 +196,114 @@ impl Digests {
         Ok(())
     }
 
+    /// Explains a failed `verify_block`, for the log: each range of the block with its extent in
+    /// the backed-up transaction and the trees referencing it there, and for every data sector
+    /// whether it is covered by a checksum and whether the device still holds what was read.
+    pub fn explain_block(&self, fs: &Filesystem, cap: &Capture, map: &UsedMap, block: usize, data: &[u8]) -> String {
+        let start = block as u64 * BLOCK;
+        let end = start + data.len() as u64;
+        let mut out = format!("block at {start} ({} bytes), generation {}:", data.len(), fs.sb.generation);
+        let mut now = vec![0u8; data.len()];
+        let reread = fs.read_at(&mut now, start).is_ok();
+        let first = map.ranges.partition_point(|r| r.physical + r.len <= start.saturating_sub(128 << 20));
+        let ranges: Vec<_> = map.ranges[first..].iter().take_while(|r| r.physical < end).filter(|r| r.physical + r.len > start).collect();
+        // Checksums in the backed-up transaction of the data sectors of the block, by physical sector.
+        let mut expected = std::collections::HashMap::new();
+        if let Ok((root, generation)) = fs.tree_root(CSUM_TREE_OBJECTID) {
+            let _ = fs.walk(root, generation, &mut |_, key, item| {
+                if key.objectid != EXTENT_CSUM_OBJECTID || key.kind != EXTENT_CSUM_KEY {
+                    return Ok(());
+                }
+                for (k, c) in item.as_chunks::<CSUM_SIZE>().0.iter().enumerate() {
+                    let logical = key.offset + k as u64 * self.sector;
+                    for r in ranges.iter().filter(|r| r.kind == Kind::Data && logical >= r.logical && logical < r.logical + r.len) {
+                        let p = r.physical + (logical - r.logical);
+                        if p >= start && p < end {
+                            expected.insert(p, u32::from_le_bytes(*c));
+                        }
+                    }
+                }
+                Ok(())
+            });
+        }
+        let mut logicals = Vec::new();
+        for r in ranges {
+            out += &format!(
+                "\n  {:?} physical {} logical {} len {} generation {}{}",
+                r.kind,
+                r.physical,
+                r.logical,
+                r.len,
+                r.generation,
+                if cap.data.contains_key(&r.logical) { " captured" } else { "" }
+            );
+            if r.kind != Kind::Data {
+                continue;
+            }
+            logicals.push(r.logical);
+            let (rs, re) = (r.physical.max(start), (r.physical + r.len).min(end));
+            let mut p = rs;
+            while p < re {
+                let o = (p - start) as usize;
+                let sent = crc32c::crc32c(&data[o..o + self.sector as usize]);
+                let disk = crc32c::crc32c(&now[o..o + self.sector as usize]);
+                out += &format!(
+                    "\n    sector {p}: {} crc {sent:08x}{}",
+                    match expected.get(&p) {
+                        Some(&e) if e == sent => "csum ok".to_string(),
+                        Some(&e) => format!("csum {e:08x} MISMATCH"),
+                        None if self.is_covered(p / self.sector) => "csum not found".to_string(),
+                        None => "no csum".to_string(),
+                    },
+                    if !reread { ", re-read failed".to_string() } else if disk != sent { format!(", now {disk:08x} on disk") } else { String::new() }
+                );
+                p += self.sector;
+            }
+        }
+        // References of those extents in the backed-up transaction (inline and keyed).
+        if let Ok((root, generation)) = fs.tree_root(EXTENT_TREE_OBJECTID) {
+            let mut refs: Vec<String> = Vec::new();
+            let _ = fs.walk(root, generation, &mut |_, key, item| {
+                if !logicals.contains(&key.objectid) {
+                    return Ok(());
+                }
+                match key.kind {
+                    EXTENT_ITEM_KEY if item.len() >= 24 => {
+                        refs.push(format!("{}: extent refs {} generation {} flags {}", key.objectid, u64_at(item, 0), u64_at(item, 8), u64_at(item, 16)));
+                        let mut o = 24;
+                        while o < item.len() {
+                            let t = item[o];
+                            o += 1;
+                            match t {
+                                178 if o + 28 <= item.len() => {
+                                    refs.push(format!("{}:   root {} inode {} offset {} count {}", key.objectid, u64_at(item, o), u64_at(item, o + 8), u64_at(item, o + 16), u32::from_le_bytes(item[o + 24..o + 28].try_into().unwrap())));
+                                    o += 28;
+                                }
+                                184 if o + 12 <= item.len() => {
+                                    refs.push(format!("{}:   shared by leaf {}", key.objectid, u64_at(item, o)));
+                                    o += 12;
+                                }
+                                172 | 176 | 182 if o + 8 <= item.len() => {
+                                    refs.push(format!("{}:   ref type {t} {}", key.objectid, u64_at(item, o)));
+                                    o += 8;
+                                }
+                                _ => break,
+                            }
+                        }
+                    }
+                    178 if item.len() >= 24 => refs.push(format!("{}:   root {} inode {} offset {}", key.objectid, u64_at(item, 0), u64_at(item, 8), u64_at(item, 16))),
+                    184 => refs.push(format!("{}:   shared by leaf {}", key.objectid, key.offset)),
+                    _ => {}
+                }
+                Ok(())
+            });
+            for r in refs {
+                out += &format!("\n  {r}");
+            }
+        }
+        out
+    }
+
     pub fn used(&self, block: usize) -> bool {
         self.table.get(block).is_some_and(|&v| v != 0)
     }

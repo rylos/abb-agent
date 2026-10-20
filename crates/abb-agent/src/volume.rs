@@ -176,7 +176,22 @@ impl Vol {
             }
             let block = &seg[(bs - vs) as usize..(be - vs) as usize];
             match self {
-                Vol::Btrfs { prep, digests } => digests.verify_block(&prep.map, k as usize, block).map_err(|e| e.to_string())?,
+                Vol::Btrfs { prep, digests } => {
+                    if let Err(e) = digests.verify_block(&prep.map, k as usize, block) {
+                        eprintln!("{}", digests.explain_block(&prep.fs, &prep.cap, &prep.map, k as usize, block));
+                        // Who references those extents now, with this run's snapshots still there.
+                        for r in prep.map.ranges.iter().filter(|r| r.kind == btrfs_image::usedmap::Kind::Data && r.physical < be && r.physical + r.len > bs) {
+                            let out = std::process::Command::new("btrfs")
+                                .args(["inspect-internal", "logical-resolve", "-o", &r.logical.to_string()])
+                                .arg(&prep.top)
+                                .output();
+                            if let Ok(o) = out {
+                                eprintln!("now at {}: {}{}", r.logical, String::from_utf8_lossy(&o.stdout).trim(), String::from_utf8_lossy(&o.stderr).trim());
+                            }
+                        }
+                        return Err(e.to_string());
+                    }
+                }
                 Vol::Ext(x) => {
                     let v = if self.block_used(k as usize) { ext_digest(block) } else { 0 };
                     x.table[k as usize].store(v, Ordering::Relaxed);
