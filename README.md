@@ -80,31 +80,43 @@ See [Supported filesystems](#supported-filesystems) for what is left out.
 
 ## Install
 
-Arch Linux:
+### Arch Linux
+
+Download the package from the [latest release](https://github.com/rylos/abb-agent/releases/latest)
+and install it:
 
 ```sh
-git clone https://github.com/rylos/abb-agent.git
-cd abb-agent/packaging/arch
-makepkg -si
+sudo pacman -U ./abb-agent-<version>-x86_64.pkg.tar.zst
 ```
 
-From source on any distribution (Rust 1.88 or newer):
+It contains `abb-agent`, `abb-restore` and the systemd units. Nothing runs until you set it up
+(see [Usage](#usage)). To build it yourself, use `packaging/arch/abb-agent` (release) or
+`packaging/arch/abb-agent-git` (latest commit) with `makepkg -si`.
+
+### Other distributions
+
+From source (Rust 1.88 or newer):
 
 ```sh
-cargo build --release -p abb-agent
+cargo build --release -p abb-agent -p abb-restore
 sudo install -Dm755 target/release/abb-agent /usr/bin/abb-agent
+sudo install -Dm755 target/release/abb-restore /usr/bin/abb-restore
 sudo install -Dm644 packaging/systemd/abb-agent.service /usr/lib/systemd/system/abb-agent.service
 sudo install -Dm644 packaging/systemd/abb-agent-fixup.service /usr/lib/systemd/system/abb-agent-fixup.service
 sudo install -Dm644 packaging/abb-agent.toml /etc/abb-agent.toml
 ```
 
-The restore tool is built as a static binary, to copy onto a USB stick next to any live image:
+### abb-restore for a live system
+
+Each release also has `abb-restore-<version>-x86_64`, a static binary with no dependencies: copy it
+onto a USB stick next to any live image. To build it:
 
 ```sh
 rustup target add x86_64-unknown-linux-musl
 cargo build --release --target x86_64-unknown-linux-musl -p abb-restore
-# target/x86_64-unknown-linux-musl/release/abb-restore
 ```
+
+`packaging/release.sh` builds all the release files into `dist/`.
 
 ## Usage
 
@@ -118,7 +130,9 @@ cargo build --release --target x86_64-unknown-linux-musl -p abb-restore
    The password is asked interactively, or read from `ABB_PASSWORD`. The server
    certificate is pinned on first contact.
 
-2. Review `/etc/abb-agent.toml` (all settings are optional; see the comments in the file).
+2. Edit `/etc/abb-agent.toml`. As installed it contains only comments, so every setting has its
+   default (all internal disks, a backup after every boot): uncomment what you want, at least the
+   disks (e.g. `disks = ["system"]`).
 
 3. Start the service:
 
