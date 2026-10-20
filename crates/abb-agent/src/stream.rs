@@ -128,33 +128,20 @@ pub fn plan_incremental(intervals: &[Interval], volumes: &[Vol], prev: &[Digests
     merge_changed(out)
 }
 
-/// Joins the changed 64 KiB blocks of each MiB into one piece, from the first to the last
-/// (unchanged blocks in between are sent again): the server spends most of an incremental on
-/// each message, not on its size.
+/// Joins consecutive changed 64 KiB blocks into pieces of up to 1 MiB (never across a MiB
+/// boundary): fewer messages for the server. Unchanged blocks are never sent again: an
+/// incremental costs the server mostly the bytes it writes (joining across them tripled the
+/// data for the same time).
 fn merge_changed(pieces: Vec<Piece>) -> Vec<Piece> {
     let mut out: Vec<Piece> = Vec::with_capacity(pieces.len());
-    // Index in `out` of the last mergeable data piece.
-    let mut last: Option<usize> = None;
     for p in pieces {
-        if let Piece::Data { start, end, cbt: true, check: None } = p {
-            if let Some(i) = last
-                && let Piece::Data { start: ps, .. } = out[i]
-                && ps / MIB == (end - 1) / MIB
-                && out[i + 1..].iter().all(|x| matches!(x, Piece::Run(_)))
-            {
-                out.truncate(i + 1);
-                if let Piece::Data { end: pe, .. } = &mut out[i] {
-                    *pe = end;
-                }
-                continue;
-            }
-            out.push(p);
-            last = Some(out.len() - 1);
-            let _ = start;
+        if let Piece::Data { start, end, cbt: true, check: None } = p
+            && let Some(Piece::Data { start: ps, end: pe, cbt: true, check: None }) = out.last_mut()
+            && *pe == start
+            && *ps / MIB == (end - 1) / MIB
+        {
+            *pe = end;
             continue;
-        }
-        if !matches!(p, Piece::Run(_)) {
-            last = None;
         }
         out.push(p);
     }

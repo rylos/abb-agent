@@ -83,7 +83,8 @@ impl Vol {
                         eprintln!("recording excluded subvolumes: {e}");
                     }
                 };
-                let prep = prepare(&p.device(), &p.fs_uuid, run_name, exclude, &mut record)
+                let own: Vec<std::path::PathBuf> = crate::backup::cbt_subvolume().into_iter().collect();
+                let prep = prepare(&p.device(), &p.fs_uuid, run_name, exclude, &own, &mut record)
                     .map_err(|e| Error::Protocol(format!("preparing {name}: {e}")))?;
                 let td = std::time::Instant::now();
                 let digests = Digests::compute(&prep.fs, &prep.cap, &prep.map)

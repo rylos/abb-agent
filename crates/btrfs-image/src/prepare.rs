@@ -71,6 +71,8 @@ pub fn top_mount(dev: &Path, uuid: &str) -> Result<(PathBuf, bool), Error> {
 
 /// `run_name`: name of this run's snapshot directory (e.g. "20261020T1530").
 /// `exclude`: patterns of subvolume paths (from the top level) to leave out of the image.
+/// `exclude_dirs`: subvolumes (by mount path, e.g. the agent's own state) always left out, if
+/// they belong to this filesystem.
 /// `before_snapshot` is called with the subvolumes that will be left out, before the snapshots
 /// are taken (so that what it writes ends up in the image).
 pub fn prepare(
@@ -78,6 +80,7 @@ pub fn prepare(
     uuid: &str,
     run_name: &str,
     exclude: &[String],
+    exclude_dirs: &[PathBuf],
     before_snapshot: &mut dyn FnMut(&[PathBuf]),
 ) -> Result<Prepared, Error> {
     let t = Instant::now();
@@ -94,6 +97,17 @@ pub fn prepare(
     snapshot::sync(&top)?;
     let fs = Filesystem::open(dev)?;
     let subvols = snapshot::list_subvolumes(&fs, &top)?;
+    let mut patterns = exclude.to_vec();
+    for dir in exclude_dirs {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(m) = std::fs::metadata(dir) else { continue };
+        for s in subvols.iter().filter(|s| !s.path.starts_with(SNAP_DIR)) {
+            if std::fs::metadata(top.join(&s.path)).is_ok_and(|t| t.dev() == m.dev() && t.ino() == m.ino()) {
+                patterns.push(s.path.to_string_lossy().into_owned());
+            }
+        }
+    }
+    let exclude = &patterns[..];
     let leaving: Vec<PathBuf> = exclude::matching(&subvols, Path::new(SNAP_DIR), exclude).into_iter().map(|s| s.path).collect();
     before_snapshot(&leaving);
     let mut sources: Vec<(u64, PathBuf, String)> = vec![(TOPLEVEL_ID, top.clone(), "5.toplevel".into())];

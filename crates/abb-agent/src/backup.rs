@@ -387,6 +387,47 @@ fn cbt_path(p: &Partition) -> std::path::PathBuf {
     Path::new(crate::state::STATE_DIR).join("cbt").join(format!("{}.cbt", p.fs_uuid))
 }
 
+/// On btrfs the CBT tables live in a subvolume of their own, left out of the images: they are
+/// rewritten after every backup (a hundred MB on a 1 TB disk) and would otherwise be sent again
+/// each time. Turns an existing directory into a subvolume. Returns its path if it is one.
+pub fn cbt_subvolume() -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    const BTRFS_SUPER_MAGIC: i64 = 0x9123_683e;
+    let state = Path::new(crate::state::STATE_DIR);
+    let dir = state.join("cbt");
+    std::fs::create_dir_all(state).ok()?;
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    let c = std::ffi::CString::new(crate::state::STATE_DIR).ok()?;
+    if unsafe { libc::statfs(c.as_ptr(), &mut st) } != 0 || st.f_type as i64 != BTRFS_SUPER_MAGIC {
+        return None;
+    }
+    match std::fs::metadata(&dir) {
+        Ok(m) if m.ino() == 256 => return Some(dir),
+        Ok(_) => {
+            let new = state.join("cbt.new");
+            if std::fs::metadata(&new).is_ok_and(|m| m.ino() == 256) {
+                let _ = btrfs_image::snapshot::destroy(state, "cbt.new");
+            }
+            btrfs_image::snapshot::create_subvolume(state, "cbt.new").map_err(|e| eprintln!("CBT subvolume: {e}")).ok()?;
+            // Files cannot be renamed across subvolumes: copied, then removed.
+            let moved = (|| -> std::io::Result<()> {
+                for e in std::fs::read_dir(&dir)?.flatten() {
+                    std::fs::copy(e.path(), new.join(e.file_name()))?;
+                }
+                std::fs::remove_dir_all(&dir)?;
+                std::fs::rename(&new, &dir)
+            })();
+            if let Err(e) = moved {
+                eprintln!("CBT subvolume: {e}");
+                let _ = btrfs_image::snapshot::destroy(state, "cbt.new");
+                return None;
+            }
+        }
+        Err(_) => btrfs_image::snapshot::create_subvolume(state, "cbt").map_err(|e| eprintln!("CBT subvolume: {e}")).ok()?,
+    }
+    Some(dir)
+}
+
 /// CBT tables of the previous backup, if they all match `base_version_id`.
 fn previous_digests(volumes: &[Partition], base_version_id: u64) -> Option<Vec<Digests>> {
     if base_version_id == 0 || volumes.is_empty() {
