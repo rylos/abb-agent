@@ -6,6 +6,10 @@
 //! - the nodes of a subvolume modified after its snapshot (generation > the snapshot's
 //!   otransid) and the data extents written in that window.
 //!
+//! - the data of files deleted but still open (orphan inodes): btrfs drops them from a new
+//!   snapshot right after creating it, so only the live subvolume references them, whatever
+//!   their age (e.g. a browser's memory-mapped metrics file, rewritten all the time).
+//!
 //! These blocks must be read right away, verified and set aside; everything else is shared
 //! with a snapshot and stays put as long as the snapshots exist.
 
@@ -16,6 +20,10 @@ use std::sync::Arc;
 
 const EXTENT_DATA_KEY: u8 = 108;
 const FILE_EXTENT_INLINE: u8 = 0;
+const ORPHAN_OBJECTID: u64 = u64::MAX - 4;
+const ORPHAN_ITEM_KEY: u8 = 48;
+/// Beyond this, data of deleted open files is not captured (it may change during the upload).
+const ORPHAN_DATA_LIMIT: u64 = 1 << 30;
 
 /// A "live" subvolume and the transaction of its snapshot.
 #[derive(Clone, Copy, Debug)]
@@ -77,7 +85,65 @@ pub fn capture(fs: &Filesystem, pinned: &[Pinned], snapshots: &[u64], unpinnable
             return Err(Error::Changed { logical: bytenr, reason: format!("subvolume {id} has no snapshot") });
         }
     }
+    // Deleted files still open in the live subvolumes.
+    let mut orphan_bytes = 0u64;
+    for p in pinned {
+        let (bytenr, generation) = fs.tree_root(p.subvol)?;
+        let mut inodes = Vec::new();
+        walk_range(fs, bytenr, generation, Key { objectid: ORPHAN_OBJECTID, kind: ORPHAN_ITEM_KEY, offset: 0 }, Key { objectid: ORPHAN_OBJECTID, kind: ORPHAN_ITEM_KEY, offset: u64::MAX }, &mut |key, _| inodes.push(key.offset))?;
+        for ino in inodes {
+            let mut extents = Vec::new();
+            walk_range(fs, bytenr, generation, Key { objectid: ino, kind: EXTENT_DATA_KEY, offset: 0 }, Key { objectid: ino, kind: EXTENT_DATA_KEY, offset: u64::MAX }, &mut |_, item| {
+                if item.len() >= 37 && item[20] != FILE_EXTENT_INLINE && u64_at(item, 21) != 0 {
+                    extents.push((u64_at(item, 21), u64_at(item, 29)));
+                }
+            })?;
+            for (disk_bytenr, disk_num_bytes) in extents {
+                if cap.data.contains_key(&disk_bytenr) {
+                    continue;
+                }
+                if orphan_bytes + disk_num_bytes > ORPHAN_DATA_LIMIT {
+                    eprintln!("subvolume {}: deleted open file {ino} too big to capture, its data may change during the backup", p.subvol);
+                    break;
+                }
+                let mut buf = vec![0u8; disk_num_bytes as usize];
+                fs.read_at(&mut buf, fs.physical(disk_bytenr)?[0])?;
+                orphan_bytes += disk_num_bytes;
+                cap.data_bytes += disk_num_bytes;
+                cap.data.insert(disk_bytenr, buf);
+            }
+        }
+    }
+    if orphan_bytes > 0 {
+        eprintln!("captured {:.1} MiB of deleted files still open", orphan_bytes as f64 / (1u64 << 20) as f64);
+    }
     Ok(Capture { nodes: Arc::new(cap.nodes), data: cap.data, data_bytes: cap.data_bytes })
+}
+
+/// Calls `item` for the leaf items of a tree with keys in `lo..=hi`, descending only into the
+/// subtrees that can hold them.
+fn walk_range(fs: &Filesystem, root: u64, root_gen: u64, lo: Key, hi: Key, item: &mut dyn FnMut(Key, &[u8])) -> Result<(), Error> {
+    let mut stack = vec![(root, root_gen)];
+    while let Some((logical, generation)) = stack.pop() {
+        let node = fs.read_node(logical, generation)?;
+        if node.header.level == 0 {
+            for (key, data) in node.items() {
+                if key >= lo && key <= hi {
+                    item(key, data);
+                }
+            }
+            continue;
+        }
+        let ptrs: Vec<_> = node.ptrs().collect();
+        for (i, (key, child, child_gen)) in ptrs.iter().enumerate().rev() {
+            // Child i holds the keys from its own up to the next child's.
+            let next = ptrs.get(i + 1).map(|p| p.0);
+            if *key <= hi && next.is_none_or(|n| n > lo) {
+                stack.push((*child, *child_gen));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Default)]
