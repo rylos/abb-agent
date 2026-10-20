@@ -38,6 +38,8 @@ pub struct Partition {
     /// Mount path, alias or device name: what to call it.
     pub label: String,
     pub mount_path: String,
+    /// Device on the original machine, e.g. "/dev/sda2".
+    pub device: String,
     pub fs: String,
     /// GPT attribute bits as the agent reports them: 9 EFI system partition, 65 BIOS boot.
     pub attribute: u64,
@@ -142,20 +144,27 @@ fn disks(doc: &Json, objects: &[(String, u64, u64)]) -> Option<Vec<Disk>> {
             .map(|p| {
                 let mount_path = text(&p["mount_path"]);
                 let alias = text(&p["alias_name"]);
+                let device = text(&p["device_name"]);
+                let attribute = num(&p["attribute"]);
                 Partition {
                     number: num(&p["partition_number"]),
                     offset: num(&p["offset"]),
                     length: num(&p["length"]),
                     label: if !mount_path.is_empty() {
                         mount_path.clone()
+                    } else if attribute == 9 {
+                        "EFI system partition".into()
+                    } else if attribute == 65 {
+                        "BIOS boot partition".into()
                     } else if !alias.is_empty() {
                         alias
                     } else {
-                        text(&p["device_name"])
+                        device.clone()
                     },
                     mount_path,
+                    device,
                     fs: text(&p["file_system"]),
-                    attribute: num(&p["attribute"]),
+                    attribute,
                     excluded: p["is_excluded"].as_bool().unwrap_or(false),
                 }
             })

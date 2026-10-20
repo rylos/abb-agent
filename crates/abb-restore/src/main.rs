@@ -32,7 +32,7 @@ const USAGE: &str = "usage:
   options: -p <port>, --otp <code>; the password comes from ABB_PASSWORD or is asked for.
 
 Disks of the backup are named as on the original machine (sda, nvme0n1); volumes by mount path
-or device name; local disks by kernel name (sdb, nvme0n1).";
+or device name (/dev/sda2); local disks by kernel name (sdb, nvme0n1).";
 
 fn die(msg: impl std::fmt::Display) -> ! {
     eprintln!("abb-restore: {msg}");
@@ -193,7 +193,7 @@ fn main() {
                             .iter()
                             .enumerate()
                             .find_map(|(i, d)| {
-                                d.partitions.iter().position(|p| p.label == vol || p.mount_path == vol).map(|j| (i, j))
+                                d.partitions.iter().position(|p| [&p.label, &p.mount_path, &p.device].iter().any(|n| n.as_str() == vol)).map(|j| (i, j))
                             })
                             .unwrap_or_else(|| die(format!("no volume {vol} in the backup")));
                         let (ldisk, place) = target.split_once(':').unwrap_or_else(|| usage());
