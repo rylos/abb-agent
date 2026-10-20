@@ -148,6 +148,23 @@ pub fn prepare(
     // From here on the global trees (extent, csum, …) are read from the capture only.
     fs.use_capture(cap.nodes.clone());
     let mut map = UsedMap::build(&fs)?;
+    // Data written while the snapshots were being taken may belong to a subvolume already
+    // snapshotted and then be freed during the upload, whatever the trees say about it: every
+    // data extent allocated since the first snapshot is captured too (a few MB at most).
+    if let Some(first) = pinned.iter().map(|p| p.snapshot_transid).min() {
+        let mut extra = 0u64;
+        for r in map.ranges.iter().filter(|r| r.kind == Kind::Data && r.generation >= first) {
+            if !cap.data.contains_key(&r.logical) {
+                let mut buf = vec![0u8; r.len as usize];
+                fs.read_at(&mut buf, r.physical)?;
+                cap.data_bytes += r.len;
+                cap.data.insert(r.logical, buf);
+                extra += 1;
+            }
+        }
+        let last = pinned.iter().map(|p| p.snapshot_transid).max().unwrap_or(first);
+        eprintln!("snapshots in transactions {first}..{last}, generation {}: {extra} recent data extents captured", fs.sb.generation);
+    }
     let mut excluded = Vec::new();
     if !exclude.is_empty() {
         let data = map.ranges.iter().filter(|r| r.kind == Kind::Data).map(|r| (r.logical, r.len));
