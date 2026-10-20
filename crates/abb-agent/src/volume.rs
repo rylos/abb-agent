@@ -85,8 +85,10 @@ impl Vol {
                 };
                 let prep = prepare(&p.device(), &p.fs_uuid, run_name, exclude, &mut record)
                     .map_err(|e| Error::Protocol(format!("preparing {name}: {e}")))?;
+                let td = std::time::Instant::now();
                 let digests = Digests::compute(&prep.fs, &prep.cap, &prep.map)
                     .map_err(|e| Error::Protocol(format!("digests of {name}: {e}")))?;
+                eprintln!("timing: digests {:.1}s", td.elapsed().as_secs_f64());
                 eprintln!(
                     "{name}: generation {}, capture {} nodes + {} extents, {:.1} GiB used",
                     prep.fs.sb.generation,

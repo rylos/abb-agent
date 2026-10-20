@@ -125,6 +125,24 @@ pub fn plan_incremental(intervals: &[Interval], volumes: &[Vol], prev: &[Digests
             out.push(Piece::Log(LOG_VOLUME_DONE, a));
         }
     }
+    merge_changed(out)
+}
+
+/// Joins consecutive changed 64 KiB blocks into pieces of up to 1 MiB (never across a MiB
+/// boundary): the server spends most of an incremental on each message, not on its size.
+fn merge_changed(pieces: Vec<Piece>) -> Vec<Piece> {
+    let mut out: Vec<Piece> = Vec::with_capacity(pieces.len());
+    for p in pieces {
+        if let Piece::Data { start, end, cbt: true, check: None } = p
+            && let Some(Piece::Data { start: ps, end: pe, cbt: true, check: None }) = out.last_mut()
+            && *pe == start
+            && *ps / MIB == (end - 1) / MIB
+        {
+            *pe = end;
+            continue;
+        }
+        out.push(p);
+    }
     out
 }
 

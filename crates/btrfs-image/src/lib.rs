@@ -184,6 +184,49 @@ impl Filesystem {
         Ok(Node { header, data })
     }
 
+    /// Reads and verifies many nodes at once, in parallel (NVMe drives answer many requests at
+    /// a time): same results, in the same order, as `read_node` on each.
+    pub fn read_nodes(&self, ptrs: &[(u64, u64)]) -> Result<Vec<Node>, Error> {
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(2, 16);
+        if ptrs.len() < 64 {
+            return ptrs.iter().map(|&(l, g)| self.read_node(l, g)).collect();
+        }
+        let per = ptrs.len().div_ceil(threads);
+        std::thread::scope(|s| {
+            let parts: Vec<_> = ptrs
+                .chunks(per)
+                .map(|c| s.spawn(move || c.iter().map(|&(l, g)| self.read_node(l, g)).collect::<Result<Vec<_>, _>>()))
+                .collect();
+            let mut out = Vec::with_capacity(ptrs.len());
+            for p in parts {
+                out.extend(p.join().expect("node reader panicked")?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// Breadth-first walk of trees, reading each level in parallel. `visit` gets every node
+    /// once (shared nodes included only once) and returns the children to descend into.
+    pub fn walk_parallel(
+        &self,
+        roots: &[(u64, u64)],
+        visit: &mut dyn FnMut(&Node) -> Result<Vec<(u64, u64)>, Error>,
+    ) -> Result<(), Error> {
+        let mut seen = std::collections::HashSet::new();
+        let mut frontier: Vec<(u64, u64)> = roots.to_vec();
+        while !frontier.is_empty() {
+            frontier.retain(|(l, _)| seen.insert(*l));
+            let mut next = Vec::new();
+            for chunk in frontier.chunks(8192) {
+                for node in self.read_nodes(chunk)? {
+                    next.extend(visit(&node)?);
+                }
+            }
+            frontier = next;
+        }
+        Ok(())
+    }
+
     /// Checks that `data` is node `logical` of the generation read: checksum, bytenr, fsid,
     /// generation not newer than the superblock (and exactly `expected_gen` if ≠ 0).
     pub fn verify_node(&self, logical: u64, expected_gen: u64, data: &[u8]) -> Result<NodeHeader, Error> {

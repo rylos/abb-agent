@@ -144,7 +144,10 @@ pub fn prepare(
             ours.push(s.id);
         }
     }
+    let tc = Instant::now();
     let mut cap = capture::capture(&fs, &pinned, &ours, &unpinned_ids)?;
+    let capture_time = tc.elapsed();
+    let tm = Instant::now();
     // From here on the global trees (extent, csum, …) are read from the capture only.
     fs.use_capture(cap.nodes.clone());
     let mut map = UsedMap::build(&fs)?;
@@ -165,6 +168,8 @@ pub fn prepare(
         let last = pinned.iter().map(|p| p.snapshot_transid).max().unwrap_or(first);
         eprintln!("snapshots in transactions {first}..{last}, generation {}: {extra} recent data extents captured", fs.sb.generation);
     }
+    let map_time = tm.elapsed();
+    let te = Instant::now();
     let mut excluded = Vec::new();
     if !exclude.is_empty() {
         let data = map.ranges.iter().filter(|r| r.kind == Kind::Data).map(|r| (r.logical, r.len));
@@ -183,6 +188,13 @@ pub fn prepare(
             Err(e) => eprintln!("cannot leave subvolumes out ({e}): they are backed up too"),
         }
     }
+    eprintln!(
+        "timing: snapshots {:.1}s, capture {:.1}s, used map {:.1}s, exclusion {:.1}s",
+        snapshot_time.as_secs_f64(),
+        capture_time.as_secs_f64(),
+        map_time.as_secs_f64(),
+        te.elapsed().as_secs_f64()
+    );
     Ok(Prepared { fs, cap, map, top, run_dir, unpinned, excluded, snapshot_time, mounted_by_us })
 }
 

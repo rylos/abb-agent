@@ -80,28 +80,22 @@ fn name_hash(name: &[u8]) -> u64 {
 /// Data extents (logical start) referenced by the file trees in `roots`. Nodes shared between
 /// trees (snapshots) are visited once.
 fn referenced_data(fs: &Filesystem, roots: &[(u64, u64)]) -> Result<HashSet<u64>, Error> {
-    let mut seen: HashSet<u64> = HashSet::new();
     let mut out = HashSet::new();
-    let mut stack: Vec<(u64, u64)> = roots.to_vec();
-    while let Some((logical, generation)) = stack.pop() {
-        if !seen.insert(logical) {
-            continue;
+    fs.walk_parallel(roots, &mut |node| {
+        if node.header.level > 0 {
+            return Ok(node.ptrs().map(|(_, child, g)| (child, g)).collect());
         }
-        let node = fs.read_node(logical, generation)?;
-        if node.header.level == 0 {
-            for (key, data) in node.items() {
-                // file_extent_item: type at 20; for regular and prealloc extents disk_bytenr at 21.
-                if key.kind == EXTENT_DATA_KEY && data.len() >= 29 && data[20] != 0 {
-                    let disk = u64_at(data, 21);
-                    if disk != 0 {
-                        out.insert(disk);
-                    }
+        for (key, data) in node.items() {
+            // file_extent_item: type at 20; for regular and prealloc extents disk_bytenr at 21.
+            if key.kind == EXTENT_DATA_KEY && data.len() >= 29 && data[20] != 0 {
+                let disk = u64_at(data, 21);
+                if disk != 0 {
+                    out.insert(disk);
                 }
             }
-        } else {
-            stack.extend(node.ptrs().map(|(_, child, g)| (child, g)));
         }
-    }
+        Ok(Vec::new())
+    })?;
     Ok(out)
 }
 

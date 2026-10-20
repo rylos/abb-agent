@@ -12,6 +12,7 @@ use crate::disk::*;
 use crate::usedmap::{Kind, UsedMap};
 use crate::{Error, Filesystem};
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::path::Path;
 
 pub const BLOCK: u64 = 64 * 1024;
@@ -73,35 +74,76 @@ impl Digests {
             }
         }
 
+        // Checksum leaves, then their items in parallel: every data sector adds its checksum to
+        // its block (a commutative sum, so the order does not matter).
         let (csum_root, csum_gen) = fs.tree_root(CSUM_TREE_OBJECTID)?;
-        fs.walk(csum_root, csum_gen, &mut |_, key, data| {
-            if key.objectid != EXTENT_CSUM_OBJECTID || key.kind != EXTENT_CSUM_KEY {
-                return Ok(());
-            }
-            let mut chunk: Option<(u64, u64, Vec<u64>)> = None; // (start, end, stripes)
-            for (k, c) in data.as_chunks::<CSUM_SIZE>().0.iter().enumerate() {
-                let logical = key.offset + k as u64 * sector;
-                // Checksums of data left out of the image do not count.
-                let x = &map.excluded_data;
-                let i = x.partition_point(|d| d.0 + d.1 <= logical);
-                if x.get(i).is_some_and(|d| d.0 <= logical) {
-                    continue;
+        let mut leaves = Vec::new();
+        fs.walk_parallel(&[(csum_root, csum_gen)], &mut |node| {
+            Ok(match node.header.level {
+                0 => {
+                    leaves.push((node.header.bytenr, node.header.generation));
+                    Vec::new()
                 }
-                if !chunk.as_ref().is_some_and(|(s, e, _)| (*s..*e).contains(&logical)) {
-                    let ch = fs.chunk_of(logical)?;
-                    chunk = Some((ch.logical, ch.logical + ch.length, ch.stripes.clone()));
+                1 => {
+                    leaves.extend(node.ptrs().map(|(_, c, g)| (c, g)));
+                    Vec::new()
                 }
-                let (start, _, stripes) = chunk.as_ref().unwrap();
-                let csum = u32::from_le_bytes(*c) as u64;
-                for st in stripes {
-                    let phys = st + (logical - start);
-                    d.add(phys, csum);
-                    let s = (phys / sector) as usize;
-                    d.covered[s / 64] |= 1 << (s % 64);
-                }
+                _ => node.ptrs().map(|(_, c, g)| (c, g)).collect(),
+            })
+        })?;
+        let table: Vec<AtomicU64> = std::mem::take(&mut d.table).into_iter().map(AtomicU64::new).collect();
+        let covered: Vec<AtomicU64> = std::mem::take(&mut d.covered).into_iter().map(AtomicU64::new).collect();
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(2, 16);
+        let per = leaves.len().div_ceil(threads).max(1);
+        std::thread::scope(|sc| -> Result<(), Error> {
+            let workers: Vec<_> = leaves
+                .chunks(per)
+                .map(|part| {
+                    let (table, covered) = (&table, &covered);
+                    sc.spawn(move || -> Result<(), Error> {
+                        let x = &map.excluded_data;
+                        for &(leaf, generation) in part {
+                            let node = fs.read_node(leaf, generation)?;
+                            for (key, data) in node.items() {
+                                if key.objectid != EXTENT_CSUM_OBJECTID || key.kind != EXTENT_CSUM_KEY {
+                                    continue;
+                                }
+                                let ch = fs.chunk_of(key.offset)?;
+                                // Checksums of data left out of the image do not count.
+                                let mut xi = x.partition_point(|d| d.0 + d.1 <= key.offset);
+                                for (k, c) in data.as_chunks::<CSUM_SIZE>().0.iter().enumerate() {
+                                    let logical = key.offset + k as u64 * sector;
+                                    while x.get(xi).is_some_and(|d| d.0 + d.1 <= logical) {
+                                        xi += 1;
+                                    }
+                                    if x.get(xi).is_some_and(|d| d.0 <= logical) {
+                                        continue;
+                                    }
+                                    let ch = if logical < ch.logical + ch.length { ch } else { fs.chunk_of(logical)? };
+                                    let csum = u32::from_le_bytes(*c) as u64;
+                                    for st in &ch.stripes {
+                                        let phys = st + (logical - ch.logical);
+                                        let t = &table[(phys / BLOCK) as usize];
+                                        if t.load(Ordering::Relaxed) != ALWAYS {
+                                            t.fetch_add(mix(phys ^ mix(csum)), Ordering::Relaxed);
+                                        }
+                                        let s = (phys / sector) as usize;
+                                        covered[s / 64].fetch_or(1 << (s % 64), Ordering::Relaxed);
+                                    }
+                                }
+                            }
+                        }
+                        Ok(())
+                    })
+                })
+                .collect();
+            for w in workers {
+                w.join().expect("digest worker panicked")?;
             }
             Ok(())
         })?;
+        d.table = table.into_iter().map(AtomicU64::into_inner).collect();
+        d.covered = covered.into_iter().map(AtomicU64::into_inner).collect();
 
         // Data without checksums: crc32c of the content, sector by sector.
         let mut buf = Vec::new();

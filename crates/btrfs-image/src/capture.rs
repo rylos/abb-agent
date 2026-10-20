@@ -61,30 +61,31 @@ pub fn capture(fs: &Filesystem, pinned: &[Pinned], snapshots: &[u64], unpinnable
 
     // Roots of all trees from the root tree (which is captured in full).
     let mut roots: Vec<(u64, u64, u64)> = Vec::new(); // (objectid, bytenr, generation)
-    capture_tree(fs, &mut cap, fs.sb.root, 0, None)?;
     fs.walk(fs.sb.root, 0, &mut |_, key, data| {
         if key.kind == ROOT_ITEM_KEY {
             roots.push((key.objectid, u64_at(data, 176), u64_at(data, 160)));
         }
         Ok(())
     })?;
-    capture_tree(fs, &mut cap, fs.sb.chunk_root, fs.sb.chunk_root_generation, None)?;
-
+    // (node, generation, since): `since` as in `capture_tree`.
+    let mut start: Vec<(u64, u64, Option<u64>)> = vec![(fs.sb.root, 0, None), (fs.sb.chunk_root, fs.sb.chunk_root_generation, None)];
     for (id, bytenr, generation) in roots {
         if !is_subvolume(id) {
-            capture_tree(fs, &mut cap, bytenr, generation, None)?;
+            start.push((bytenr, generation, None));
         } else if snapshots.contains(&id) {
             continue;
         } else if let Some(p) = pinned.iter().find(|p| p.subvol == id) {
-            capture_tree(fs, &mut cap, bytenr, generation, Some(p.snapshot_transid))?;
+            start.push((bytenr, generation, Some(p.snapshot_transid)));
         } else if unpinnable.contains(&id) || id == 5 {
             // Tree captured in full, data excluded (for the top level, which is not snapshotted,
             // it is usually tiny: it only holds the directories containing the subvolumes).
-            capture_tree(fs, &mut cap, bytenr, generation, None)?;
+            start.push((bytenr, generation, None));
         } else {
             return Err(Error::Changed { logical: bytenr, reason: format!("subvolume {id} has no snapshot") });
         }
     }
+    capture_trees(fs, &mut cap, start)?;
+
     // Deleted files still open in the live subvolumes.
     let mut orphan_bytes = 0u64;
     for p in pinned {
@@ -153,44 +154,46 @@ struct Building {
     data_bytes: u64,
 }
 
-/// Captures a tree. With `since = Some(t)` it only descends into nodes with generation > t (the
-/// others are shared with the snapshot) and captures the data extents written after t.
-fn capture_tree(
-    fs: &Filesystem,
-    cap: &mut Building,
-    root: u64,
-    root_gen: u64,
-    since: Option<u64>,
-) -> Result<(), Error> {
-    let mut stack = vec![(root, root_gen)];
-    while let Some((logical, expected_gen)) = stack.pop() {
-        if cap.nodes.contains_key(&logical) {
-            continue;
-        }
-        let node = fs.read_node(logical, expected_gen)?;
-        if node.header.level > 0 {
-            for (_, child, child_gen) in node.ptrs() {
-                if since.is_none_or(|t| child_gen > t) {
-                    stack.push((child, child_gen));
+/// Captures trees, level by level with parallel reads. With `since = Some(t)` only the nodes
+/// with generation > t are descended into (the others are shared with the snapshot) and the
+/// data extents written after t are captured.
+fn capture_trees(fs: &Filesystem, cap: &mut Building, roots: Vec<(u64, u64, Option<u64>)>) -> Result<(), Error> {
+    let mut frontier = roots;
+    while !frontier.is_empty() {
+        frontier.retain(|(l, _, _)| !cap.nodes.contains_key(l));
+        frontier.sort_by_key(|f| f.0);
+        frontier.dedup_by_key(|f| f.0);
+        let mut next = Vec::new();
+        for chunk in frontier.chunks(8192) {
+            let ptrs: Vec<(u64, u64)> = chunk.iter().map(|&(l, g, _)| (l, g)).collect();
+            let nodes = fs.read_nodes(&ptrs)?;
+            for (node, &(logical, _, since)) in nodes.into_iter().zip(chunk) {
+                if node.header.level > 0 {
+                    for (_, child, child_gen) in node.ptrs() {
+                        if since.is_none_or(|t| child_gen > t) {
+                            next.push((child, child_gen, since));
+                        }
+                    }
+                } else if let Some(t) = since {
+                    for (key, item) in node.items() {
+                        if key.kind != EXTENT_DATA_KEY || item[20] == FILE_EXTENT_INLINE {
+                            continue;
+                        }
+                        let generation = u64_at(item, 0);
+                        let disk_bytenr = u64_at(item, 21);
+                        let disk_num_bytes = u64_at(item, 29);
+                        if generation > t && disk_bytenr != 0 && !cap.data.contains_key(&disk_bytenr) {
+                            let mut buf = vec![0u8; disk_num_bytes as usize];
+                            fs.read_at(&mut buf, fs.physical(disk_bytenr)?[0])?;
+                            cap.data_bytes += disk_num_bytes;
+                            cap.data.insert(disk_bytenr, buf);
+                        }
+                    }
                 }
+                cap.nodes.insert(logical, node.data);
             }
-        } else if let Some(t) = since {
-            for (key, item) in node.items() {
-                if key.kind != EXTENT_DATA_KEY || item[20] == FILE_EXTENT_INLINE {
-                    continue;
-                }
-                let generation = u64_at(item, 0);
-                let disk_bytenr = u64_at(item, 21);
-                let disk_num_bytes = u64_at(item, 29);
-                if generation > t && disk_bytenr != 0 && !cap.data.contains_key(&disk_bytenr) {
-                    let mut buf = vec![0u8; disk_num_bytes as usize];
-                    fs.read_at(&mut buf, fs.physical(disk_bytenr)?[0])?;
-                    cap.data_bytes += disk_num_bytes;
-                    cap.data.insert(disk_bytenr, buf);
-                }
-            }
         }
-        cap.nodes.insert(logical, node.data);
+        frontier = next;
     }
     Ok(())
 }

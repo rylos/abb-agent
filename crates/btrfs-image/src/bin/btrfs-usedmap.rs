@@ -48,7 +48,14 @@ fn main() {
         let cap = btrfs_image::capture::Capture::default();
         let d = btrfs_image::cbt::Digests::compute(&fs, &cap, &map).unwrap_or_else(|e| fail(e));
         let used = d.table.iter().filter(|v| **v != 0).count();
-        println!("fingerprints: {} blocks of 64 KiB, {} used, in {:.1}s", d.table.len(), used, t3.elapsed().as_secs_f64());
+        let bytes: Vec<u8> = d.table.iter().flat_map(|v| v.to_le_bytes()).collect();
+        println!(
+            "fingerprints: {} blocks of 64 KiB, {} used, crc32c {:08x}, in {:.1}s",
+            d.table.len(),
+            used,
+            crc32c::crc32c(&bytes),
+            t3.elapsed().as_secs_f64()
+        );
         return;
     }
     let block = 1u64 << 20;
