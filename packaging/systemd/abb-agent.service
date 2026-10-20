@@ -8,6 +8,8 @@ After=network-online.target
 Type=simple
 ExecStart=/usr/bin/abb-agent daemon
 Restart=on-failure
+# A backup being stopped cancels itself and removes its snapshots first.
+TimeoutStopSec=300
 RestartSec=30
 # Backups run in the background: keep the machine responsive.
 Nice=10

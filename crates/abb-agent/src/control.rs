@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 static CANCEL: AtomicBool = AtomicBool::new(false);
+/// SIGTERM or SIGINT received: the running backup stops and cleans up, nothing new starts.
+static STOPPING: AtomicBool = AtomicBool::new(false);
 static BUSY: AtomicBool = AtomicBool::new(false);
 static RUNNING_TASK: AtomicU64 = AtomicU64::new(0);
 /// Bytes per second, 0 = unlimited.
@@ -56,7 +58,26 @@ pub fn cancel(reason: &str) {
 }
 
 pub fn cancelled() -> bool {
-    CANCEL.load(Ordering::SeqCst)
+    CANCEL.load(Ordering::SeqCst) || STOPPING.load(Ordering::SeqCst)
+}
+
+pub fn stopping() -> bool {
+    STOPPING.load(Ordering::SeqCst)
+}
+
+extern "C" fn on_signal(_: libc::c_int) {
+    // Only an atomic store: safe in a signal handler.
+    STOPPING.store(true, Ordering::SeqCst);
+}
+
+/// SIGTERM (systemctl stop) and SIGINT (Ctrl-C) cancel the running backup, which then removes
+/// its snapshots and tells the server, instead of killing the process in the middle of it.
+pub fn handle_stop_signals() {
+    let handler = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+    unsafe {
+        libc::signal(libc::SIGTERM, handler);
+        libc::signal(libc::SIGINT, handler);
+    }
 }
 
 /// The running backup must stop: cancelled, or outside the backup window.

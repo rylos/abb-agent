@@ -32,6 +32,7 @@ const USAGE: &str = "usage:
   abb-agent status                                       connection and task status
   abb-agent daemon                                       service: heartbeat, events, scheduled backups
   abb-agent backup                                       back up now, in the foreground
+  abb-agent cleanup                                      delete snapshots left by an interrupted backup
   abb-agent config                                       configuration in effect (/etc/abb-agent.toml)
   abb-agent disks [disk]                                 disks, partitions and filesystems
   abb-agent bench [disk…] [--freeze-ext] [--limit GiB] [--image PREFIX]
@@ -74,7 +75,9 @@ fn main() {
             println!("paired with {server} as {user}: device and task created on the server");
         }
         Some("status") => status(),
+        Some("cleanup") => backup::startup_cleanup(),
         Some("backup") => {
+            control::handle_stop_signals();
             let sess = load();
             sess.auth_by_token(false).unwrap_or_else(|e| die(e));
             let trigger = backup::Trigger::Local { trigger_type: backup::TRIGGER_MANUAL, trigger_event: None };
@@ -235,7 +238,18 @@ fn fmt_time(t: u64) -> String {
 /// handles the server's events, also while a backup runs (cancel, bandwidth, console requests).
 fn daemon() {
     let sess = load();
+    control::handle_stop_signals();
     backup::startup_cleanup();
+    // On SIGTERM: wait for the running backup to cancel and clean up, then exit.
+    std::thread::spawn(|| {
+        loop {
+            std::thread::sleep(Duration::from_millis(200));
+            if control::stopping() && !control::busy() {
+                eprintln!("stopped");
+                std::process::exit(0);
+            }
+        }
+    });
     loop {
         match sess.auth_by_token(true) {
             Ok(()) => break,
@@ -279,6 +293,9 @@ fn daemon() {
     std::thread::spawn(move || {
         let s = Session::new(worker_state);
         for req in rx {
+            if control::stopping() {
+                continue;
+            }
             control::set_busy(true);
             if let Some((trigger_type, trigger_event)) = req {
                 let last = state::LastRun::load();

@@ -30,15 +30,18 @@ fn boot_time() -> u64 {
 /// Backup due from the local settings: when, and with which trigger.
 pub fn local_due(sc: &LocalSchedule, last: &LastRun) -> Option<(u64, LocalTrigger)> {
     let failed = last.start > 0 && (last.status == "error" || last.status == "running");
+    // A backup cancelled by the user counts as done for the boot and interval triggers: they
+    // fire again only at the next boot or after the next interval, not right away.
+    let done = if last.status == "cancel" { last.last_ok_start.max(last.start) } else { last.last_ok_start };
     let mut due: Vec<(u64, LocalTrigger)> = Vec::new();
     if failed && sc.retry_minutes > 0 {
         due.push((last.start + sc.retry_minutes * 60, (TRIGGER_SCHEDULE, None)));
     }
-    if sc.on_boot && last.last_ok_start < boot_time() && !failed {
+    if sc.on_boot && done < boot_time() && !failed {
         due.push((0, (TRIGGER_EVENT, Some(EVENT_STARTUP))));
     }
-    if sc.interval_hours > 0 && last.last_ok_start > 0 {
-        due.push((last.last_ok_start + sc.interval_hours * 3600, (TRIGGER_SCHEDULE, None)));
+    if sc.interval_hours > 0 && done > 0 {
+        due.push((done + sc.interval_hours * 3600, (TRIGGER_SCHEDULE, None)));
     }
     due.into_iter().min_by_key(|d| d.0)
 }
