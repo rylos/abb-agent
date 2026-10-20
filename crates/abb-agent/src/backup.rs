@@ -773,7 +773,7 @@ fn run_inner(
     let snapshot_time = t.elapsed();
     let result = (|| -> Result<bool> {
         let used: Vec<u64> = disks.iter().map(|(d, iv)| used_estimate(iv, &volumes, d)).collect();
-        let plans: Vec<Vec<Piece>> = disks
+        let mut plans: Vec<Vec<Piece>> = disks
             .iter()
             .map(|(d, iv)| match prev {
                 Some(prev) => stream::plan_incremental(iv, &volumes, prev),
@@ -786,6 +786,9 @@ fn run_inner(
                     eprintln!("{}: {r}", alias(p));
                 }
             }
+        }
+        if prev.is_some() {
+            stream::settle_raw(&mut plans, disks, raws)?;
         }
         let transfer: Vec<u64> = plans
             .iter()

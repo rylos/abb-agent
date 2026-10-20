@@ -83,6 +83,30 @@ impl RawTables {
     }
 }
 
+/// Before an incremental: reads and digests the areas outside the volumes, and turns the
+/// pieces unchanged since the previous backup into "used, unchanged" ones, so that the total
+/// announced to the server (the console's progress bar) counts only what is sent.
+pub fn settle_raw(plans: &mut [Vec<Piece>], disks: &[(Disk, Vec<Interval>)], raws: &RawTables) -> Result<()> {
+    for (n, plan) in plans.iter_mut().enumerate() {
+        if raws.prev[n].is_empty() {
+            continue;
+        }
+        let dev = Device::open(&disks[n].0.device())?;
+        let mut buf = Vec::new();
+        for p in plan.iter_mut() {
+            let Piece::Data { start, end, check: Some(Check::Raw), .. } = *p else { continue };
+            buf.resize((end - start) as usize, 0);
+            dev.read_exact_at(&mut buf, start)?;
+            let h = xxhash_rust::xxh3::xxh3_64(&buf).max(1);
+            if raws.prev[n].get(&start) == Some(&h) {
+                raws.cur.lock().unwrap()[n].insert(start, h);
+                *p = Piece::Run(Run { start, end, used: true, changed: false, cbt: true });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Message without data (possibly extended over contiguous pieces with the same flags).
 #[derive(Clone, Copy)]
 pub struct Run {
@@ -476,6 +500,8 @@ fn send_stream(
     compress: bool,
     next: &mut dyn FnMut() -> Result<Ready>,
 ) -> Result<()> {
+    let t0 = Instant::now();
+    RUNS_SENT.store(0, Ordering::Relaxed);
     let mut ctr = Counters::default();
     let mut first_perf = Some(snapshot_time);
     let mut last_perf = Instant::now();
@@ -553,6 +579,7 @@ fn send_stream(
         }
     }
     up.send(&perf(&ctr, None))?;
+    eprintln!("all pieces sent after {:.1}s ({blocks} with data, {runs} without), waiting for the server", t0.elapsed().as_secs_f64(), runs = RUNS_SENT.load(Ordering::Relaxed));
     up.send(&Value::map([("close", Value::Int(1))]))?;
     up.set_read_timeout(Some(Duration::from_secs(3600)))?;
     let r = up.recv()?;
@@ -592,7 +619,10 @@ impl Throttle {
     }
 }
 
+static RUNS_SENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn send_run(up: &mut Connection, image: &str, r: &Run) -> Result<()> {
+    RUNS_SENT.fetch_add(1, Ordering::Relaxed);
     up.send(&Value::map([
         ("changed", Value::Int(r.changed as u64)),
         ("changed_length", Value::Int(0)),
