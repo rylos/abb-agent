@@ -128,18 +128,33 @@ pub fn plan_incremental(intervals: &[Interval], volumes: &[Vol], prev: &[Digests
     merge_changed(out)
 }
 
-/// Joins consecutive changed 64 KiB blocks into pieces of up to 1 MiB (never across a MiB
-/// boundary): the server spends most of an incremental on each message, not on its size.
+/// Joins the changed 64 KiB blocks of each MiB into one piece, from the first to the last
+/// (unchanged blocks in between are sent again): the server spends most of an incremental on
+/// each message, not on its size.
 fn merge_changed(pieces: Vec<Piece>) -> Vec<Piece> {
     let mut out: Vec<Piece> = Vec::with_capacity(pieces.len());
+    // Index in `out` of the last mergeable data piece.
+    let mut last: Option<usize> = None;
     for p in pieces {
-        if let Piece::Data { start, end, cbt: true, check: None } = p
-            && let Some(Piece::Data { start: ps, end: pe, cbt: true, check: None }) = out.last_mut()
-            && *pe == start
-            && *ps / MIB == (end - 1) / MIB
-        {
-            *pe = end;
+        if let Piece::Data { start, end, cbt: true, check: None } = p {
+            if let Some(i) = last
+                && let Piece::Data { start: ps, .. } = out[i]
+                && ps / MIB == (end - 1) / MIB
+                && out[i + 1..].iter().all(|x| matches!(x, Piece::Run(_)))
+            {
+                out.truncate(i + 1);
+                if let Piece::Data { end: pe, .. } = &mut out[i] {
+                    *pe = end;
+                }
+                continue;
+            }
+            out.push(p);
+            last = Some(out.len() - 1);
+            let _ = start;
             continue;
+        }
+        if !matches!(p, Piece::Run(_)) {
+            last = None;
         }
         out.push(p);
     }
@@ -274,6 +289,7 @@ fn produce(
     disks: &[(Disk, Vec<Interval>)],
     volumes: &[Vol],
     prev: Option<&[Digests]>,
+    compress: bool,
     (n, start, end, check): DataJob,
 ) -> Result<Ready> {
     let t = Instant::now();
@@ -282,8 +298,13 @@ fn produce(
         (Some((v, k)), Some(prev)) => volumes[v].unchanged(&prev[v], k),
         _ => false,
     };
-    let packed = if unchanged { Vec::new() } else { lz4_flex::block::compress(&raw) };
-    Ok(Ready { packed, len: raw.len() as u64, unchanged, read_time: t.elapsed() })
+    let len = raw.len() as u64;
+    let packed = match (unchanged, compress) {
+        (true, _) => Vec::new(),
+        (false, true) => lz4_flex::block::compress(&raw),
+        (false, false) => raw,
+    };
+    Ok(Ready { packed, len, unchanged, read_time: t.elapsed() })
 }
 
 fn open_devices(disks: &[(Disk, Vec<Interval>)]) -> Result<Vec<Device>> {
@@ -300,11 +321,12 @@ pub fn upload(
     volumes: &[Vol],
     prev: Option<&[Digests]>,
     snapshot_time: Duration,
+    (compress, encrypt): (bool, bool),
 ) -> Result<()> {
     let sess = job.sess;
     let devs = open_devices(disks)?;
     let jobs = data_jobs(plans);
-    let mut up = sess.connect()?;
+    let mut up = if encrypt { sess.connect()? } else { sess.connect_plain()? };
     let open = up.call(&request(
         "backup",
         vec![
@@ -319,8 +341,8 @@ pub fn upload(
     }
     parallel_ordered(
         jobs.len(),
-        |i| produce(&devs, disks, volumes, prev, jobs[i]),
-        |next| send_stream(job, logc, &mut up, disks, plans, snapshot_time, next),
+        |i| produce(&devs, disks, volumes, prev, compress, jobs[i]),
+        |next| send_stream(job, logc, &mut up, disks, plans, snapshot_time, compress, next),
     )
 }
 
@@ -354,7 +376,7 @@ pub fn bench(disks: &[(Disk, Vec<Interval>)], volumes: &[Vol], limit: Option<u64
     let t = Instant::now();
     parallel_ordered(
         jobs.len(),
-        |i| produce(&devs, disks, volumes, None, jobs[i]),
+        |i| produce(&devs, disks, volumes, None, true, jobs[i]),
         |next| {
             let (mut raw, mut packed) = (0u64, 0u64);
             for k in 0..jobs.len() {
@@ -402,6 +424,7 @@ fn send_stream(
     disks: &[(Disk, Vec<Interval>)],
     plans: &[Vec<Piece>],
     snapshot_time: Duration,
+    compress: bool,
     next: &mut dyn FnMut() -> Result<Ready>,
 ) -> Result<()> {
     let mut ctr = Counters::default();
@@ -445,7 +468,7 @@ fn send_stream(
                     let msg = Value::map([
                         ("buffer", Value::Buffer(ready.packed)),
                         ("changed", Value::Int(1)),
-                        ("compressed", Value::Int(1)),
+                        ("compressed", Value::Int(compress as u64)),
                         ("image_name", Value::str(image.clone())),
                         ("is_interval_cbt", Value::Int(*cbt as u64)),
                         ("length", Value::Int(ready.len)),

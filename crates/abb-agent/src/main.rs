@@ -72,7 +72,7 @@ fn main() {
             }
             .unwrap_or_else(|e| die(e));
             state.save().unwrap_or_else(|e| die(e));
-            println!("paired with {server} as {user}: device and task created on the server");
+            println!("paired with {server} as {user}: the device and its task are in the ABB console");
         }
         Some("status") => status(),
         Some("cleanup") => backup::startup_cleanup(),

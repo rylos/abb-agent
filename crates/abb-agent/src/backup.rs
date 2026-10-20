@@ -737,6 +737,13 @@ fn run_inner(
                 None => stream::plan_full(d, iv, &volumes),
             })
             .collect();
+        if let Some(prev) = prev {
+            for (p, (v, old)) in volume_parts.iter().zip(volumes.iter().zip(prev)) {
+                if let Some(r) = v.change_report(old) {
+                    eprintln!("{}: {r}", alias(p));
+                }
+            }
+        }
         let transfer: Vec<u64> = plans
             .iter()
             .map(|p| p.iter().map(|x| if let Piece::Data { start, end, .. } = x { end - start } else { 0 }).sum())
@@ -758,7 +765,7 @@ fn run_inner(
         )?;
         job.log(c, LOG_UPLOAD_SPEC_DONE, None);
 
-        stream::upload(job, c, disks, &plans, &volumes, prev, snapshot_time)?;
+        stream::upload(job, c, disks, &plans, &volumes, prev, snapshot_time, (task.compression, task.encryption))?;
         // The version is on the server: the digests become the base for the next incremental.
         for (p, v) in volume_parts.iter().zip(&volumes) {
             let path = cbt_path(p);

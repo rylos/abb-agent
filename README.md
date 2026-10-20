@@ -230,6 +230,7 @@ The task settings in the ABB console apply as they do with the official agent:
 | Source type | *Entire device*: every internal disk. *System volume*: the volumes holding `/` and `/boot` plus the EFI/BIOS boot partitions. *Custom volume*: the volumes picked in the console (btrfs volumes are offered too). Partition tables are always kept, so the disks can be restored bare-metal with all their partitions; volumes left out are restored empty. |
 | Schedule and backup window | followed in server time; a run missed while the machine was off happens when it comes back; a backup still running when the window closes is cancelled |
 | Bandwidth limit | applied to the upload, also when changed during a backup |
+| Transfer compression and encryption | followed: LZ4 blocks or raw ones, TLS or plaintext data connection (on a fast LAN, turning both off leaves more of the NAS CPU for the backup) |
 | Pre/post scripts | the pre script runs before the snapshots, the post script right after them, as root with `/bin/sh` (180 s limit); output and result are reported to the server |
 | Back up now / Cancel | start and stop a backup at any time |
 | Retention, permissions, backup verification | handled by the server |
@@ -289,6 +290,10 @@ abb-restore run      -a nas.example.lan -u backupuser -t 2 --device --exclude-su
 Synology's own recovery media works too: the agent reports the device so that it is listed there.
 
 ### After a restore
+
+The server renews the device token when a machine is restored: run
+`sudo abb-agent connect -a <nas> -u <user>` once on the restored system, and the device carries
+on with its task and versions.
 
 The agent removes, on its first start, the temporary snapshots that were part of the image.
 Excluded subvolumes are gone in the restored system; `abb-agent-fixup` recreates them empty early

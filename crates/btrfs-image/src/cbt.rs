@@ -346,6 +346,82 @@ impl Digests {
         out
     }
 
+    /// What the blocks changed since `prev` hold, for the log: bytes of tree nodes by tree
+    /// (owner) and of data by subvolume, from the extent references.
+    pub fn change_report(&self, prev: &Digests, fs: &Filesystem, map: &UsedMap) -> String {
+        let changed = |b: u64| self.changed(prev, b as usize) && self.used(b as usize);
+        let mut trees: std::collections::BTreeMap<u64, u64> = Default::default();
+        let mut data: std::collections::HashMap<u64, u64> = Default::default();
+        let (mut blocks, mut tree_only, mut data_only) = (0u64, 0u64, 0u64);
+        let mut kinds: std::collections::HashMap<u64, (bool, bool)> = Default::default();
+        for r in &map.ranges {
+            let (b0, b1) = (r.physical / BLOCK, (r.physical + r.len - 1) / BLOCK);
+            let hit = (b0..=b1).filter(|&b| changed(b)).count() as u64;
+            if hit == 0 {
+                continue;
+            }
+            for b in (b0..=b1).filter(|&b| changed(b)) {
+                let k = kinds.entry(b).or_default();
+                match r.kind {
+                    Kind::Tree => k.0 = true,
+                    Kind::Data => k.1 = true,
+                    Kind::Reserved => {}
+                }
+            }
+            match r.kind {
+                Kind::Tree => {
+                    let owner = fs.read_node(r.logical, 0).map_or(0, |n| n.header.owner);
+                    *trees.entry(owner).or_default() += r.len;
+                }
+                Kind::Data => *data.entry(r.logical).or_default() += r.len.min(hit * BLOCK),
+                Kind::Reserved => {}
+            }
+        }
+        for (t, d) in kinds.values() {
+            blocks += 1;
+            match (t, d) {
+                (true, false) => tree_only += 1,
+                (false, true) => data_only += 1,
+                _ => {}
+            }
+        }
+        // Data bytes by subvolume, from the extent items (shared extents counted apart).
+        let mut by_root: std::collections::BTreeMap<String, u64> = Default::default();
+        if let Ok((root, generation)) = fs.tree_root(EXTENT_TREE_OBJECTID) {
+            let _ = fs.walk(root, generation, &mut |_, key, item| {
+                if key.kind != EXTENT_ITEM_KEY || item.len() < 25 {
+                    return Ok(());
+                }
+                let Some(&bytes) = data.get(&key.objectid) else { return Ok(()) };
+                let who = match item[24] {
+                    178 if item.len() >= 33 => format!("subvolume {}", u64_at(item, 25)),
+                    184 => "shared".to_string(),
+                    _ => "other".to_string(),
+                };
+                *by_root.entry(who).or_default() += bytes;
+                Ok(())
+            });
+        }
+        let mib = |b: u64| b as f64 / (1u64 << 20) as f64;
+        let mut out = format!(
+            "changed: {blocks} blocks of 64 KiB ({:.0} MiB), {tree_only} with nodes only, {data_only} with data only",
+            mib(blocks * BLOCK)
+        );
+        let mut t: Vec<_> = trees.into_iter().collect();
+        t.sort_by_key(|x| std::cmp::Reverse(x.1));
+        out += &format!(
+            "\n  nodes by tree: {}",
+            t.iter().take(8).map(|(o, b)| format!("{o}: {:.1} MiB", mib(*b))).collect::<Vec<_>>().join(", ")
+        );
+        let mut d: Vec<_> = by_root.into_iter().collect();
+        d.sort_by_key(|x| std::cmp::Reverse(x.1));
+        out += &format!(
+            "\n  data by owner: {}",
+            d.iter().take(8).map(|(o, b)| format!("{o}: {:.1} MiB", mib(*b))).collect::<Vec<_>>().join(", ")
+        );
+        out
+    }
+
     pub fn used(&self, block: usize) -> bool {
         self.table.get(block).is_some_and(|&v| v != 0)
     }

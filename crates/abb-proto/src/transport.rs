@@ -1,5 +1,6 @@
 //! Agent → server connection: TCP 5510, one plaintext `encrypt_channel`, then TLS on the
-//! same socket. One request at a time per connection.
+//! same socket. One request at a time per connection. The backup data connection stays in
+//! plaintext from the start when the task does not encrypt the transfer.
 
 use crate::pobject::Value;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -139,8 +140,44 @@ impl ServerCertVerifier for PinVerifier {
     }
 }
 
+enum Stream {
+    Tls(Box<StreamOwned<ClientConnection, TcpStream>>),
+    Plain(TcpStream),
+}
+
+impl Stream {
+    fn io(&mut self) -> &mut dyn ReadWrite {
+        match self {
+            Stream::Tls(s) => s.as_mut(),
+            Stream::Plain(s) => s,
+        }
+    }
+
+    fn sock(&self) -> &TcpStream {
+        match self {
+            Stream::Tls(s) => &s.sock,
+            Stream::Plain(s) => s,
+        }
+    }
+}
+
+trait ReadWrite: io::Read + Write {}
+impl<T: io::Read + Write> ReadWrite for T {}
+
+fn tcp_connect(host: &str, port: u16) -> Result<(TcpStream, std::net::SocketAddr)> {
+    let addr = (host, port)
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| Error::Protocol(format!("could not resolve address: {host}")))?;
+    let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(15))?;
+    tcp.set_nodelay(true)?;
+    tcp.set_read_timeout(Some(Duration::from_secs(600)))?;
+    tcp.set_write_timeout(Some(Duration::from_secs(600)))?;
+    Ok((tcp, addr))
+}
+
 pub struct Connection {
-    stream: StreamOwned<ClientConnection, TcpStream>,
+    stream: Stream,
     /// Fingerprint of the certificate the server presented on this connection.
     pub fingerprint: Fingerprint,
     /// Plaintext reply to `encrypt_channel` (contains the server versions).
@@ -151,14 +188,7 @@ impl Connection {
     /// Opens an encrypted connection. With `pin = None` it accepts any certificate and
     /// returns its fingerprint in `fingerprint` (first contact).
     pub fn open(host: &str, port: u16, pin: Option<Fingerprint>) -> Result<Connection> {
-        let addr = (host, port)
-            .to_socket_addrs()?
-            .next()
-            .ok_or_else(|| Error::Protocol(format!("could not resolve address: {host}")))?;
-        let mut tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(15))?;
-        tcp.set_nodelay(true)?;
-        tcp.set_read_timeout(Some(Duration::from_secs(600)))?;
-        tcp.set_write_timeout(Some(Duration::from_secs(600)))?;
+        let (mut tcp, addr) = tcp_connect(host, port)?;
 
         // Plaintext phase.
         tcp.write_all(&request("encrypt_channel", vec![]).to_bytes())?;
@@ -186,19 +216,27 @@ impl Connection {
             .lock()
             .unwrap()
             .ok_or_else(|| Error::Protocol("the server did not present a certificate".into()))?;
-        Ok(Connection { stream: StreamOwned::new(conn, tcp), fingerprint, hello })
+        Ok(Connection { stream: Stream::Tls(Box::new(StreamOwned::new(conn, tcp))), fingerprint, hello })
+    }
+
+    /// Opens a plaintext connection (no `encrypt_channel`, no TLS), as the official agent does
+    /// for the data of a task with `enable_encrypt_transfer=0`.
+    pub fn open_plain(host: &str, port: u16) -> Result<Connection> {
+        let (tcp, _) = tcp_connect(host, port)?;
+        Ok(Connection { stream: Stream::Plain(tcp), fingerprint: [0; 32], hello: Value::Null })
     }
 
     pub fn send(&mut self, msg: &Value) -> Result<()> {
-        self.stream.write_all(&msg.to_bytes())?;
-        self.stream.flush()?;
+        let io = self.stream.io();
+        io.write_all(&msg.to_bytes())?;
+        io.flush()?;
         Ok(())
     }
 
     /// Next message, skipping any `type:"keep_alive"`.
     pub fn recv(&mut self) -> Result<Value> {
         loop {
-            let v = Value::read_from(&mut self.stream)?;
+            let v = Value::read_from(&mut self.stream.io())?;
             if v.get("type").and_then(Value::as_str) != Some("keep_alive") {
                 return Ok(v);
             }
@@ -214,7 +252,7 @@ impl Connection {
     }
 
     pub fn set_read_timeout(&self, t: Option<Duration>) -> Result<()> {
-        Ok(self.stream.sock.set_read_timeout(t)?)
+        Ok(self.stream.sock().set_read_timeout(t)?)
     }
 }
 

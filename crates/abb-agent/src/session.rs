@@ -66,11 +66,11 @@ pub fn pair(server: &str, port: u16, username: &str, password: &str, otp: Option
         device_uuid: host.device_uuid.clone(),
         last_event_id: 0,
     };
-    let template_id = resp
-        .get("task_template")
-        .and_then(|t| t.get("id"))
-        .and_then(Value::as_int)
-        .ok_or_else(|| Error::Protocol("task_template missing from response".into()))?;
+    // A device the server already knows (connected before, or restored onto this machine,
+    // which renews its token) gets a new token and keeps its tasks: nothing to confirm.
+    let Some(template_id) = resp.get("task_template").and_then(|t| t.get("id")).and_then(Value::as_int) else {
+        return Ok(state);
+    };
     drop(c);
 
     let mut c = Connection::open(server, port, Some(fingerprint))?;
@@ -100,6 +100,11 @@ impl Session {
 
     pub fn connect(&self) -> Result<Connection> {
         Connection::open(&self.state.server, self.state.port, self.state.pin())
+    }
+
+    /// Plaintext connection, for the backup data of a task that does not encrypt the transfer.
+    pub fn connect_plain(&self) -> Result<Connection> {
+        Connection::open_plain(&self.state.server, self.state.port)
     }
 
     /// `auth` with the token (with `init:1` at startup, then periodically).

@@ -149,6 +149,14 @@ impl Vol {
         }
     }
 
+    /// For the log: what changed since the previous backup (btrfs).
+    pub fn change_report(&self, prev: &Digests) -> Option<String> {
+        match self {
+            Vol::Btrfs { prep, digests } => Some(digests.change_report(prev, &prep.fs, &prep.map)),
+            Vol::Ext(_) => None,
+        }
+    }
+
     pub fn block_used(&self, k: usize) -> bool {
         match self {
             Vol::Btrfs { digests, .. } => digests.used(k),

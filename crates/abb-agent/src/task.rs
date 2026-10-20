@@ -113,6 +113,9 @@ pub struct TaskInfo {
     pub selection: Selection,
     pub schedule: Schedule,
     pub scripts: Scripts,
+    /// Transfer settings of the task: LZ4 blocks, TLS on the data connection.
+    pub compression: bool,
+    pub encryption: bool,
 }
 
 impl TaskInfo {
@@ -139,6 +142,8 @@ impl TaskInfo {
             selection: Selection::from_task(t),
             schedule: t.get("sched_content").and_then(Value::as_str).and_then(Schedule::parse).unwrap_or_default(),
             scripts: if mode == ScriptMode::None { Scripts::default() } else { Scripts { mode, pre: script("pre"), post: script("post") } },
+            compression: t.get("compression").and_then(Value::as_int) != Some(0),
+            encryption: t.get("encryption").and_then(Value::as_int) != Some(0),
         })
     }
 }
