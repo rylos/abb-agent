@@ -21,7 +21,7 @@ curl -fsSL -o "$tmp/bin.tar.gz" "$url/releases/download/v$version/abb-agent-$ver
 src=$(sha256sum "$tmp/src.tar.gz" | cut -d' ' -f1)
 bin=$(sha256sum "$tmp/bin.tar.gz" | cut -d' ' -f1)
 sed -i "s/^pkgver=.*/pkgver=$version/; s/^pkgrel=.*/pkgrel=1/; s/^sha256sums=.*/sha256sums=('$src')/" "$aur/abb-agent/PKGBUILD"
-sed -i "s/^pkgver=.*/pkgver=$version/; s/^pkgrel=.*/pkgrel=1/; s/^sha256sums_x86_64=.*/sha256sums_x86_64=('$bin')/" "$aur/abb-agent-bin/PKGBUILD"
+sed -i "s/^pkgver=.*/pkgver=$version/; s/^pkgrel=.*/pkgrel=1/; s/^sha256sums_x86_64=.*/sha256sums_x86_64=('$bin' 'SKIP')/" "$aur/abb-agent-bin/PKGBUILD"
 for pkg in abb-agent abb-agent-bin; do
   (cd "$aur/$pkg" && makepkg --printsrcinfo >.SRCINFO && git add PKGBUILD abb-agent.install .SRCINFO && git status --short)
 done
