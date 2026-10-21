@@ -364,6 +364,12 @@ Things that do not work yet, or have not been tested:
 See [CONTRIBUTING.md](CONTRIBUTING.md). Bug reports with `abb-agent disks` output and the
 journal of the service (`journalctl -u abb-agent`) are very welcome.
 
+## Related projects
+
+- [synodeb](https://github.com/rylos/synodeb): Debian on the Synology DS923+, with every piece of
+  hardware working (fans, LEDs, buttons, UPS, all bays and M.2 slots), installed with the official
+  Debian installer over SSH. DSM can stay on its own disks.
+
 ## Buy me a beer
 
 If abb-agent saves you a backup, or a weekend, you can buy me a beer 🍺 at this Ethereum
