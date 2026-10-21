@@ -163,10 +163,12 @@ pub fn plan(
     let root_of = |id: u64| items.iter().find(|(i, _)| *i == id).map(|(_, d)| (u64_at(d, 176), u64_at(d, 160)));
 
     // Data referenced by anything that stays: the root tree (v1 free space cache), the top level
-    // and every other file tree.
+    // and every other file tree. Dead trees do not stay: the cleaner drops them at mount, and
+    // the ones left out at backup time never had their own data sent.
     let mut kept_roots = vec![(fs.sb.root, 0)];
     for (id, d) in &items {
-        if (*id == FS_TREE_OBJECTID || *id >= FIRST_FREE_OBJECTID) && !excluded.contains(id) {
+        let dead = u64_at(d, 208) & ROOT_SUBVOL_DEAD != 0;
+        if (*id == FS_TREE_OBJECTID || *id >= FIRST_FREE_OBJECTID) && !excluded.contains(id) && !dead {
             kept_roots.push((u64_at(d, 176), u64_at(d, 160)));
         }
     }
