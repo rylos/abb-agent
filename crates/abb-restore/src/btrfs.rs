@@ -9,7 +9,7 @@
 //!
 //! Metadata chunks are DUP on a single device: one copy is downloaded and written to both.
 
-use crate::restore::{Device, Event, Job, Special, download};
+use crate::restore::{Device, Event, Job, Special, transfer};
 use crate::server::{Range, Server};
 use crate::spec::{Task, Version};
 use btrfs_image::Filesystem;
@@ -20,10 +20,9 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 
 const MIB: u64 = 1 << 20;
-/// Gaps up to this size between data ranges are downloaded rather than split: the server skips
-/// what is unused anyway, and fewer ranges keep the task small.
-const MERGE_GAP: u64 = 16 * MIB;
-const MAX_RANGES: usize = 2000;
+/// Used bytes not wanted that may come down between two wanted ranges to make them one. Measured
+/// on a NAS: wider merges are no faster (the server sets the pace) and send more stale data.
+const MERGE_WASTE: u64 = MIB;
 
 pub struct Ctx<'a> {
     pub server: &'a mut Server,
@@ -47,7 +46,7 @@ fn fetch(ctx: &mut Ctx, sp: &Special, pieces: &[Piece], what: &str, report: &mut
     }
     let d = &ctx.version.disks[sp.disk];
     let p = &sp.part;
-    let mut jobs: Vec<Job> = pieces
+    let jobs: Vec<Job> = pieces
         .iter()
         .map(|x| Job {
             range: Range {
@@ -66,17 +65,10 @@ fn fetch(ctx: &mut Ctx, sp: &Special, pieces: &[Piece], what: &str, report: &mut
             mirrors: x.mirrors.iter().map(|&m| sp.delta + m as i64 - x.offset as i64).collect(),
         })
         .collect();
-    let ranges: Vec<Range> = jobs.iter().map(|j| j.range.clone()).collect();
-    let total = ranges.iter().map(|r| r.length).sum();
     report(Event::Step(format!("{}: {what}", p.label)));
-    let running = ctx
-        .server
-        .start(ctx.task.device_id, ctx.task.task_id, ctx.version.id, ctx.mode, &crate::local::machine_uuid(), &ranges)
-        .map_err(|e| format!("the server refused the restore: {e}"))?;
-    let res = download(ctx.server, running, &mut jobs, ctx.devices, total, ctx.cancel, report);
-    let status = if res.is_ok() { ("complete", 1203) } else { ("error", 1000) };
-    let _ = ctx.server.finish(running, status.0, status.1);
-    res?;
+    let (task, version, mode) = (ctx.task, ctx.version, ctx.mode);
+    let start = |s: &mut Server, ranges: &[Range]| s.start(task.device_id, task.task_id, version.id, mode, &crate::local::machine_uuid(), ranges);
+    transfer(ctx.server, &start, jobs, ctx.devices, ctx.cancel, report)?;
     ctx.devices[sp.dev].file.sync_all().map_err(|e| e.to_string())
 }
 
@@ -153,39 +145,75 @@ pub fn restore(mut ctx: Ctx, sp: &Special, patterns: &[String], report: &mut dyn
     // Data extents in use and not left out, plus the superblock copies; mixed block groups
     // (data and metadata together) came down with the metadata.
     let mixed: Vec<&Chunk> = fs.chunks.values().filter(|c| c.kind & BLOCK_GROUP_DATA != 0 && c.kind & BLOCK_GROUP_METADATA != 0).collect();
-    let mut want: Vec<(u64, u64)> = map
+    let used: Vec<(u64, u64, bool)> = map
         .ranges
         .iter()
-        .filter(|r| match r.kind {
-            Kind::Data => skip.binary_search_by_key(&r.logical, |d| d.0).is_err(),
-            Kind::Reserved => r.physical >= MIB,
-            Kind::Tree => false,
+        .map(|r| {
+            let wanted = match r.kind {
+                Kind::Data => skip.binary_search_by_key(&r.logical, |d| d.0).is_err(),
+                Kind::Reserved => r.physical >= MIB,
+                Kind::Tree => false,
+            } && !mixed.iter().any(|c| c.stripes.iter().any(|&s| r.physical >= s && r.physical < s + c.length));
+            (r.physical, r.len, wanted)
         })
-        .filter(|r| !mixed.iter().any(|c| c.stripes.iter().any(|&s| r.physical >= s && r.physical < s + c.length)))
-        .map(|r| (r.physical, r.len))
         .collect();
-    want.sort();
-    let mut gap = MERGE_GAP;
-    let pieces = loop {
-        let mut merged: Vec<(u64, u64)> = Vec::new();
-        for &(o, l) in &want {
-            match merged.last_mut() {
-                Some((mo, ml)) if o <= *mo + *ml + gap => *ml = (o + l).max(*mo + *ml) - *mo,
-                _ => merged.push((o, l)),
-            }
-        }
-        if merged.len() <= MAX_RANGES {
-            break merged;
-        }
-        gap *= 4;
-    };
     drop(fs);
-    let pieces: Vec<Piece> = pieces.into_iter().map(|(offset, length)| Piece { offset, length, mirrors: vec![] }).collect();
+    let pieces = join(used, MERGE_WASTE);
+    let wanted: u64 = pieces.iter().map(|p| p.2).sum();
+    let requested: u64 = pieces.iter().map(|p| p.1).sum();
+    let pieces: Vec<Piece> = pieces.into_iter().map(|(offset, length, _)| Piece { offset, length, mirrors: vec![] }).collect();
     let what = if skipped > 0 {
-        format!("data ({} left out)", crate::local::size_str(skipped))
+        format!(
+            "data ({} left out; {} in use, {} requested in {} ranges)",
+            crate::local::size_str(skipped),
+            crate::local::size_str(wanted),
+            crate::local::size_str(requested),
+            pieces.len()
+        )
     } else {
         "data".to_string()
     };
     fetch(&mut ctx, sp, &pieces, &what, report)?;
     Ok(left)
+}
+
+/// Joins the wanted ranges of `used` (physical offset, length, wanted) into pieces to request:
+/// (offset, length, wanted bytes inside). Two wanted ranges become one piece when what lies
+/// between them costs at most `waste`: used ranges not wanted count, free space does not, as the
+/// server sends only the parts of it that the image holds.
+fn join(mut used: Vec<(u64, u64, bool)>, waste: u64) -> Vec<(u64, u64, u64)> {
+    used.sort_unstable();
+    let mut out: Vec<(u64, u64, u64)> = Vec::new();
+    let mut between = 0;
+    for (o, l, wanted) in used {
+        if !wanted {
+            between += l;
+            continue;
+        }
+        match out.last_mut() {
+            Some((po, pl, pw)) if between <= waste => {
+                *pl = (o + l).max(*po + *pl) - *po;
+                *pw += l;
+            }
+            _ => out.push((o, l, l)),
+        }
+        between = 0;
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn joining() {
+        // Wanted 0..10 and 20..30 with 10 bytes not wanted between: one piece only when the
+        // waste allows it. Free space (30..100) costs nothing: 20..30 and 100..105 always join.
+        let used = vec![(20, 10, true), (10, 10, false), (0, 10, true), (100, 5, true)];
+        assert_eq!(join(used.clone(), 0), vec![(0, 10, 10), (20, 85, 15)]);
+        assert_eq!(join(used, 10), vec![(0, 105, 25)]);
+        // A wanted range inside another one does not shrink the piece.
+        assert_eq!(join(vec![(0, 100, true), (10, 5, true)], 0)[0].1, 100);
+    }
 }

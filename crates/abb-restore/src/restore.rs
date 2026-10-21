@@ -10,7 +10,7 @@ use std::fs::{File, OpenOptions};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 /// `log.code` values of `check_complete` (synoabb::LogType).
@@ -110,16 +110,10 @@ pub fn run(
     report(Event::Step("Preparing the disks".into()));
     let (mut jobs, devices) = prepare(v, plan, locals)?;
     let specials = if plan.exclude_subvolumes.is_empty() { vec![] } else { carve(&mut jobs, v) };
-    let ranges: Vec<Range> = jobs.iter().map(|j| j.range.clone()).collect();
-    let total: u64 = ranges.iter().map(|r| r.length).sum();
-
-    report(Event::Step("Starting the restore on the server".into()));
-    let running = server
-        .start(task.device_id, task.task_id, v.id, plan.mode.code(), &crate::local::machine_uuid(), &ranges)
-        .map_err(|e| format!("the server refused the restore: {e}"))?;
-
+    let mode = plan.mode.code();
+    let start = |s: &mut Server, ranges: &[Range]| s.start(task.device_id, task.task_id, v.id, mode, &crate::local::machine_uuid(), ranges);
     report(Event::Step("Restoring".into()));
-    let result = download(server, running, &mut jobs, &devices, total, cancel, report);
+    let result = transfer(server, &start, std::mem::take(&mut jobs), &devices, cancel, report).map(|j| jobs = j);
     let mut recreate = Vec::new();
     let result = result.and_then(|_| {
         for sp in &specials {
@@ -145,19 +139,10 @@ pub fn run(
         .filter_map(|(disk, offset, dev, paths)| partition_device(v, locals, &devices, disk, offset, dev).map(|p| (p, paths)))
         .collect();
     drop(devices);
-    let result = result.map(|mut work| {
+    result.map(|mut work| {
         work.recreate = recreate;
         after_restore(plan, work, report)
-    });
-    let (status, code) = match &result {
-        Ok(()) => ("complete", LOG_RESTORE_FINISH),
-        Err(_) if cancel.load(Ordering::Relaxed) => ("cancel", LOG_RESTORE_CANCEL),
-        Err(_) => ("error", LOG_INTERNAL_ERROR),
-    };
-    if let Err(e) = server.finish(running, status, code) {
-        report(Event::Warning(format!("could not report the result to the server: {e}")));
-    }
-    result
+    })
 }
 
 /// A btrfs partition restored in phases, to leave subvolumes out.
@@ -347,15 +332,127 @@ fn device_size(f: &File) -> Option<u64> {
     (unsafe { libc::ioctl(f.as_raw_fd(), BLKGETSIZE64 as _, &mut size) } == 0).then_some(size)
 }
 
+/// Parallel downloads: the server reads one restore task at a time well below what its disks
+/// can give (measured on a DS with HDDs: 8 tasks at once more than double the throughput).
+const STREAMS: usize = 8;
+/// Restore tasks per transfer, to balance the streams; more when the ranges need it.
+const TASKS: usize = 2 * STREAMS;
+/// Ranges per restore task.
+const MAX_RANGES: usize = 2000;
+/// Longer ranges are cut, so that they spread over the streams too.
+const SPLIT: u64 = 256 * MIB;
+
+/// Downloads `jobs` with up to [`STREAMS`] restore tasks at once, each over a share of the
+/// ranges. `start` creates a restore task on the server for some ranges. Returns the jobs, cut
+/// where they were long, with their tables filled.
+pub(crate) fn transfer(
+    server: &Server,
+    start: &(dyn Fn(&mut Server, &[Range]) -> abb_proto::transport::Result<u64> + Sync),
+    jobs: Vec<Job>,
+    devices: &[Device],
+    cancel: &AtomicBool,
+    report: &mut dyn FnMut(Event),
+) -> Result<Vec<Job>, String> {
+    let mut cut = Vec::with_capacity(jobs.len());
+    for j in jobs {
+        if j.table.is_some() || j.range.length <= SPLIT {
+            cut.push(j);
+            continue;
+        }
+        let mut o = 0;
+        while o < j.range.length {
+            let mut range = j.range.clone();
+            range.offset += o;
+            range.length = SPLIT.min(j.range.length - o);
+            cut.push(Job { range, dev: j.dev, delta: j.delta, table: None, mirrors: j.mirrors.clone() });
+            o += SPLIT;
+        }
+    }
+    cut.sort_by(|a, b| (&a.range.image_path, a.range.offset).cmp(&(&b.range.image_path, b.range.offset)));
+    let total: u64 = cut.iter().map(|j| j.range.length).sum();
+    // Ranges dealt in turn, so that every task gets some of each part of the disk.
+    let tasks = TASKS.max(cut.len().div_ceil(MAX_RANGES)).min(cut.len());
+    let mut shares: Vec<Vec<Job>> = (0..tasks).map(|_| Vec::new()).collect();
+    for (i, j) in cut.into_iter().enumerate() {
+        shares[i % tasks].push(j);
+    }
+    let shares: Vec<std::sync::Mutex<Vec<Job>>> = shares.into_iter().map(std::sync::Mutex::new).collect();
+    let next = AtomicUsize::new(0);
+    let done = AtomicU64::new(0);
+    let running_streams = AtomicUsize::new(0);
+    let failed = AtomicBool::new(false);
+    let errors = std::sync::Mutex::new(Vec::<String>::new());
+    let warnings = std::sync::Mutex::new(Vec::<String>::new());
+    let streams = STREAMS.min(shares.len());
+    std::thread::scope(|sc| {
+        for _ in 0..streams {
+            let mut s = server.clone();
+            running_streams.fetch_add(1, Ordering::SeqCst);
+            let (shares, next, done, failed, errors, warnings, running_streams) = (&shares, &next, &done, &failed, &errors, &warnings, &running_streams);
+            sc.spawn(move || {
+                while !failed.load(Ordering::Relaxed) && !cancel.load(Ordering::Relaxed) {
+                    let Some(share) = shares.get(next.fetch_add(1, Ordering::Relaxed)) else { break };
+                    let mut share = share.lock().unwrap();
+                    let ranges: Vec<Range> = share.iter().map(|j| j.range.clone()).collect();
+                    let res = start(&mut s, &ranges).map_err(|e| format!("the server refused the restore: {e}")).and_then(|running| {
+                        let res = download(&mut s, running, &mut share, devices, done, cancel, &|w| warnings.lock().unwrap().push(w));
+                        let (status, code) = match &res {
+                            Ok(()) => ("complete", LOG_RESTORE_FINISH),
+                            Err(_) if cancel.load(Ordering::Relaxed) => ("cancel", LOG_RESTORE_CANCEL),
+                            Err(_) => ("error", LOG_INTERNAL_ERROR),
+                        };
+                        let _ = s.finish(running, status, code);
+                        res
+                    });
+                    if let Err(e) = res {
+                        failed.store(true, Ordering::Relaxed);
+                        errors.lock().unwrap().push(e);
+                    }
+                }
+                running_streams.fetch_sub(1, Ordering::SeqCst);
+            });
+        }
+        let mut shown = u64::MAX;
+        loop {
+            for w in warnings.lock().unwrap().drain(..) {
+                report(Event::Warning(w));
+            }
+            let d = done.load(Ordering::Relaxed);
+            if d != shown {
+                shown = d;
+                report(Event::Progress { done: d, total });
+            }
+            if running_streams.load(Ordering::SeqCst) == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    });
+    if let Some(e) = errors.into_inner().unwrap().into_iter().next() {
+        return Err(e);
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return Err("cancelled".into());
+    }
+    Ok(shares.into_iter().flat_map(|s| s.into_inner().unwrap()).collect())
+}
+
+/// Downloads the ranges of one restore task into their jobs; `done` counts the bytes written.
 pub(crate) fn download(
     server: &mut Server,
     running: u64,
     jobs: &mut [Job],
     devices: &[Device],
-    total: u64,
+    done: &AtomicU64,
     cancel: &AtomicBool,
-    report: &mut dyn FnMut(Event),
+    warn: &dyn Fn(String),
 ) -> Result<(), String> {
+    // Jobs in order of image and offset, to find the one a chunk belongs to by bisection.
+    jobs.sort_by(|a, b| (&a.range.image_path, a.range.offset).cmp(&(&b.range.image_path, b.range.offset)));
+    let find = |jobs: &[Job], path: &str, offset: u64| {
+        let i = jobs.partition_point(|j| (j.range.image_path.as_str(), j.range.offset) <= (path, offset));
+        i.checked_sub(1).filter(|&i| jobs[i].range.image_path == path)
+    };
     let mut attempt = 0;
     loop {
         let ranges: Vec<Range> = jobs.iter().map(|j| j.range.clone()).collect();
@@ -365,9 +462,9 @@ pub(crate) fn download(
             }
             match c {
                 Chunk::Data { image_path, offset, data } => {
-                    let job = jobs
-                        .iter_mut()
-                        .find(|j| j.range.image_path == image_path && offset >= j.range.offset && offset < j.range.offset + j.range.length)
+                    let job = find(jobs, &image_path, offset)
+                        .map(|i| &mut jobs[i])
+                        .filter(|j| offset < j.range.offset + j.range.length)
                         .ok_or_else(|| std::io::Error::other(format!("{image_path} offset {offset} outside the requested ranges")))?;
                     let end = (offset + data.len() as u64).min(job.range.offset + job.range.length);
                     let data = &data[..(end - offset) as usize];
@@ -379,16 +476,21 @@ pub(crate) fn download(
                             devices[d].file.write_all_at(data, (offset as i64 + delta) as u64)?;
                         }
                     }
-                    job.range.done = end - job.range.offset;
+                    let now = end - job.range.offset;
+                    done.fetch_add(now.saturating_sub(job.range.done), Ordering::Relaxed);
+                    job.range.done = job.range.done.max(now);
                 }
                 Chunk::EndOfRange { image_path, offset } => {
-                    if let Some(j) = jobs.iter_mut().find(|j| j.range.image_path == image_path && j.range.offset + j.range.length == offset) {
+                    // The range that ends here starts at or before offset - 1.
+                    if let Some(j) = offset.checked_sub(1).and_then(|o| find(jobs, &image_path, o)).map(|i| &mut jobs[i])
+                        && j.range.offset + j.range.length == offset
+                    {
+                        done.fetch_add(j.range.length - j.range.done, Ordering::Relaxed);
                         j.range.done = j.range.length;
                     }
                 }
                 Chunk::Done => {}
             }
-            report(Event::Progress { done: jobs.iter().map(|j| j.range.done).sum(), total });
             Ok(())
         });
         match res {
@@ -401,7 +503,7 @@ pub(crate) fn download(
             Err(e) if cancel.load(Ordering::Relaxed) => return Err(format!("cancelled ({e})")),
             Err(abb_proto::Error::Io(e)) if attempt < 10 && e.kind() != std::io::ErrorKind::Other => {
                 attempt += 1;
-                report(Event::Warning(format!("connection lost ({e}), resuming (attempt {attempt})")));
+                warn(format!("connection lost ({e}), resuming (attempt {attempt})"));
                 std::thread::sleep(Duration::from_secs((1u64 << attempt).min(30)));
             }
             Err(e) => return Err(e.to_string()),

@@ -235,6 +235,10 @@ fn main() {
                 restore::Event::Warning(m) => eprintln!("warning: {m}"),
                 restore::Event::Progress { done, total } => {
                     let pct = done * 100 / total.max(1);
+                    // Every step (superblock, metadata, data…) counts from zero again.
+                    if pct < last {
+                        last = 0;
+                    }
                     if pct >= last + 5 || done == total {
                         last = pct;
                         eprintln!("  {pct:>3}%  {} of {}", size_str(done), size_str(total));

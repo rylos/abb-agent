@@ -5,6 +5,7 @@ use abb_proto::transport::{Error, Fingerprint, Result};
 use abb_proto::{Connection, Value, request};
 use std::time::Duration;
 
+#[derive(Clone)]
 pub struct Server {
     pub host: String,
     pub port: u16,
