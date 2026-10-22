@@ -190,7 +190,6 @@ fn status() {
         let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
         println!("{}", st.row("Task", &format!("#{id} {}", st.bold(name))));
         if let Some(info) = task::TaskInfo::parse(t) {
-            println!("{}", st.row("Source", &info.selection.to_string()));
             let sch = &info.schedule;
             let console = if sch.is_scheduled() {
                 format!(
@@ -223,12 +222,15 @@ fn status() {
     let disks: Vec<String> = names
         .iter()
         .map(|n| match disk::scan(n) {
-            Ok(d) => format!("{} ({})", d.name, ui::size(d.size)),
+            Ok(d) => disk::label(&d),
             Err(_) if !disk::has_partitions(n) => format!("{n} (not included: no partitions)"),
             Err(e) => format!("{n} ({e})"),
         })
         .collect();
     println!("{}", st.row("Disks", &disks.join(", ")));
+    if let Some(info) = tasks.first().and_then(task::TaskInfo::parse) {
+        println!("{}", st.row("Volumes", &info.selection.volumes()));
+    }
 
     let running = sess.running_tasks(&mut c).unwrap_or_else(|e| die(e));
     let last = state::LastRun::load();

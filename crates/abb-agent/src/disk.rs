@@ -122,6 +122,13 @@ fn read_u64(p: impl AsRef<Path>) -> std::io::Result<u64> {
         .map_err(|_| std::io::Error::other(format!("{}: invalid number", p.as_ref().display())))
 }
 
+/// A disk as `status` and the backup view show it: `nvme0n1 (931.5 GiB)`, plus `· system` when
+/// it holds `/`.
+pub fn label(d: &Disk) -> String {
+    let system = system_disk().is_ok_and(|s| s == d.name);
+    format!("{} ({}){}", d.name, crate::ui::size(d.size), if system { " · system" } else { "" })
+}
+
 /// Disk containing partition `part` (e.g. "nvme0n1p2" → "nvme0n1").
 pub fn parent_disk(part: &str) -> std::io::Result<String> {
     let link = fs::canonicalize(Path::new("/sys/class/block").join(part))?;

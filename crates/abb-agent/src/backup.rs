@@ -70,6 +70,16 @@ impl std::fmt::Display for Selection {
 }
 
 impl Selection {
+    /// Which volumes of the disks are backed up, for `status` and the backup view, with the
+    /// name of the setting in the console.
+    pub fn volumes(&self) -> String {
+        match self {
+            Selection::WholeDevice => "all of them (console: entire device)".into(),
+            Selection::System => "system volumes only (console: system volumes)".into(),
+            Selection::Custom(paths) => format!("{} (console: custom volumes)", paths.join(", ")),
+        }
+    }
+
     /// From a `get_task` entry: `source_type` and `custom_volume` (a JSON array of mount paths,
     /// sent as a string).
     pub fn from_task(task: &Value) -> Selection {
@@ -562,11 +572,12 @@ fn scan_disks(sel: &Selection) -> Result<(Scan, bool)> {
     for ((d, _), named) in disks.iter_mut().zip(only) {
         d.image = named.image;
     }
-    let names: Vec<String> = disks.iter().map(|(d, _)| format!("{} ({})", d.name, crate::ui::size(d.size))).collect();
+    let names: Vec<String> = disks.iter().map(|(d, _)| crate::disk::label(d)).collect();
     crate::ui::row("Disks", &names.join(", "));
     if !skipped.is_empty() {
         crate::ui::row("Not included", &skipped.join(", "));
     }
+    crate::ui::row("Volumes", &sel.volumes());
     Ok(((disks, volume_parts), missed))
 }
 
@@ -637,7 +648,6 @@ fn run_locked(sess: &Session, trigger: Trigger) -> Result<()> {
     eprintln!("source: {selection}");
     crate::ui::row("Server", &format!("{}:{} · user {}", sess.state.server, sess.state.port, sess.state.username));
     crate::ui::row("Task", &format!("#{task_id} {task_name}"));
-    crate::ui::row("Source", &selection.to_string());
 
     let ((disks, volume_parts), missed) = scan_disks(&selection)?;
     remove_stale_snapshots(&volume_parts);
