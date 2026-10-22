@@ -165,6 +165,30 @@ impl Vol {
         }
     }
 
+    /// One line for the terminal view: space used, subvolumes left out.
+    pub fn summary(&self) -> String {
+        match self {
+            Vol::Btrfs { prep, .. } => {
+                // Copies in the service snapshots and the agent's own CBT subvolume are not the
+                // user's exclusions.
+                let n = prep
+                    .excluded
+                    .iter()
+                    .filter(|x| !x.starts_with(".abb-snapshots") && !x.ends_with("abb-agent/cbt"))
+                    .count();
+                let mut s = format!("{} used", crate::ui::size(prep.map.stats.physical_bytes));
+                if n > 0 {
+                    s += &format!(" · {n} subvolume{} left out", if n == 1 { "" } else { "s" });
+                }
+                if !prep.unpinned.is_empty() {
+                    s += " · some files not snapshotted";
+                }
+                s
+            }
+            Vol::Ext(e) => format!("{} used", crate::ui::size(e.fs.used_bytes())),
+        }
+    }
+
     /// Volume size in bytes (offsets beyond it are outside the filesystem).
     pub fn size(&self) -> u64 {
         match self {

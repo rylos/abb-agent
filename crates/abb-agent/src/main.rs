@@ -16,6 +16,7 @@ mod stream;
 mod task;
 mod volume;
 mod state;
+mod ui;
 
 use abb_proto::transport::{DEFAULT_PORT, fingerprint_hex};
 use abb_proto::{Connection, Value, request};
@@ -31,7 +32,8 @@ const USAGE: &str = "usage:
                                                          two-factor code prompted when needed)
   abb-agent status                                       connection and task status
   abb-agent daemon                                       service: heartbeat, events, scheduled backups
-  abb-agent backup                                       back up now, in the foreground
+  abb-agent backup [-v]                                  back up now, in the foreground (-v: the log here,
+                                                         not the journal)
   abb-agent cleanup                                      delete snapshots left by an interrupted backup
   abb-agent config                                       configuration in effect (/etc/abb-agent.toml)
   abb-agent disks [disk]                                 disks, partitions and filesystems
@@ -79,9 +81,19 @@ fn main() {
         Some("backup") => {
             control::handle_stop_signals();
             let sess = load();
-            sess.auth_by_token(false).unwrap_or_else(|e| die(e));
-            let trigger = backup::Trigger::Local { trigger_type: backup::TRIGGER_MANUAL, trigger_event: None };
-            backup::run(&sess, trigger).unwrap_or_else(|e| die(e));
+            // On a terminal: steps and progress bar, the log to the journal; -v keeps the log here.
+            let view = !args.iter().any(|a| a == "-v" || a == "--verbose") && ui::start();
+            let res = sess.auth_by_token(false).and_then(|()| {
+                let trigger = backup::Trigger::Local { trigger_type: backup::TRIGGER_MANUAL, trigger_event: None };
+                backup::run(&sess, trigger)
+            });
+            if let Err(e) = res {
+                if view {
+                    ui::finish("error", &e.to_string());
+                    std::process::exit(1);
+                }
+                die(e);
+            }
         }
         Some("daemon") => daemon(),
         Some("disks") => {
@@ -161,45 +173,38 @@ fn load() -> Session {
 }
 
 fn status() {
-    let st = Style::new();
+    let st = ui::Style::for_fd(1);
     let sess = load();
-    let row = |label: &str, value: String| println!("  {}  {value}", st.dim(&format!("{label:<11}")));
-    println!("{}  {}", st.bold(&format!("abb-agent {}", env!("CARGO_PKG_VERSION"))), st.dim("· Synology Active Backup for Business"));
+    let sep = format!(" {} ", st.sep());
+    println!("{}", st.header());
     println!();
-    row("Server", format!("{}:{} {} user {}", sess.state.server, sess.state.port, st.dim("·"), sess.state.username));
-    row("Device", sess.state.device_uuid.clone());
+    println!("{}", st.row("Server", &format!("{}:{}{sep}user {}", sess.state.server, sess.state.port, sess.state.username)));
+    println!("{}", st.row("Device", &sess.state.device_uuid));
     sess.auth_by_token(false).unwrap_or_else(|e| die(e));
     let mut c = sess.connect().unwrap_or_else(|e| die(e));
     let tasks = sess.tasks(&mut c).unwrap_or_else(|e| die(e));
     let sc = &config::get().schedule;
     for t in &tasks {
         println!();
-        row(
-            "Task",
-            format!(
-                "#{} {}",
-                t.get("id").and_then(|v| v.as_int()).unwrap_or(0),
-                st.bold(t.get("name").and_then(|v| v.as_str()).unwrap_or(""))
-            ),
-        );
+        let id = t.get("id").and_then(|v| v.as_int()).unwrap_or(0);
+        let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        println!("{}", st.row("Task", &format!("#{id} {}", st.bold(name))));
         if let Some(info) = task::TaskInfo::parse(t) {
-            row("Source", info.selection.to_string());
+            println!("{}", st.row("Source", &info.selection.to_string()));
             let sch = &info.schedule;
-            row(
-                "Console",
-                if sch.is_scheduled() {
-                    format!(
-                        "{} at {:02}:{:02} (server time){}{}",
-                        weekdays(&sch.weekdays),
-                        sch.hour,
-                        sch.minute,
-                        if sch.hourly { ", then every hour" } else { "" },
-                        if sch.window.is_some() { ", within the backup window" } else { "" }
-                    )
-                } else {
-                    "manual only".into()
-                },
-            );
+            let console = if sch.is_scheduled() {
+                format!(
+                    "{} at {:02}:{:02} (server time){}{}",
+                    weekdays(&sch.weekdays),
+                    sch.hour,
+                    sch.minute,
+                    if sch.hourly { ", then every hour" } else { "" },
+                    if sch.window.is_some() { ", within the backup window" } else { "" }
+                )
+            } else {
+                "manual only".into()
+            };
+            println!("{}", st.row("Console", &console));
         }
     }
     let mut local = vec![format!("after boot: {}", if sc.on_boot { "yes" } else { "no" })];
@@ -207,56 +212,57 @@ fn status() {
         local.push(format!("every {} h", sc.interval_hours));
     }
     local.push(if sc.retry_minutes > 0 { format!("retry after {} min", sc.retry_minutes) } else { "no retry".into() });
-    row("Local", local.join(&format!(" {} ", st.dim("·"))));
+    println!("{}", st.row("Local", &local.join(&sep)));
+    // The disks a backup would take, as the backup shows them.
+    let cfg_disks = &config::get().disks;
+    let names: Vec<String> = if cfg_disks.is_empty() {
+        disk::internal_disks().unwrap_or_default()
+    } else {
+        cfg_disks.iter().map(|e| disk::resolve(e).unwrap_or_else(|_| e.clone())).collect()
+    };
+    let disks: Vec<String> = names
+        .iter()
+        .map(|n| match disk::scan(n) {
+            Ok(d) => format!("{} ({})", d.name, ui::size(d.size)),
+            Err(_) if !disk::has_partitions(n) => format!("{n} (not included: no partitions)"),
+            Err(e) => format!("{n} ({e})"),
+        })
+        .collect();
+    println!("{}", st.row("Disks", &disks.join(", ")));
 
     let running = sess.running_tasks(&mut c).unwrap_or_else(|e| die(e));
     let last = state::LastRun::load();
     println!();
     if last.status == "running" {
         let ago = host::now().saturating_sub(last.start);
-        println!("{} {}  started {} ({} ago)", st.cyan("▶"), st.bold("Backup in progress"), fmt_short(last.start), fmt_duration(ago));
+        println!("{}", st.event(ui::Mark::Run, "Backing up", &format!("started {} ({} ago)", fmt_short(last.start), ui::fmt_duration(ago))));
         match state::Progress::load() {
-            Some(p) if p.phase == "sending" && p.total > 0 => {
-                let pct = p.done as f64 * 100.0 / p.total as f64;
-                let mut line = format!("  {} {:>5.1}%   {} of {}", st.cyan(&bar(pct, 30)), pct, size(p.done), size(p.total));
-                if p.rate > 0 {
-                    let left = (p.total - p.done.min(p.total)) / p.rate.max(1);
-                    line += &format!(" {} {}/s {} ~{} left", st.dim("·"), size(p.rate), st.dim("·"), fmt_duration(left));
-                }
-                println!("{line}");
-            }
-            Some(p) if p.phase == "finishing" => println!("  {} 100.0%   {}", st.cyan(&bar(100.0, 30)), st.dim("all sent, the server is checking the version")),
-            Some(_) => println!("  {}", st.dim("preparing: snapshots and plan of what to send")),
+            Some(p) if p.phase == "sending" && p.total > 0 => println!("{}", st.progress(p.done, p.total, p.rate)),
+            Some(p) if p.phase == "finishing" => println!("  {} {}", st.mark(ui::Mark::Busy), st.dim("all sent, the server is checking the version")),
+            Some(_) => println!("  {} {}", st.mark(ui::Mark::Busy), st.dim("preparing: snapshots and plan of what to send")),
             None => {}
         }
     } else if !running.is_empty() {
         let what = if running.iter().any(|r| r.status == 1) { "running" } else { "queued" };
-        println!("{} {}", st.cyan("▶"), st.bold(&format!("Backup {what} on the server")));
+        println!("{}", st.event(ui::Mark::Run, &format!("Backup {what} on the server"), ""));
     }
     if last.status != "running" && last.start != 0 {
-        let (mark, color): (&str, fn(&Style, &str) -> String) = match last.status.as_str() {
-            "complete" => ("✓", Style::green),
-            "partial" | "cancel" => ("!", Style::yellow),
-            _ => ("✗", Style::red),
-        };
         let server = if last.server_status.is_empty() || last.server_status == last.status {
             String::new()
         } else {
-            format!(" {} on the server: {}", st.dim("·"), last.server_status)
+            format!("{sep}on the server: {}", last.server_status)
         };
-        println!(
-            "{} {}  {} → {} ({}) {} {}{server}",
-            color(&st, mark),
-            st.bold("Last backup"),
+        let detail = format!(
+            "{} → {} ({}){sep}{}{server}",
             fmt_short(last.start),
             fmt_short(last.end),
-            fmt_duration(last.end.saturating_sub(last.start)),
-            st.dim("·"),
-            color(&st, &last.status),
+            ui::fmt_duration(last.end.saturating_sub(last.start)),
+            st.outcome_color(&last.status, &last.status)
         );
+        println!("{}", st.event(st.outcome(&last.status), "Last backup", &detail));
     }
     if last.last_ok_start != 0 && last.status != "complete" {
-        println!("  {}  started {}", st.dim("Last successful"), fmt_short(last.last_ok_start));
+        println!("{}", st.row("Last success", &format!("started {}", fmt_short(last.last_ok_start))));
     }
     if let Ok(off) = sess.server_offset(&mut c) {
         control::set_server_offset(off);
@@ -265,8 +271,8 @@ fn status() {
     let local = scheduler::local_due(sc, &last).map(|d| d.0.max(host::now()));
     match [console, local].into_iter().flatten().min() {
         _ if last.status == "running" || !running.is_empty() => {}
-        Some(t) => println!("{} {}  {}", st.dim("○"), st.bold("Next backup"), fmt_short(t)),
-        None => println!("{} {}  when started from the console or with `abb-agent backup`", st.dim("○"), st.bold("Next backup")),
+        Some(t) => println!("{}", st.event(ui::Mark::Next, "Next backup", &fmt_short(t))),
+        None => println!("{}", st.event(ui::Mark::Next, "Next backup", "when started from the console or with `abb-agent backup`")),
     }
     if let Ok(offered) = offered_agent(&sess)
         && offered > our_version()
@@ -274,63 +280,13 @@ fn status() {
         let (a, b, c, d) = offered;
         println!();
         println!(
-            "{} the NAS offers the official agent {a}.{b}.{c}-{d}: the console may show an update; update abb-agent with the package manager instead",
-            st.yellow("!")
+            "{}",
+            st.event(
+                ui::Mark::Warn,
+                "Official agent",
+                &format!("the NAS offers {a}.{b}.{c}-{d}: the console may show an update; update abb-agent with the package manager instead")
+            )
         );
-    }
-}
-
-/// ANSI styles, only on a terminal and without `NO_COLOR`.
-struct Style(bool);
-
-impl Style {
-    fn new() -> Style {
-        Style(unsafe { libc::isatty(1) } == 1 && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty()))
-    }
-    fn paint(&self, code: &str, s: &str) -> String {
-        if self.0 { format!("\x1b[{code}m{s}\x1b[0m") } else { s.to_string() }
-    }
-    fn bold(&self, s: &str) -> String {
-        self.paint("1", s)
-    }
-    fn dim(&self, s: &str) -> String {
-        self.paint("2", s)
-    }
-    fn red(&self, s: &str) -> String {
-        self.paint("31", s)
-    }
-    fn green(&self, s: &str) -> String {
-        self.paint("32", s)
-    }
-    fn yellow(&self, s: &str) -> String {
-        self.paint("33", s)
-    }
-    fn cyan(&self, s: &str) -> String {
-        self.paint("36", s)
-    }
-}
-
-fn bar(pct: f64, width: usize) -> String {
-    let full = ((pct / 100.0 * width as f64).round() as usize).min(width);
-    format!("{}{}", "█".repeat(full), "░".repeat(width - full))
-}
-
-fn size(b: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut v = b as f64;
-    let mut u = 0;
-    while v >= 1024.0 && u < UNITS.len() - 1 {
-        v /= 1024.0;
-        u += 1;
-    }
-    if u == 0 { format!("{b} B") } else { format!("{v:.1} {}", UNITS[u]) }
-}
-
-fn fmt_duration(s: u64) -> String {
-    match s {
-        0..60 => format!("{s} s"),
-        60..3600 => format!("{} min", s / 60),
-        _ => format!("{} h {:02} min", s / 3600, s % 3600 / 60),
     }
 }
 
@@ -706,9 +662,9 @@ mod tests {
         assert_eq!(weekdays(&[0, 1, 2, 3, 4, 5, 6]), "every day");
         assert_eq!(weekdays(&[1, 3, 0]), "Mon, Wed, Sun");
         assert_eq!(weekdays(&[5, 6, 0]), "Fri–Sun");
-        assert_eq!(bar(50.0, 4), "██░░");
-        assert_eq!(size(512), "512 B");
-        assert_eq!(size(3 << 30), "3.0 GiB");
-        assert_eq!(fmt_duration(3720), "1 h 02 min");
+        assert_eq!(ui::bar(50.0, 4), "██░░");
+        assert_eq!(ui::size(512), "512 B");
+        assert_eq!(ui::size(3 << 30), "3.0 GiB");
+        assert_eq!(ui::fmt_duration(3720), "1 h 02 min");
     }
 }

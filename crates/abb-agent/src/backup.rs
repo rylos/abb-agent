@@ -510,12 +510,16 @@ fn scan_disks(sel: &Selection) -> Result<(Scan, bool)> {
     let mut disks = Vec::new();
     let mut volume_parts = Vec::new();
     let mut missed = false;
+    let mut skipped = Vec::new();
     for n in names {
         let d = match disk::scan(&n) {
             Ok(d) => d,
             Err(e) if !explicit => {
                 let has_parts = disk::has_partitions(&n);
-                eprintln!("{n}: not backed up: {e}");
+                // An empty disk is not a problem: no partition table, nothing to keep.
+                let why = if has_parts { e.to_string() } else { "no partitions".into() };
+                eprintln!("{n}: not backed up: {why}");
+                skipped.push(format!("{n} ({why})"));
                 missed |= has_parts;
                 continue;
             }
@@ -558,6 +562,11 @@ fn scan_disks(sel: &Selection) -> Result<(Scan, bool)> {
     for ((d, _), named) in disks.iter_mut().zip(only) {
         d.image = named.image;
     }
+    let names: Vec<String> = disks.iter().map(|(d, _)| format!("{} ({})", d.name, crate::ui::size(d.size))).collect();
+    crate::ui::row("Disks", &names.join(", "));
+    if !skipped.is_empty() {
+        crate::ui::row("Not included", &skipped.join(", "));
+    }
     Ok(((disks, volume_parts), missed))
 }
 
@@ -590,6 +599,7 @@ pub fn run(sess: &Session, trigger: Trigger) -> Result<()> {
     for l in &crate::config::get().schedule.wait_locks {
         if Path::new(l).exists() {
             eprintln!("waiting for {l}");
+            crate::ui::busy(&format!("waiting for {l} (another backup job)"));
         }
         _shared.push(flock(l, false, true)?);
     }
@@ -605,6 +615,11 @@ pub fn run(sess: &Session, trigger: Trigger) -> Result<()> {
         Err(_) => "error".into(),
     };
     crate::hooks::on_finish(&status);
+    let detail = match &res {
+        Ok(()) => String::new(),
+        Err(e) => e.to_string(),
+    };
+    crate::ui::finish(&status, &detail);
     res
 }
 
@@ -612,14 +627,17 @@ pub fn run(sess: &Session, trigger: Trigger) -> Result<()> {
 fn run_locked(sess: &Session, trigger: Trigger) -> Result<()> {
     let mut c = sess.connect()?;
     let tasks = sess.tasks(&mut c)?;
-    let task = match &trigger {
+    let raw = match &trigger {
         Trigger::Server(rt) => tasks.iter().find(|t| t.get("id").and_then(Value::as_int) == Some(rt.task_id)),
         Trigger::Local { .. } => tasks.first(),
-    }
-    .and_then(TaskInfo::parse)
-    .ok_or_else(|| Error::Protocol("no task for this device".into()))?;
+    };
+    let task_name = raw.and_then(|t| t.get("name")).and_then(Value::as_str).unwrap_or("").to_string();
+    let task = raw.and_then(TaskInfo::parse).ok_or_else(|| Error::Protocol("no task for this device".into()))?;
     let (task_id, task_uuid, selection) = (task.id, task.uuid.clone(), task.selection.clone());
     eprintln!("source: {selection}");
+    crate::ui::row("Server", &format!("{}:{} · user {}", sess.state.server, sess.state.port, sess.state.username));
+    crate::ui::row("Task", &format!("#{task_id} {task_name}"));
+    crate::ui::row("Source", &selection.to_string());
 
     let ((disks, volume_parts), missed) = scan_disks(&selection)?;
     remove_stale_snapshots(&volume_parts);
@@ -689,6 +707,12 @@ fn run_locked(sess: &Session, trigger: Trigger) -> Result<()> {
         if is_cbt == 1 { "incremental" } else { "full" },
         rt.running_task_id
     );
+    crate::ui::gap();
+    crate::ui::running(&if is_cbt == 1 {
+        format!("incremental · version {version_id}, based on {base_version_id}")
+    } else {
+        format!("full · version {version_id}")
+    });
 
     let outcome = run_inner(&job, &mut c, &task, start_time, &disks, &volume_parts, prev.as_deref(), &raws, version_id)
         .map(|complete| complete && !missed);
@@ -763,9 +787,17 @@ fn run_inner(
     let volumes = {
         let c = &mut *c;
         prepare_volumes(volume_parts, &job.run_name, |p, done| {
+            if !done {
+                crate::ui::busy(&format!("{}: snapshot and changed blocks", alias(p)));
+            }
             job.log(c, if done { LOG_SNAPSHOT_DONE } else { LOG_SNAPSHOT_START }, Some(&alias(p)))
         })
     };
+    if let Ok(volumes) = &volumes {
+        for (p, v) in volume_parts.iter().zip(volumes) {
+            crate::ui::step(crate::ui::Mark::Ok, &format!("{}  {} · {}", alias(p), p.fs.name(), v.summary()));
+        }
+    }
     // The post script runs right after the snapshots, whether they succeeded or not.
     let post = scripts::run(job, c, &task.scripts, Hook::Post, version_id);
     let mut volumes = volumes?;
@@ -808,6 +840,8 @@ fn run_inner(
             .iter()
             .map(|p| p.iter().map(|x| if let Piece::Data { start, end, .. } = x { end - start } else { 0 }).sum())
             .collect();
+        let to_read: u64 = transfer.iter().sum();
+        crate::ui::step(crate::ui::Mark::Ok, &format!("{} to read{}", crate::ui::size(to_read), if prev.is_some() { " (blocks changed since the base version)" } else { "" }));
         job.log(c, LOG_UPLOAD_SPEC_START, None);
         let spec = spec(sess, disks, &used, &transfer, prev.is_some(), start_time, &job.run_name);
         let mut spec_bytes = serde_json::to_string_pretty(&spec).unwrap().into_bytes();

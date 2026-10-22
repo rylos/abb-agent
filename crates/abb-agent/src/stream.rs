@@ -544,6 +544,7 @@ fn send_stream(
     let total: u64 = plans.iter().flatten().map(|p| if let Piece::Data { start, end, .. } = p { end - start } else { 0 }).sum();
     let mut progress = crate::state::Progress { pid: std::process::id(), phase: "sending".into(), total, ..Default::default() };
     progress.save();
+    crate::ui::progress(0, total, 0);
     let (mut last_progress, mut last_done) = (Instant::now(), 0);
     let mut throttle = Throttle::default();
     for ((d, _), plan) in disks.iter().zip(plans) {
@@ -571,6 +572,7 @@ fn send_stream(
                     if last_progress.elapsed() > Duration::from_secs(2) {
                         progress.rate = ((progress.done - last_done) as f64 / last_progress.elapsed().as_secs_f64()) as u64;
                         progress.save();
+                        crate::ui::progress(progress.done, progress.total, progress.rate);
                         (last_progress, last_done) = (Instant::now(), progress.done);
                     }
                     if ready.unchanged {
@@ -626,6 +628,15 @@ fn send_stream(
     up.send(&perf(&ctr, None))?;
     eprintln!("all pieces sent after {:.1}s ({blocks} with data, {runs} without), waiting for the server", t0.elapsed().as_secs_f64(), runs = RUNS_SENT.load(Ordering::Relaxed));
     crate::state::Progress { phase: "finishing".into(), done: progress.total, ..progress }.save();
+    let secs = t0.elapsed().as_secs();
+    let rate = sent_raw.checked_div(secs).map_or(String::new(), |r| format!(" · {}/s", crate::ui::size(r)));
+    crate::ui::sent(&format!(
+        "{} sent ({} compressed) in {}{rate}",
+        crate::ui::size(sent_raw),
+        crate::ui::size(ctr.sent_compressed),
+        crate::ui::fmt_duration(secs)
+    ));
+    crate::ui::busy("the server is checking the version");
     up.send(&Value::map([("close", Value::Int(1))]))?;
     up.set_read_timeout(Some(Duration::from_secs(3600)))?;
     let r = up.recv()?;
