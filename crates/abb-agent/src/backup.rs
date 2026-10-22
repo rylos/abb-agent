@@ -676,6 +676,7 @@ fn run_locked(sess: &Session, trigger: Trigger) -> Result<()> {
     last.result_id = result_id;
     last.server_status = String::new();
     let _ = last.save();
+    crate::state::Progress::phase("preparing", 0, 0);
     let run_name = format!("abb-{start_time}");
     let job = Job { sess, rt: rt.clone(), result_id, run_name: run_name.clone() };
     control::begin(rt.running_task_id, Some(task.schedule.clone()));
@@ -698,6 +699,7 @@ fn run_locked(sess: &Session, trigger: Trigger) -> Result<()> {
         Err(_) => "error",
     };
     control::end();
+    crate::state::Progress::clear();
     if let Err(e) = &outcome {
         eprintln!("backup failed: {e}");
     }

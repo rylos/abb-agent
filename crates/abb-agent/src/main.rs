@@ -161,65 +161,102 @@ fn load() -> Session {
 }
 
 fn status() {
+    let st = Style::new();
     let sess = load();
-    println!("server {}:{} · user {} · device {}", sess.state.server, sess.state.port, sess.state.username, sess.state.device_uuid);
+    let row = |label: &str, value: String| println!("  {}  {value}", st.dim(&format!("{label:<11}")));
+    println!("{}  {}", st.bold(&format!("abb-agent {}", env!("CARGO_PKG_VERSION"))), st.dim("· Synology Active Backup for Business"));
+    println!();
+    row("Server", format!("{}:{} {} user {}", sess.state.server, sess.state.port, st.dim("·"), sess.state.username));
+    row("Device", sess.state.device_uuid.clone());
     sess.auth_by_token(false).unwrap_or_else(|e| die(e));
     let mut c = sess.connect().unwrap_or_else(|e| die(e));
     let tasks = sess.tasks(&mut c).unwrap_or_else(|e| die(e));
+    let sc = &config::get().schedule;
     for t in &tasks {
-        println!(
-            "task {} {:?}",
-            t.get("id").and_then(|v| v.as_int()).unwrap_or(0),
-            t.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+        println!();
+        row(
+            "Task",
+            format!(
+                "#{} {}",
+                t.get("id").and_then(|v| v.as_int()).unwrap_or(0),
+                st.bold(t.get("name").and_then(|v| v.as_str()).unwrap_or(""))
+            ),
         );
         if let Some(info) = task::TaskInfo::parse(t) {
-            println!("  source: {}", info.selection);
+            row("Source", info.selection.to_string());
             let sch = &info.schedule;
-            if sch.is_scheduled() {
-                println!(
-                    "  console schedule: days {:?} (0 = Sunday) at {:02}:{:02} server time{}{}",
-                    sch.weekdays,
-                    sch.hour,
-                    sch.minute,
-                    if sch.hourly { ", then every hour" } else { "" },
-                    if sch.window.is_some() { ", within the backup window" } else { "" }
-                );
-            } else {
-                println!("  console schedule: manual only");
-            }
+            row(
+                "Console",
+                if sch.is_scheduled() {
+                    format!(
+                        "{} at {:02}:{:02} (server time){}{}",
+                        weekdays(&sch.weekdays),
+                        sch.hour,
+                        sch.minute,
+                        if sch.hourly { ", then every hour" } else { "" },
+                        if sch.window.is_some() { ", within the backup window" } else { "" }
+                    )
+                } else {
+                    "manual only".into()
+                },
+            );
         }
     }
-    let running = sess.running_tasks(&mut c).unwrap_or_else(|e| die(e));
-    if let Ok(offered) = offered_agent(&sess)
-        && offered > our_version()
-    {
-        let (a, b, c, d) = offered;
-        println!("the NAS offers the official agent {a}.{b}.{c}-{d}: the console may show an update; update abb-agent with the package manager instead");
+    let mut local = vec![format!("after boot: {}", if sc.on_boot { "yes" } else { "no" })];
+    if sc.interval_hours > 0 {
+        local.push(format!("every {} h", sc.interval_hours));
     }
+    local.push(if sc.retry_minutes > 0 { format!("retry after {} min", sc.retry_minutes) } else { "no retry".into() });
+    row("Local", local.join(&format!(" {} ", st.dim("·"))));
+
+    let running = sess.running_tasks(&mut c).unwrap_or_else(|e| die(e));
     let last = state::LastRun::load();
-    let sc = &config::get().schedule;
-    println!(
-        "local schedule: after boot {}, every {} h, retry after {} min",
-        if sc.on_boot { "yes" } else { "no" },
-        if sc.interval_hours == 0 { "-".into() } else { sc.interval_hours.to_string() },
-        sc.retry_minutes
-    );
+    println!();
     if last.status == "running" {
-        println!("backup in progress, started {}", fmt_time(last.start));
+        let ago = host::now().saturating_sub(last.start);
+        println!("{} {}  started {} ({} ago)", st.cyan("▶"), st.bold("Backup in progress"), fmt_short(last.start), fmt_duration(ago));
+        match state::Progress::load() {
+            Some(p) if p.phase == "sending" && p.total > 0 => {
+                let pct = p.done as f64 * 100.0 / p.total as f64;
+                let mut line = format!("  {} {:>5.1}%   {} of {}", st.cyan(&bar(pct, 30)), pct, size(p.done), size(p.total));
+                if p.rate > 0 {
+                    let left = (p.total - p.done.min(p.total)) / p.rate.max(1);
+                    line += &format!(" {} {}/s {} ~{} left", st.dim("·"), size(p.rate), st.dim("·"), fmt_duration(left));
+                }
+                println!("{line}");
+            }
+            Some(p) if p.phase == "finishing" => println!("  {} 100.0%   {}", st.cyan(&bar(100.0, 30)), st.dim("all sent, the server is checking the version")),
+            Some(_) => println!("  {}", st.dim("preparing: snapshots and plan of what to send")),
+            None => {}
+        }
     } else if !running.is_empty() {
         let what = if running.iter().any(|r| r.status == 1) { "running" } else { "queued" };
-        println!("backup {what} on the server");
+        println!("{} {}", st.cyan("▶"), st.bold(&format!("Backup {what} on the server")));
     }
     if last.status != "running" && last.start != 0 {
+        let (mark, color): (&str, fn(&Style, &str) -> String) = match last.status.as_str() {
+            "complete" => ("✓", Style::green),
+            "partial" | "cancel" => ("!", Style::yellow),
+            _ => ("✗", Style::red),
+        };
+        let server = if last.server_status.is_empty() || last.server_status == last.status {
+            String::new()
+        } else {
+            format!(" {} on the server: {}", st.dim("·"), last.server_status)
+        };
         println!(
-            "last backup: {} → {}, {}{}",
-            fmt_time(last.start),
-            fmt_time(last.end),
-            last.status,
-            if last.server_status.is_empty() { String::new() } else { format!(" (on the server: {})", last.server_status) }
+            "{} {}  {} → {} ({}) {} {}{server}",
+            color(&st, mark),
+            st.bold("Last backup"),
+            fmt_short(last.start),
+            fmt_short(last.end),
+            fmt_duration(last.end.saturating_sub(last.start)),
+            st.dim("·"),
+            color(&st, &last.status),
         );
-    } else if last.last_ok_start != 0 {
-        println!("last successful backup: started {}", fmt_time(last.last_ok_start));
+    }
+    if last.last_ok_start != 0 && last.status != "complete" {
+        println!("  {}  started {}", st.dim("Last successful"), fmt_short(last.last_ok_start));
     }
     if let Ok(off) = sess.server_offset(&mut c) {
         control::set_server_offset(off);
@@ -228,27 +265,123 @@ fn status() {
     let local = scheduler::local_due(sc, &last).map(|d| d.0.max(host::now()));
     match [console, local].into_iter().flatten().min() {
         _ if last.status == "running" || !running.is_empty() => {}
-        Some(t) => println!("next backup: {}", fmt_time(t)),
-        None => println!("next backup: when started from the console or with `abb-agent backup`"),
+        Some(t) => println!("{} {}  {}", st.dim("○"), st.bold("Next backup"), fmt_short(t)),
+        None => println!("{} {}  when started from the console or with `abb-agent backup`", st.dim("○"), st.bold("Next backup")),
+    }
+    if let Ok(offered) = offered_agent(&sess)
+        && offered > our_version()
+    {
+        let (a, b, c, d) = offered;
+        println!();
+        println!(
+            "{} the NAS offers the official agent {a}.{b}.{c}-{d}: the console may show an update; update abb-agent with the package manager instead",
+            st.yellow("!")
+        );
     }
 }
 
-fn fmt_time(t: u64) -> String {
+/// ANSI styles, only on a terminal and without `NO_COLOR`.
+struct Style(bool);
+
+impl Style {
+    fn new() -> Style {
+        Style(unsafe { libc::isatty(1) } == 1 && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty()))
+    }
+    fn paint(&self, code: &str, s: &str) -> String {
+        if self.0 { format!("\x1b[{code}m{s}\x1b[0m") } else { s.to_string() }
+    }
+    fn bold(&self, s: &str) -> String {
+        self.paint("1", s)
+    }
+    fn dim(&self, s: &str) -> String {
+        self.paint("2", s)
+    }
+    fn red(&self, s: &str) -> String {
+        self.paint("31", s)
+    }
+    fn green(&self, s: &str) -> String {
+        self.paint("32", s)
+    }
+    fn yellow(&self, s: &str) -> String {
+        self.paint("33", s)
+    }
+    fn cyan(&self, s: &str) -> String {
+        self.paint("36", s)
+    }
+}
+
+fn bar(pct: f64, width: usize) -> String {
+    let full = ((pct / 100.0 * width as f64).round() as usize).min(width);
+    format!("{}{}", "█".repeat(full), "░".repeat(width - full))
+}
+
+fn size(b: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = b as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 { format!("{b} B") } else { format!("{v:.1} {}", UNITS[u]) }
+}
+
+fn fmt_duration(s: u64) -> String {
+    match s {
+        0..60 => format!("{s} s"),
+        60..3600 => format!("{} min", s / 60),
+        _ => format!("{} h {:02} min", s / 3600, s % 3600 / 60),
+    }
+}
+
+/// Days of the week (0 = Sunday) as "Mon–Fri", "every day", "Mon, Wed, Fri".
+fn weekdays(days: &[u64]) -> String {
+    const NAMES: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    // Monday first.
+    let mut d: Vec<u64> = days.iter().map(|&x| (x + 6) % 7).collect();
+    d.sort_unstable();
+    d.dedup();
+    if d.len() == 7 {
+        return "every day".into();
+    }
+    let name = |x: u64| NAMES[((x + 1) % 7) as usize];
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < d.len() {
+        let mut j = i;
+        while j + 1 < d.len() && d[j + 1] == d[j] + 1 {
+            j += 1;
+        }
+        out.push(if j - i >= 2 { format!("{}–{}", name(d[i]), name(d[j])) } else { (i..=j).map(|k| name(d[k])).collect::<Vec<_>>().join(", ") });
+        i = j + 1;
+    }
+    out.join(", ")
+}
+
+/// "today 13:50", "yesterday 11:07", "Thu 23/10 03:00".
+fn fmt_short(t: u64) -> String {
     if t == 0 {
         return "-".into();
     }
-    let tt = t as libc::time_t;
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    unsafe { libc::localtime_r(&tt, &mut tm) };
-    format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-        tm.tm_year + 1900,
-        tm.tm_mon + 1,
-        tm.tm_mday,
-        tm.tm_hour,
-        tm.tm_min,
-        tm.tm_sec
-    )
+    let tm = |t: u64| {
+        let tt = t as libc::time_t;
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        unsafe { libc::localtime_r(&tt, &mut tm) };
+        tm
+    };
+    let (a, now) = (tm(t), tm(host::now()));
+    let day = (a.tm_year, a.tm_yday);
+    let hm = format!("{:02}:{:02}", a.tm_hour, a.tm_min);
+    if day == (now.tm_year, now.tm_yday) {
+        format!("today {hm}")
+    } else if day == (now.tm_year, now.tm_yday - 1) {
+        format!("yesterday {hm}")
+    } else if day == (now.tm_year, now.tm_yday + 1) {
+        format!("tomorrow {hm}")
+    } else {
+        const NAMES: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+        format!("{} {:04}-{:02}-{:02} {hm}", NAMES[a.tm_wday as usize], a.tm_year + 1900, a.tm_mon + 1, a.tm_mday)
+    }
 }
 
 /// Service: heartbeat, schedule and backups each in a thread of their own; the main thread
@@ -560,5 +693,22 @@ pub fn run_pending(sess: &Session) {
             }
         }
         Err(e) => eprintln!("get_running_task: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_formats() {
+        assert_eq!(weekdays(&[1, 2, 3, 4, 5]), "Mon–Fri");
+        assert_eq!(weekdays(&[0, 1, 2, 3, 4, 5, 6]), "every day");
+        assert_eq!(weekdays(&[1, 3, 0]), "Mon, Wed, Sun");
+        assert_eq!(weekdays(&[5, 6, 0]), "Fri–Sun");
+        assert_eq!(bar(50.0, 4), "██░░");
+        assert_eq!(size(512), "512 B");
+        assert_eq!(size(3 << 30), "3.0 GiB");
+        assert_eq!(fmt_duration(3720), "1 h 02 min");
     }
 }

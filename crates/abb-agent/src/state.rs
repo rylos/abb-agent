@@ -58,6 +58,45 @@ impl LastRun {
     }
 }
 
+/// Progress of the running backup, for `abb-agent status` (in /run: gone after a reboot).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Progress {
+    /// Process running the backup: the file counts only while it is alive.
+    pub pid: u32,
+    /// "preparing" (snapshots, plan), "sending" or "finishing" (the server checks the version).
+    pub phase: String,
+    /// Bytes of data processed (sent, or read and found unchanged) and to process.
+    pub done: u64,
+    pub total: u64,
+    /// Bytes per second over the last few seconds.
+    pub rate: u64,
+}
+
+impl Progress {
+    const PATH: &str = "/run/abb-agent/progress.json";
+
+    pub fn load() -> Option<Progress> {
+        let p: Progress = serde_json::from_str(&fs::read_to_string(Self::PATH).ok()?).ok()?;
+        Path::new("/proc").join(p.pid.to_string()).exists().then_some(p)
+    }
+
+    pub fn save(&self) {
+        let tmp = Path::new(Self::PATH).with_extension("tmp");
+        let _ = fs::create_dir_all(tmp.parent().unwrap())
+            .and_then(|_| fs::write(&tmp, serde_json::to_string(self).unwrap_or_default()))
+            .and_then(|_| fs::rename(&tmp, Self::PATH));
+    }
+
+    /// Sets the phase of this process's backup.
+    pub fn phase(phase: &str, done: u64, total: u64) {
+        Progress { pid: std::process::id(), phase: phase.into(), done, total, rate: 0 }.save();
+    }
+
+    pub fn clear() {
+        let _ = fs::remove_file(Self::PATH);
+    }
+}
+
 fn path() -> PathBuf {
     Path::new(STATE_DIR).join("state.json")
 }

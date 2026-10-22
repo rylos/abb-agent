@@ -541,6 +541,10 @@ fn send_stream(
     let mut first_perf = Some(snapshot_time);
     let mut last_perf = Instant::now();
     let (mut blocks, mut unchanged, mut sent_raw) = (0u64, 0u64, 0u64);
+    let total: u64 = plans.iter().flatten().map(|p| if let Piece::Data { start, end, .. } = p { end - start } else { 0 }).sum();
+    let mut progress = crate::state::Progress { pid: std::process::id(), phase: "sending".into(), total, ..Default::default() };
+    progress.save();
+    let (mut last_progress, mut last_done) = (Instant::now(), 0);
     let mut throttle = Throttle::default();
     for ((d, _), plan) in disks.iter().zip(plans) {
         let image = d.image_name();
@@ -563,6 +567,12 @@ fn send_stream(
                     let ready = next()?;
                     ctr.read_time += ready.read_time;
                     ctr.read_bytes += ready.len;
+                    progress.done += ready.len;
+                    if last_progress.elapsed() > Duration::from_secs(2) {
+                        progress.rate = ((progress.done - last_done) as f64 / last_progress.elapsed().as_secs_f64()) as u64;
+                        progress.save();
+                        (last_progress, last_done) = (Instant::now(), progress.done);
+                    }
                     if ready.unchanged {
                         unchanged += 1;
                         // Taken from the previous version: an area outside the volumes too.
@@ -615,6 +625,7 @@ fn send_stream(
     }
     up.send(&perf(&ctr, None))?;
     eprintln!("all pieces sent after {:.1}s ({blocks} with data, {runs} without), waiting for the server", t0.elapsed().as_secs_f64(), runs = RUNS_SENT.load(Ordering::Relaxed));
+    crate::state::Progress { phase: "finishing".into(), done: progress.total, ..progress }.save();
     up.send(&Value::map([("close", Value::Int(1))]))?;
     up.set_read_timeout(Some(Duration::from_secs(3600)))?;
     let r = up.recv()?;
