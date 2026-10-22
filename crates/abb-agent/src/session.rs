@@ -4,16 +4,28 @@ use crate::host::Host;
 use crate::state::State;
 use abb_proto::transport::{Error, Result, fingerprint_hex};
 use abb_proto::{Connection, Value, request};
+use std::sync::Mutex;
 
 pub struct Session {
     pub state: State,
     pub host: Host,
 }
 
+/// Token the server gave in place of the saved one: after a restore onto this machine (same
+/// SMBIOS UUID) it marks the device token dirty and hands out a new one at the next `auth`.
+/// Shared by every `Session` of the process, each of which holds its own copy of the state.
+static RENEWED_TOKEN: Mutex<String> = Mutex::new(String::new());
+
+/// The device token in use.
+pub fn token(state: &State) -> String {
+    let t = RENEWED_TOKEN.lock().unwrap();
+    if t.is_empty() { state.token.clone() } else { t.clone() }
+}
+
 /// An authenticated request: `ds_id` and `token` are added automatically.
 pub fn authed(state: &State, action: &str, mut fields: Vec<(&'static str, Value)>) -> Value {
     fields.push(("ds_id", Value::str(state.ds_id.clone())));
-    fields.push(("token", Value::str(state.token.clone())));
+    fields.push(("token", Value::str(token(state))));
     request(action, fields)
 }
 
@@ -110,7 +122,7 @@ impl Session {
     /// `auth` with the token (with `init:1` at startup, then periodically).
     pub fn auth_by_token(&self, init: bool) -> Result<()> {
         let mut c = self.connect()?;
-        c.call(&authed(
+        let resp = c.call(&authed(
             &self.state,
             "auth",
             vec![
@@ -124,6 +136,19 @@ impl Session {
                 ("username", Value::str(self.state.username.clone())),
             ],
         ))?;
+        if let Some(new) = resp.get("token").and_then(Value::as_str).filter(|t| !t.is_empty())
+            && new != token(&self.state)
+        {
+            *RENEWED_TOKEN.lock().unwrap() = new.to_string();
+            let saved = State::load().and_then(|mut s| {
+                s.token = new.to_string();
+                s.save()
+            });
+            match saved {
+                Ok(()) => eprintln!("the server renewed the device token"),
+                Err(e) => eprintln!("the server renewed the device token, but saving it failed: {e}"),
+            }
+        }
         Ok(())
     }
 

@@ -441,7 +441,7 @@ pub fn upload(
             ("subaction", Value::str("upload_block")),
             ("is_cache", Value::Int(0)),
             ("running_task_id", Value::Int(job.rt.running_task_id)),
-            ("token", Value::str(sess.state.token.clone())),
+            ("token", Value::str(crate::session::token(&sess.state))),
         ],
     ))?;
     if open.get("success").and_then(Value::as_int) != Some(1) {

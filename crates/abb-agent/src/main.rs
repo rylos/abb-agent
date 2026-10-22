@@ -414,6 +414,7 @@ fn daemon() {
             }
             sess.state.last_event_id = sess.state.last_event_id.max(ev.id);
         }
+        sess.state.token = session::token(&sess.state);
         let _ = sess.state.save();
         if check_tasks {
             if control::busy() {
