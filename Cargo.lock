@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "abb-agent"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "abb-proto",
  "btrfs-image",
@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "abb-proto"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "rustls",
  "sha2",
@@ -27,7 +27,7 @@ dependencies = [
 
 [[package]]
 name = "abb-restore"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "abb-proto",
  "btrfs-image",
@@ -61,7 +61,7 @@ dependencies = [
 
 [[package]]
 name = "btrfs-image"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "crc32c",
  "libc",
@@ -234,7 +234,7 @@ dependencies = [
 
 [[package]]
 name = "ext-image"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "btrfs-image",
 ]
