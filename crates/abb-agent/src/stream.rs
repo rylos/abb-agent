@@ -162,8 +162,9 @@ pub fn plan_full(d: &Disk, intervals: &[Interval], volumes: &[Vol]) -> Vec<Piece
 }
 
 /// Plan for an incremental: 64 KiB blocks with `is_interval_cbt:1` inside volumes; the rest
-/// of the disk (GPT tables, ESP, ...) is sent again in full, as the official agent does.
-pub fn plan_incremental(intervals: &[Interval], volumes: &[Vol], prev: &[Digests]) -> Vec<Piece> {
+/// of the disk (GPT tables, ESP, ...) is sent again in full, as the official agent does, and so
+/// are volumes with no CBT table of the base (`None` in `prev`: a new disk or volume).
+pub fn plan_incremental(intervals: &[Interval], volumes: &[Vol], prev: &[Option<Digests>]) -> Vec<Piece> {
     let mut out = Vec::new();
     for i in intervals {
         let logged = i.part.as_ref().filter(|_| i.kind == 1 || i.kind == 2).map(alias);
@@ -182,8 +183,22 @@ pub fn plan_incremental(intervals: &[Interval], volumes: &[Vol], prev: &[Digests
                     w = we;
                 }
             }
+            Source::Vol(v) if prev[v].is_none() => {
+                // As in a full backup: used MiBs sent, free ones described as unused.
+                let off = i.part.as_ref().unwrap().offset;
+                let mut w = i.start;
+                while w < i.end {
+                    let we = ((w / MIB + 1) * MIB).min(i.end);
+                    out.push(if volumes[v].any_used(w - off, we - off) {
+                        Piece::Data { start: w, end: we, cbt: false, check: None }
+                    } else {
+                        Piece::Run(Run { start: w, end: we, used: false, changed: true, cbt: false })
+                    });
+                    w = we;
+                }
+            }
             Source::Vol(v) => {
-                let (vol, old) = (&volumes[v], &prev[v]);
+                let (vol, old) = (&volumes[v], prev[v].as_ref().unwrap());
                 let blocks = (i.end - i.start).div_ceil(cbt::BLOCK);
                 let per_mib = MIB / cbt::BLOCK;
                 let btrfs = vol.changed(old, 0).is_some();
@@ -374,7 +389,7 @@ fn produce(
     devs: &[Device],
     disks: &[(Disk, Vec<Interval>)],
     volumes: &[Vol],
-    prev: Option<&[Digests]>,
+    prev: Option<&[Option<Digests>]>,
     raws: &RawTables,
     compress: bool,
     (n, start, end, check): DataJob,
@@ -382,7 +397,7 @@ fn produce(
     let t = Instant::now();
     let raw = build(&devs[n], &disks[n].1, volumes, start, end)?;
     let unchanged = match (check, prev) {
-        (Some(Check::Vol(v, k)), Some(prev)) => volumes[v].unchanged(&prev[v], k),
+        (Some(Check::Vol(v, k)), Some(prev)) => prev[v].as_ref().is_some_and(|old| volumes[v].unchanged(old, k)),
         (Some(Check::Raw), _) => {
             let h = xxhash_rust::xxh3::xxh3_64(&raw).max(1);
             raws.cur.lock().unwrap()[n].insert(start, h);
@@ -411,7 +426,7 @@ pub fn upload(
     disks: &[(Disk, Vec<Interval>)],
     plans: &[Vec<Piece>],
     volumes: &[Vol],
-    prev: Option<&[Digests]>,
+    prev: Option<&[Option<Digests>]>,
     snapshot_time: Duration,
     (compress, encrypt): (bool, bool),
     raws: &RawTables,

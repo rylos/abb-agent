@@ -335,7 +335,8 @@ restore is a full one.
    compressed. Superblocks are rewritten without the tree log.
 5. **Incrementals.** Each 64 KiB block has a 64-bit fingerprint, derived from the data checksums
    and from tree node addresses and generations. Blocks whose fingerprint did not change since the
-   previous version are not sent.
+   previous version are not sent. A volume with no fingerprints of the previous version (a disk
+   or volume added since) is sent in full within the incremental; the others stay incremental.
 
 ext volumes follow the same scheme, using the block bitmaps instead of the extent tree. Their
 fingerprints are computed while reading; in an incremental, the blocks owned by files whose inode

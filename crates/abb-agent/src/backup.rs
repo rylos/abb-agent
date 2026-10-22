@@ -427,26 +427,28 @@ pub fn cbt_subvolume() -> Option<std::path::PathBuf> {
     Some(dir)
 }
 
-/// CBT tables of the previous backup, if they all match `base_version_id`.
-fn previous_digests(volumes: &[Partition], base_version_id: u64) -> Option<Vec<Digests>> {
+/// CBT tables of the previous backup, by volume: `None` for a volume whose table does not match
+/// `base_version_id` (a new disk or volume), which is sent in full within the incremental.
+/// `None` overall when no volume has one: a full backup.
+fn previous_digests(volumes: &[Partition], base_version_id: u64) -> Option<Vec<Option<Digests>>> {
     if base_version_id == 0 || volumes.is_empty() {
         return None;
     }
-    let mut out = Vec::new();
-    for p in volumes {
-        match Digests::load(&cbt_path(p)) {
-            Ok((d, meta)) if meta.version_id == base_version_id && meta.partition_offset == p.offset => out.push(d),
+    let out: Vec<Option<Digests>> = volumes
+        .iter()
+        .map(|p| match Digests::load(&cbt_path(p)) {
+            Ok((d, meta)) if meta.version_id == base_version_id && meta.partition_offset == p.offset => Some(d),
             Ok((_, meta)) => {
-                eprintln!("{}: CBT table is from version {} (base {base_version_id}): full backup", alias(p), meta.version_id);
-                return None;
+                eprintln!("{}: CBT table is from version {} (base {base_version_id}): sent in full", alias(p), meta.version_id);
+                None
             }
             Err(e) => {
-                eprintln!("{}: no CBT table ({e}): full backup", alias(p));
-                return None;
+                eprintln!("{}: no CBT table ({e}): sent in full", alias(p));
+                None
             }
-        }
-    }
-    Some(out)
+        })
+        .collect();
+    out.iter().any(Option::is_some).then_some(out)
 }
 
 /// Who started the backup.
@@ -748,7 +750,7 @@ fn run_inner(
     start_time: u64,
     disks: &[(Disk, Vec<Interval>)],
     volume_parts: &[Partition],
-    prev: Option<&[Digests]>,
+    prev: Option<&[Option<Digests>]>,
     raws: &stream::RawTables,
     version_id: u64,
 ) -> Result<bool> {
@@ -770,8 +772,8 @@ fn run_inner(
         return Err(e);
     }
     // ext: blocks of unchanged files need not be read again.
-    if prev.is_some() {
-        for (p, v) in volume_parts.iter().zip(volumes.iter_mut()).filter(|(p, _)| matches!(p.fs, Fs::Ext(_))) {
+    if let Some(prev) = prev {
+        for ((p, v), _) in volume_parts.iter().zip(volumes.iter_mut()).zip(prev).filter(|((p, _), old)| matches!(p.fs, Fs::Ext(_)) && old.is_some()) {
             // The CBT table of this volume belongs to the base version (checked when loaded).
             let Ok((_, meta)) = Digests::load(&cbt_path(p)) else { continue };
             if let Some(sigs) = crate::volume::load_inodes(&cbt_path(p).with_extension("inodes"), meta.version_id) {
@@ -792,7 +794,7 @@ fn run_inner(
             .collect();
         if let Some(prev) = prev {
             for (p, (v, old)) in volume_parts.iter().zip(volumes.iter().zip(prev)) {
-                if let Some(r) = v.change_report(old) {
+                if let Some(r) = old.as_ref().and_then(|old| v.change_report(old)) {
                     eprintln!("{}: {r}", alias(p));
                 }
             }
