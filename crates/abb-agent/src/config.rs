@@ -18,6 +18,15 @@ pub struct Config {
     pub ext: Ext,
     pub performance: Performance,
     pub hooks: Hooks,
+    pub agent: Agent,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Agent {
+    /// Build of the official agent to announce instead of abb-agent's (4 digits): only when the
+    /// NAS refuses this agent as too old, until an abb-agent release announces the new build.
+    pub announce_build: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -55,6 +55,12 @@
 # Threads that read, verify and compress data (0 = one per CPU, at most 8).
 # workers = 0
 
+# [agent]
+# Build of the official agent to announce instead of abb-agent's 5554. Only if the NAS refuses
+# this agent ("client version too low"), until an abb-agent release announces the new build:
+# the 4-digit build of the official agent the NAS offers (`abb-agent status` shows it).
+# announce_build = ""
+
 # [hooks]
 # Shell commands (run as root with /bin/sh, at most 5 minutes each). on_finish gets
 # ABB_STATUS (complete, partial, error or cancel) and ABB_EXIT (0 only when complete).

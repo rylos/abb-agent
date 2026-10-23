@@ -65,12 +65,25 @@ impl From<rustls::Error> for Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+static ANNOUNCED_BUILD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Build announced to the server: [`AGENT_BUILD`], or the one set with [`announce_build`].
+pub fn agent_build() -> &'static str {
+    ANNOUNCED_BUILD.get().map_or(AGENT_BUILD, String::as_str)
+}
+
+/// Announces another build (once, before the first request): for a server that refuses
+/// [`AGENT_BUILD`] as too old, until a release announces the new one.
+pub fn announce_build(build: &str) {
+    let _ = ANNOUNCED_BUILD.set(build.to_string());
+}
+
 /// The `agent` field present in every request.
 pub fn agent_field() -> Value {
     Value::map([(
         "version",
         Value::map([
-            ("build", Value::str(AGENT_BUILD)),
+            ("build", Value::str(agent_build())),
             ("major", Value::Int(AGENT_MAJOR)),
             ("mini", Value::Int(AGENT_MINI)),
             ("minor", Value::Int(AGENT_MINOR)),

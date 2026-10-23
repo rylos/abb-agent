@@ -348,7 +348,7 @@ fn spec(sess: &Session, disks: &[(Disk, Vec<Interval>)], used: &[u64], transfer:
         }));
     }
     json!({
-        "agent_version": abb_proto::transport::AGENT_BUILD,
+        "agent_version": abb_proto::transport::agent_build(),
         "device_spec": {
             "cpu_number": sess.host.cpu_number,
             "disk_layout": disk_layout,

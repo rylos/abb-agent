@@ -76,7 +76,17 @@ pub fn console_due(task: &TaskInfo) -> Option<u64> {
         c => c,
     };
     let off = control::server_offset();
-    task.schedule.next_after(checked as i64 + off).map(|t| (t - off).max(0) as u64)
+    let next = task.schedule.next_after(checked as i64 + off)?;
+    Some(to_utc(next, off) as u64)
+}
+
+/// Server wall-clock seconds to UTC. The server gives only its current offset; when it matches
+/// the local one (same time zone, clocks within a few minutes) the local rules also cover a
+/// daylight saving change before `t` (the console's 03:00 stays 03:00 after the switch).
+fn to_utc(t: i64, off: i64) -> i64 {
+    let skew = off - crate::host::utc_offset(now() as i64);
+    let utc = if skew.abs() < 900 { t - crate::host::utc_offset(t - off) - skew } else { t - off };
+    utc.max(0)
 }
 
 pub fn refresh_timezone(sess: &Session) {

@@ -10,7 +10,7 @@
 use crate::session::Session;
 use crate::state::STATE_DIR;
 use abb_proto::Value;
-use abb_proto::transport::{AGENT_BUILD, Error};
+use abb_proto::transport::{AGENT_BUILD, Error, agent_build};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -46,7 +46,28 @@ impl std::fmt::Display for Package {
 
 /// Build this agent announces.
 pub fn ours() -> u64 {
-    AGENT_BUILD.parse().unwrap_or(0)
+    agent_build().parse().unwrap_or(0)
+}
+
+/// `agent.announce_build` from the configuration, checked: 4 digits, above the server's
+/// highest threshold, and not below abb-agent's own build.
+pub fn apply_config() -> Result<(), String> {
+    let b = crate::config::get().agent.announce_build.trim();
+    if b.is_empty() {
+        return Ok(());
+    }
+    let n: u64 = b.parse().map_err(|_| format!("agent.announce_build {b:?} is not a number"))?;
+    let own: u64 = AGENT_BUILD.parse().unwrap_or(0);
+    if b.len() != 4 || n <= 4496 || n < own {
+        return Err(format!("agent.announce_build {b}: give the 4-digit build of the official agent the NAS offers (above {own})"));
+    }
+    abb_proto::transport::announce_build(b);
+    Ok(())
+}
+
+/// The announced build comes from the configuration.
+pub fn overridden() -> bool {
+    agent_build() != AGENT_BUILD
 }
 
 pub fn query(sess: &Session) -> Result<Package, String> {
@@ -117,6 +138,9 @@ pub fn check_server(sess: &Session) {
 /// What a package on the NAS means for this agent, for the journal and `status`.
 pub fn warnings(p: &Package) -> Vec<String> {
     let mut w = Vec::new();
+    if overridden() {
+        w.push(format!("abb-agent announces build {} (agent.announce_build in {}) instead of {AGENT_BUILD}", agent_build(), crate::config::path()));
+    }
     if p.agent_build() <= MIN_SERVER_BUILD {
         w.push(format!("Active Backup {p} on the NAS is older than the official agent 3.2.2 accepts: update the package in DSM"));
     }
@@ -134,7 +158,7 @@ pub fn warnings(p: &Package) -> Vec<String> {
 pub fn refusal(e: &Error) -> Option<String> {
     match e {
         Error::Server { code: ERR_CLIENT_TOO_OLD, .. } => Some(format!(
-            "the NAS refuses this agent as too old (client version too low for build {}): update abb-agent",
+            "the NAS refuses this agent as too old (client version too low for build {}): update abb-agent, or meanwhile set agent.announce_build to the build of the official agent it offers",
             ours()
         )),
         Error::Server { code: ERR_TOKEN_NOT_FOUND, .. } => {

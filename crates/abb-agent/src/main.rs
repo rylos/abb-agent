@@ -48,6 +48,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let opt = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned();
     let cfg = config::load().unwrap_or_else(|e| die(format!("configuration: {e}")));
+    version::apply_config().unwrap_or_else(|e| die(format!("configuration: {e}")));
     match args.get(1).map(String::as_str) {
         Some("config") => {
             println!("# {}", config::path());

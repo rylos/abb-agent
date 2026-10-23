@@ -228,6 +228,8 @@ cargo build --release --target x86_64-unknown-linux-musl -p abb-restore
 | `server error 0x1005: Requires OTP` | the account has two-factor authentication: enter the code when asked, or pass `--otp <code>` |
 | `server error 0x100f: Create Task Failed due to invalid parameters` | the default template's destination does not exist: fix it in ABB → *Settings* → *Template*, then connect again |
 | `permission denied: run it with sudo` | the agent's state is readable by root only |
+| `the NAS refuses this agent as too old` (status: *Refused*) | an Active Backup update raised the minimum agent build: update abb-agent; until a release is out, set `announce_build` in `[agent]` of `/etc/abb-agent.toml` to the build of the official agent the NAS offers (shown by `abb-agent status`) and restart the service |
+| `the NAS no longer knows this device` | the device was removed in the ABB console: pair again with `abb-agent connect` |
 | backup ends with `partial` | a volume could not be backed up (unsupported filesystem…): see `journalctl -u abb-agent` |
 
 Other commands:
@@ -357,8 +359,11 @@ Things that do not work yet, or have not been tested:
 - **Restore of MBR disks** is not handled beyond writing the image as it is (untested).
 - After a restore onto **different hardware** the initramfs is not regenerated, and no UEFI NVRAM
   boot entry is created (the fallback path `\EFI\BOOT\` is used instead).
-- The agent identifies itself as the official agent version it was written against; a future ABB
-  release may change the protocol.
+- The agent identifies itself as the official agent version it was written against (3.2.2, build
+  5554). The NAS checks only that build, never refuses a newer one, and an agent left at an older
+  version keeps backing up; a future ABB release may still change the protocol. `abb-agent status`
+  shows the Active Backup version on the NAS, and the journal notes when it changes. *Update agent*
+  in the console does not update abb-agent: update it with the package manager.
 
 ## Contributing
 

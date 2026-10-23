@@ -37,9 +37,6 @@ impl Host {
         let os_name = os_name(&name, field("VERSION_ID").as_deref());
         let release = fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
         let kernel_version = release.trim().split('.').take(2).collect::<Vec<_>>().join(".");
-        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-        let now = unsafe { libc::time(std::ptr::null_mut()) };
-        unsafe { libc::localtime_r(&now, &mut tm) };
         let meminfo = fs::read_to_string("/proc/meminfo").unwrap_or_default();
         let mem_kib: u64 = meminfo
             .lines()
@@ -51,7 +48,7 @@ impl Host {
             host_name,
             os_name,
             kernel_version,
-            time_zone: tm.tm_gmtoff,
+            time_zone: utc_offset(now() as i64),
             cpu_number: std::thread::available_parallelism().map_or(1, |n| n.get() as u64),
             memory_size: mem_kib / 1024,
         }
@@ -95,4 +92,11 @@ mod tests {
         assert_eq!(os_name("Arch Linux", None), "Linux - Arch Linux (64-bit)");
         assert_eq!(os_name("Fedora Linux", Some("42")), "Linux - Fedora Linux 42 (64-bit)");
     }
+}
+
+/// Offset of local time from UTC at Unix time `t`, in seconds (daylight saving included).
+pub fn utc_offset(t: i64) -> i64 {
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe { libc::localtime_r(&(t as libc::time_t), &mut tm) };
+    tm.tm_gmtoff
 }
