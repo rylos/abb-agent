@@ -143,13 +143,40 @@ pub fn prepare(
             Err(e) => return Err(e),
         }
     }
+    let run_prefix = Path::new(SNAP_DIR).join(run_name);
+    // btrfs drops the deleted-but-open files of a new snapshot right after committing it
+    // (`btrfs_orphan_cleanup` in `create_snapshot`), in the next transaction: until that is
+    // committed the snapshot is not final, and the blocks the cleanup frees can be reused while
+    // the backup reads them (pc-casa, 2026-10-23: a node of generation N+2 in place of N's).
+    // Commit, and check that none of this run's snapshots still holds orphan items.
+    let mut tries = 0;
+    let (mut fs, after) = loop {
+        snapshot::sync(&top)?;
+        let fs = Filesystem::open(dev)?;
+        let after = snapshot::list_subvolumes(&fs, &top)?;
+        let mut pending = Vec::new();
+        for s in after.iter().filter(|s| s.path.starts_with(&run_prefix)) {
+            // A node that cannot be read yet is still being rewritten: not final either.
+            if capture::has_orphans(&fs, s.id).unwrap_or(true) {
+                pending.push(s.id);
+            }
+        }
+        tries += 1;
+        if pending.is_empty() || tries == 30 {
+            if tries > 1 {
+                eprintln!("snapshots final after {tries} commits (btrfs was dropping deleted files from them)");
+            }
+            if !pending.is_empty() {
+                eprintln!("btrfs has not finished dropping deleted files from snapshots {pending:?}: the backup may fail if it reuses their blocks");
+            }
+            break (fs, after);
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    };
     let snapshot_time = t.elapsed();
 
     // Generation just committed: from here on we work on it only.
-    let mut fs = Filesystem::open(dev)?;
     let items = fs.root_items()?;
-    let after = snapshot::list_subvolumes(&fs, &top)?;
-    let run_prefix = Path::new(SNAP_DIR).join(run_name);
     let mut pinned = Vec::new();
     let mut snap_ids = Vec::new();
     let mut ours = frozen.clone();

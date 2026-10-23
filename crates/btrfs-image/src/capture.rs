@@ -238,3 +238,13 @@ pub fn tree_block_refs(fs: &Filesystem, logical: u64) -> String {
         Ok(()) => out.join(", "),
     }
 }
+
+/// Whether a subvolume tree still holds orphan items (inodes deleted while open, or being
+/// truncated, that btrfs has not finished dropping).
+pub fn has_orphans(fs: &Filesystem, subvol: u64) -> Result<bool, Error> {
+    let (bytenr, generation) = fs.tree_root(subvol)?;
+    let mut any = false;
+    let key = |offset| Key { objectid: ORPHAN_OBJECTID, kind: ORPHAN_ITEM_KEY, offset };
+    walk_range(fs, bytenr, generation, key(0), key(u64::MAX), &mut |_, _| any = true)?;
+    Ok(any)
+}

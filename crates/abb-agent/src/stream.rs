@@ -338,7 +338,9 @@ fn parallel_ordered<T: Send, R>(
                             return;
                         }
                     }
-                    let r = produce(idx);
+                    // A panic would leave the consumer waiting forever: it becomes an error.
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| produce(idx)))
+                        .unwrap_or_else(|_| Err(Error::Protocol(format!("internal error preparing piece {idx}"))));
                     let mut q = queue.lock().unwrap();
                     q.done.insert(idx, r);
                     cv.notify_all();
@@ -481,10 +483,11 @@ pub fn bench(disks: &[(Disk, Vec<Interval>)], volumes: &[Vol], limit: Option<u64
                 .transpose()
         })
         .collect::<std::io::Result<_>>()?;
+    let raws = RawTables { prev: vec![Default::default(); disks.len()], cur: Mutex::new(vec![Default::default(); disks.len()]) };
     let t = Instant::now();
     parallel_ordered(
         jobs.len(),
-        |i| produce(&devs, disks, volumes, None, &RawTables::default(), true, jobs[i]),
+        |i| produce(&devs, disks, volumes, None, &raws, true, jobs[i]),
         |next| {
             let (mut raw, mut packed) = (0u64, 0u64);
             for k in 0..jobs.len() {
