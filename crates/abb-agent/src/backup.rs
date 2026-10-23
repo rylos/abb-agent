@@ -495,6 +495,11 @@ fn flock(path: &str, create: bool, wait: bool) -> Result<Option<std::fs::File>> 
     Ok(Some(f))
 }
 
+/// A backup holds the lock, in this process or another (`abb-agent backup` by hand).
+pub fn in_progress() -> bool {
+    matches!(flock(LOCK, false, false), Err(Error::Protocol(_)))
+}
+
 /// Disks with their intervals, and the partitions of the volumes to prepare.
 type Scan = (Vec<(Disk, Vec<Interval>)>, Vec<Partition>);
 
@@ -759,6 +764,17 @@ fn run_locked(sess: &Session, trigger: Trigger) -> Result<()> {
     outcome.map(|_| ())
 }
 
+/// The server answers the stream's `close` even when it failed to store it (it drains the
+/// rest after a write error): its result for the version says whether it took it.
+fn server_accepted(job: &Job, c: &mut Connection) -> Result<()> {
+    let r = job.sess.call(c, "get_running_task_result", vec![("result_id", Value::Int(job.result_id))])?;
+    let status = r.get("running_task_result").and_then(|t| t.get("status")).and_then(Value::as_str).unwrap_or("");
+    if ["fail", "error", "cancel"].iter().any(|f| status.starts_with(f)) {
+        return Err(Error::Protocol(format!("the server did not store the version (status {status}): see its log in the ABB console")));
+    }
+    Ok(())
+}
+
 /// Prepares the volumes (btrfs snapshots, maps, ext freeze) one after another; on error,
 /// releases the ones already prepared.
 fn prepare_volumes(volume_parts: &[Partition], run_name: &str, mut each: impl FnMut(&Partition, bool)) -> Result<Vec<Vol>> {
@@ -870,6 +886,7 @@ fn run_inner(
         job.log(c, LOG_UPLOAD_SPEC_DONE, None);
 
         stream::upload(job, c, disks, &plans, &volumes, prev, snapshot_time, (task.compression, task.encryption), raws)?;
+        server_accepted(job, c)?;
         raws.save(disks, version_id);
         for (p, v) in volume_parts.iter().zip(&volumes) {
             if let Some(n) = v.changed_while_read().filter(|&n| n > 0) {
