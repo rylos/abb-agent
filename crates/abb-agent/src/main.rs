@@ -460,7 +460,12 @@ fn daemon() {
         let has = match sess.long_poll(c, 400) {
             Ok(h) => h,
             Err(e) => {
-                eprintln!("long_poll: {e}");
+                // The server sometimes lets the wait run past our read timeout: just reconnect.
+                let timeout = matches!(&e, abb_proto::transport::Error::Io(io)
+                    if matches!(io.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut));
+                if !timeout {
+                    eprintln!("long_poll: {e}");
+                }
                 poll = None;
                 continue;
             }
