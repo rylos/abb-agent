@@ -14,7 +14,16 @@ git archive --format=tar.gz --prefix="abb-agent-$version/" HEAD >"$dist/build/ab
 cp packaging/arch/abb-agent/PKGBUILD packaging/arch/abb-agent/abb-agent.install "$dist/build/"
 sum=$(sha256sum "$dist/build/abb-agent-$version.tar.gz" | cut -d' ' -f1)
 sed -i "s/^pkgver=.*/pkgver=$version/; s/^sha256sums=.*/sha256sums=('$sum')/" "$dist/build/PKGBUILD"
-(cd "$dist/build" && makepkg -f --noconfirm)
+# The binaries go to other computers: built for any x86-64 CPU, not with the build host's
+# -march/-C target-cpu=native from /etc/makepkg.conf (or makepkg.conf.d), which made the 0.2.x
+# binaries die with SIGILL on older CPUs (an i5-7300U).
+cp /etc/makepkg.conf "$dist/build/makepkg.conf"
+cat >>"$dist/build/makepkg.conf" <<'CONF'
+CFLAGS="-march=x86-64 -mtune=generic -O2 -pipe -fno-plt -fexceptions -Wp,-D_FORTIFY_SOURCE=3 -Wformat -Werror=format-security -fstack-clash-protection -fcf-protection"
+CXXFLAGS="$CFLAGS -Wp,-D_GLIBCXX_ASSERTIONS"
+RUSTFLAGS="-C opt-level=3 -C target-cpu=x86-64"
+CONF
+(cd "$dist/build" && makepkg -f --noconfirm --config ./makepkg.conf)
 mv "$dist"/build/abb-agent-"$version"-*.pkg.tar.zst "$dist/"
 
 # The same binaries with the units and the configuration, for abb-agent-bin.
