@@ -239,7 +239,13 @@ impl Vol {
     /// `false` if there are no used bytes.
     pub fn fill(&self, vs: u64, seg: &mut [u8]) -> std::result::Result<bool, String> {
         let any = match self {
-            Vol::Btrfs { prep, .. } => fill_window(&prep.fs, &prep.cap, &prep.map, vs, seg).map_err(|e| e.to_string())?,
+            Vol::Btrfs { prep, .. } => fill_window(&prep.fs, &prep.cap, &prep.map, vs, seg).map_err(|e| match e {
+                // Which tree held it at the generation read: something the capture missed.
+                btrfs_image::Error::Changed { logical, .. } => {
+                    format!("{e} ({})", btrfs_image::capture::tree_block_refs(&prep.fs, logical))
+                }
+                e => e.to_string(),
+            })?,
             Vol::Ext(x) => {
                 let any = x.fs.fill_window(vs, seg);
                 // Metadata captured while frozen replaces what is on the device now.

@@ -622,7 +622,25 @@ pub fn run(sess: &Session, trigger: Trigger) -> Result<()> {
 
     crate::hooks::on_start();
     let started = now();
-    let res = run_locked(sess, trigger);
+    // A retry is the agent's own run: the server's running task already got its outcome.
+    let again = match &trigger {
+        Trigger::Server(_) => Trigger::Local { trigger_type: TRIGGER_MANUAL, trigger_event: None },
+        Trigger::Local { trigger_type, trigger_event } => Trigger::Local { trigger_type: *trigger_type, trigger_event: *trigger_event },
+    };
+    let mut res = run_locked(sess, trigger);
+    // A node of the generation read was overwritten on the device before it was sent: a rare
+    // race the snapshots and the capture did not cover. A new run reads a new generation.
+    if let Err(e) = &res
+        && e.to_string().contains("changed after the generation read")
+        && !control::cancelled()
+    {
+        eprintln!("the filesystem changed under the backup: starting it again in 1 min");
+        crate::ui::step(crate::ui::Mark::Warn, "the filesystem changed under the backup: starting again in 1 min");
+        std::thread::sleep(std::time::Duration::from_secs(60));
+        if !control::cancelled() {
+            res = run_locked(sess, again);
+        }
+    }
     let last = LastRun::load();
     let status = match &res {
         Ok(()) if last.start >= started => last.status.clone(),

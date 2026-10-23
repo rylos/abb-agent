@@ -197,3 +197,44 @@ fn capture_trees(fs: &Filesystem, cap: &mut Building, roots: Vec<(u64, u64, Opti
     }
     Ok(())
 }
+
+/// What the extent tree of the generation read says about a tree block: when it was allocated
+/// and which trees or parent nodes reference it. For diagnosing a node that changed on the
+/// device during the backup.
+pub fn tree_block_refs(fs: &Filesystem, logical: u64) -> String {
+    const TREE_BLOCK_REF_KEY: u8 = 176;
+    const SHARED_BLOCK_REF_KEY: u8 = 182;
+    let refs_in = |data: &[u8], mut o: usize, out: &mut Vec<String>| {
+        while o + 9 <= data.len() {
+            let (kind, value) = (data[o], u64_at(data, o + 1));
+            match kind {
+                TREE_BLOCK_REF_KEY => out.push(format!("tree {value}")),
+                SHARED_BLOCK_REF_KEY => out.push(format!("parent node {value}")),
+                _ => break,
+            }
+            o += 9;
+        }
+    };
+    let (root, generation) = match fs.tree_root(EXTENT_TREE_OBJECTID) {
+        Ok(r) => r,
+        Err(e) => return format!("extent tree: {e}"),
+    };
+    let mut out = Vec::new();
+    let r = walk_range(fs, root, generation, Key { objectid: logical, kind: 0, offset: 0 }, Key { objectid: logical, kind: u8::MAX, offset: u64::MAX }, &mut |key, item| {
+        match key.kind {
+            EXTENT_ITEM_KEY | METADATA_ITEM_KEY if item.len() >= 24 => {
+                out.push(format!("allocated in generation {}, {} refs", u64_at(item, 8), u64_at(item, 0)));
+                // EXTENT_ITEM of a tree block: key and level of the block before the refs.
+                refs_in(item, if key.kind == EXTENT_ITEM_KEY { 24 + 18 } else { 24 }, &mut out);
+            }
+            176 => out.push(format!("tree {}", key.offset)),
+            182 => out.push(format!("parent node {}", key.offset)),
+            _ => {}
+        }
+    });
+    match r {
+        Err(e) => format!("extent tree: {e}"),
+        Ok(()) if out.is_empty() => "not in the extent tree".into(),
+        Ok(()) => out.join(", "),
+    }
+}

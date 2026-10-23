@@ -1,5 +1,5 @@
 //! Read-only diagnostics: map of the used blocks of a btrfs.
-//! Usage: sudo btrfs-usedmap /dev/nvme0n1p2
+//! Usage: sudo btrfs-usedmap /dev/nvme0n1p2 [--refs <logical>]
 
 use btrfs_image::Filesystem;
 use btrfs_image::usedmap::{Kind, UsedMap};
@@ -15,6 +15,12 @@ fn main() {
     let t = Instant::now();
     let fs = Filesystem::open(dev.as_ref()).unwrap_or_else(|e| fail(e));
     let sb = &fs.sb;
+    // `--refs <logical>`: what the extent tree says about a tree block.
+    if std::env::args().nth(2).as_deref() == Some("--refs") {
+        let logical = std::env::args().nth(3).and_then(|v| v.parse().ok()).unwrap_or(sb.root);
+        println!("{logical}: {}", btrfs_image::capture::tree_block_refs(&fs, logical));
+        return;
+    }
     println!(
         "generation {}  nodesize {}  device {:.1} GiB  bytes_used {:.2} GiB  chunk {}",
         sb.generation,
