@@ -92,7 +92,7 @@ fn to_utc(t: i64, off: i64) -> i64 {
 pub fn refresh_timezone(sess: &Session) {
     match sess.connect().and_then(|mut c| sess.server_offset(&mut c)) {
         Ok(off) => control::set_server_offset(off),
-        Err(e) => eprintln!("get_timezone: {e}"),
+        Err(e) => control::net_error("get_timezone", &e),
     }
 }
 
@@ -103,6 +103,7 @@ pub fn run(sess: Session, worker: Sender<LocalTrigger>) {
     let mut task: Option<TaskInfo> = None;
     let mut fetched: Option<Instant> = None;
     let mut tz: Option<Instant> = None;
+    let mut waiting = false;
     loop {
         if tz.is_none_or(|t| t.elapsed() > Duration::from_secs(3600)) {
             refresh_timezone(&sess);
@@ -114,7 +115,7 @@ pub fn run(sess: Session, worker: Sender<LocalTrigger>) {
                     task = list.first().and_then(TaskInfo::parse);
                     fetched = Some(Instant::now());
                 }
-                Err(e) => eprintln!("get_task: {e}"),
+                Err(e) => control::net_error("get_task", &e),
             }
         }
         // A backup started by hand (`abb-agent backup`) holds the lock in another process.
@@ -122,7 +123,16 @@ pub fn run(sess: Session, worker: Sender<LocalTrigger>) {
             let t = now();
             let console = task.as_ref().and_then(console_due).filter(|&d| d <= t);
             let local = local_due(&config::get().schedule, &LastRun::load()).filter(|d| d.0 <= t);
-            if console.is_some() {
+            let due = console.is_some() || local.is_some();
+            // `only_if` (e.g. "on the home network"): the backup stays due until it holds.
+            let held = due && !crate::hooks::allowed();
+            if held && !waiting {
+                eprintln!("backup due, waiting for schedule.only_if to hold");
+            }
+            waiting = held;
+            if held {
+                // Checked again at the next round.
+            } else if console.is_some() {
                 eprintln!("scheduled backup (console schedule)");
                 save_checked(t);
                 let _ = worker.send((TRIGGER_SCHEDULE, None));

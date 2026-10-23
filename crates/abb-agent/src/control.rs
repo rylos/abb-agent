@@ -116,3 +116,24 @@ pub fn server_offset() -> i64 {
 pub fn server_now() -> ServerTime {
     crate::host::now() as i64 + server_offset()
 }
+
+static OFFLINE: AtomicBool = AtomicBool::new(false);
+
+/// A request to the NAS failed. Network errors are logged once until the NAS answers again: a
+/// laptop away from home would otherwise fill the journal.
+pub fn net_error(what: &str, e: &abb_proto::transport::Error) {
+    if matches!(e, abb_proto::transport::Error::Io(_)) {
+        if !OFFLINE.swap(true, Ordering::SeqCst) {
+            eprintln!("{what}: {e}: the NAS cannot be reached, retrying quietly");
+        }
+    } else {
+        eprintln!("{what}: {e}");
+    }
+}
+
+/// The NAS answered.
+pub fn net_ok() {
+    if OFFLINE.swap(false, Ordering::SeqCst) {
+        eprintln!("the NAS can be reached again");
+    }
+}

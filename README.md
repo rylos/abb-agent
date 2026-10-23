@@ -257,7 +257,8 @@ The task settings in the ABB console apply as they do with the official agent:
 | Retention, permissions, backup verification | handled by the server |
 
 On top of that, `/etc/abb-agent.toml` can add a backup after every boot (on by default), a fixed
-interval, retries after a failure, lock files to wait for, and commands to run when a backup
+interval, retries after a failure, lock files to wait for, a condition for the agent's own
+backups (`only_if`, e.g. a laptop only on the home network), and commands to run when a backup
 starts and ends (e.g. to ping a monitoring service). Disks can be named by stable paths
 (`/dev/disk/by-id/…`) or as `system`, and each disk keeps its image on the server even if the
 kernel names it differently later.

@@ -227,6 +227,9 @@ fn status() {
         local.push(format!("every {} h", sc.interval_hours));
     }
     local.push(if sc.retry_minutes > 0 { format!("retry after {} min", sc.retry_minutes) } else { "no retry".into() });
+    if !sc.only_if.trim().is_empty() {
+        local.push(if hooks::allowed() { "only_if holds now".into() } else { "only_if does not hold now".into() });
+    }
     println!("{}", st.row("Local", &local.join(&sep)));
     // The disks a backup would take, as the backup shows them.
     let cfg_disks = &config::get().disks;
@@ -381,13 +384,14 @@ fn daemon() {
                     version::check_server(&sess);
                 }
                 None => {
-                    eprintln!("auth: {e}; retrying in 30 s");
+                    control::net_error("auth", &e);
                     std::thread::sleep(Duration::from_secs(30));
                 }
             },
         }
     }
     version::accepted();
+    control::net_ok();
     eprintln!("connected to {} as {}", sess.state.server, sess.host.host_name);
     // A backup interrupted by a crash or power loss is still "running" here: take its outcome
     // from the server before scheduling anything.
@@ -403,13 +407,13 @@ fn daemon() {
         loop {
             std::thread::sleep(Duration::from_secs(6));
             if conn.is_none() {
-                conn = s.connect().map_err(|e| eprintln!("heartbeat: {e}")).ok();
+                conn = s.connect().map_err(|e| control::net_error("heartbeat", &e)).ok();
             }
             if let Some(c) = conn.as_mut()
                 && let Err(e) = s.heart_beat(c)
             {
                 if version::refusal(&e).is_none() {
-                    eprintln!("heartbeat: {e}");
+                    control::net_error("heartbeat", &e);
                 }
                 conn = None;
             }
@@ -417,6 +421,7 @@ fn daemon() {
                 match s.auth_by_token(false) {
                     Ok(()) => {
                         version::accepted();
+                        control::net_ok();
                         // Back after an outage: the NAS may have updated Active Backup.
                         if auth_failed || last_check.elapsed() > Duration::from_secs(6 * 3600) {
                             version::check_server(&s);
@@ -428,7 +433,7 @@ fn daemon() {
                         match version::refusal(&e) {
                             Some(why) if version::refused(&why) => eprintln!("auth renewal: {why}"),
                             Some(_) => {}
-                            None => eprintln!("auth renewal: {e}"),
+                            None => control::net_error("auth renewal", &e),
                         }
                         auth_failed = true;
                     }
@@ -492,7 +497,7 @@ fn daemon() {
                     poll = Some(c);
                 }
                 Err(e) => {
-                    eprintln!("long_poll: {e}");
+                    control::net_error("long_poll", &e);
                     std::thread::sleep(Duration::from_secs(15));
                     continue;
                 }
@@ -509,7 +514,7 @@ fn daemon() {
                     // Logged by the auth renewal; wait instead of asking again at once.
                     std::thread::sleep(Duration::from_secs(60));
                 } else if !timeout {
-                    eprintln!("long_poll: {e}");
+                    control::net_error("long_poll", &e);
                 }
                 poll = None;
                 continue;

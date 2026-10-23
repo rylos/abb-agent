@@ -41,11 +41,15 @@ pub struct Schedule {
     pub retry_minutes: u64,
     /// Lock files to wait for (exclusive flock) before a backup; missing files are ignored.
     pub wait_locks: Vec<String>,
+    /// Shell command that must succeed for the agent to start a scheduled backup on its own
+    /// (e.g. "on the home network"); checked again every 30 s while a backup is due. Empty =
+    /// always. Backups started from the console or by hand do not check it.
+    pub only_if: String,
 }
 
 impl Default for Schedule {
     fn default() -> Schedule {
-        Schedule { on_boot: true, interval_hours: 0, retry_minutes: 60, wait_locks: Vec::new() }
+        Schedule { on_boot: true, interval_hours: 0, retry_minutes: 60, wait_locks: Vec::new(), only_if: String::new() }
     }
 }
 

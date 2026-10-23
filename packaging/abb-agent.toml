@@ -33,6 +33,10 @@
 # time (abb-agent takes an exclusive flock on each). Missing files are ignored.
 # Example: wait_locks = ["/run/lock/backup-nas.lock"]
 # wait_locks = []
+# Only start a scheduled backup when this shell command succeeds, e.g. on a laptop only on the
+# home network (the router's address and MAC: another network may use the same addresses).
+# Checked every 30 s while a backup is due; the console and `abb-agent backup` ignore it.
+# only_if = "ip neigh show 192.168.1.254 | grep -qi 'aa:bb:cc:dd:ee:ff'"
 
 # [btrfs]
 # Subvolumes to leave out of the image, as paths from the top-level subvolume (`*` and `?`

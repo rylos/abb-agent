@@ -18,37 +18,42 @@ fn exit_code(status: &str) -> u8 {
 }
 
 fn run(name: &str, cmd: &str, env: &[(&str, String)]) {
-    if cmd.trim().is_empty() {
-        return;
+    if let Err(e) = exec(cmd, env, TIMEOUT) {
+        eprintln!("{name}: {e}");
     }
-    let mut child = match Command::new("/bin/sh").arg("-c").arg(cmd).envs(env.iter().map(|(k, v)| (k, v))).stdin(Stdio::null()).spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("{name}: {e}");
-            return;
-        }
-    };
+}
+
+/// Runs `cmd` with /bin/sh; Ok if it exits with 0 within `timeout` (an empty command is Ok).
+fn exec(cmd: &str, env: &[(&str, String)], timeout: Duration) -> Result<(), String> {
+    if cmd.trim().is_empty() {
+        return Ok(());
+    }
+    let mut child = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(cmd)
+        .envs(env.iter().map(|(k, v)| (k, v)))
+        .stdin(Stdio::null())
+        .spawn()
+        .map_err(|e| e.to_string())?;
     let start = Instant::now();
     loop {
         match child.try_wait() {
-            Ok(Some(s)) if s.success() => return,
-            Ok(Some(s)) => {
-                eprintln!("{name}: {s}");
-                return;
-            }
-            Ok(None) if start.elapsed() > TIMEOUT => {
+            Ok(Some(s)) if s.success() => return Ok(()),
+            Ok(Some(s)) => return Err(s.to_string()),
+            Ok(None) if start.elapsed() > timeout => {
                 let _ = child.kill();
                 let _ = child.wait();
-                eprintln!("{name}: killed after {} s", TIMEOUT.as_secs());
-                return;
+                return Err(format!("killed after {} s", timeout.as_secs()));
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(200)),
-            Err(e) => {
-                eprintln!("{name}: {e}");
-                return;
-            }
+            Err(e) => return Err(e.to_string()),
         }
     }
+}
+
+/// `schedule.only_if`: whether the agent may start a scheduled backup now.
+pub fn allowed() -> bool {
+    exec(&crate::config::get().schedule.only_if, &[], Duration::from_secs(30)).is_ok()
 }
 
 pub fn on_start() {
