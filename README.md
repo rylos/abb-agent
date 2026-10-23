@@ -236,7 +236,7 @@ Other commands:
 
 | command | |
 |---|---|
-| `abb-agent status` | connection, tasks, last backup and next scheduled one |
+| `abb-agent status [-w]` | connection, tasks, last backup and next scheduled one; `-w` follows a running backup with a live progress bar until it ends |
 | `abb-agent backup [-v]` | run a backup now, in the foreground: steps and a progress bar on a terminal, the detailed log in the journal (`journalctl -t abb-agent`); `-v` prints the log instead |
 | `abb-agent config` | show the configuration in effect |
 | `abb-agent disks [disk]` | disks, partitions and filesystems as the agent sees them |

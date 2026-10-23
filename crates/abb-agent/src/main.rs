@@ -31,7 +31,8 @@ const USAGE: &str = "usage:
                                                          pair this computer with the ABB server
                                                          (password from ABB_PASSWORD or prompted,
                                                          two-factor code prompted when needed)
-  abb-agent status                                       connection and task status
+  abb-agent status [-w]                                  connection and task status (-w: follow a
+                                                         running backup until it ends)
   abb-agent daemon                                       service: heartbeat, events, scheduled backups
   abb-agent backup [-v]                                  back up now, in the foreground (-v: the log here,
                                                          not the journal)
@@ -78,7 +79,7 @@ fn main() {
             state.save().unwrap_or_else(|e| die(e));
             println!("paired with {server} as {user}: the device and its task are in the ABB console");
         }
-        Some("status") => status(),
+        Some("status") => status(args.iter().any(|a| a == "-w" || a == "--watch")),
         Some("cleanup") => backup::startup_cleanup(),
         Some("backup") => {
             control::handle_stop_signals();
@@ -174,7 +175,60 @@ fn load() -> Session {
     Session::new(state)
 }
 
-fn status() {
+/// The live line of a running backup: progress bar while sending, otherwise the phase.
+fn progress_line(st: &ui::Style) -> Option<String> {
+    let p = state::Progress::load()?;
+    Some(match p.phase.as_str() {
+        "sending" if p.total > 0 => st.progress(p.done, p.total, p.rate),
+        "finishing" => format!("  {} {}", st.mark(ui::Mark::Busy), st.dim("all sent, the server is checking the version")),
+        _ => format!("  {} {}", st.mark(ui::Mark::Busy), st.dim("preparing: snapshots and plan of what to send")),
+    })
+}
+
+fn last_backup_line(st: &ui::Style, last: &state::LastRun) -> String {
+    let sep = format!(" {} ", st.sep());
+    let server = if last.server_status.is_empty() || last.server_status == last.status {
+        String::new()
+    } else {
+        format!("{sep}on the server: {}", last.server_status)
+    };
+    let detail = format!(
+        "{} → {} ({}){sep}{}{server}",
+        fmt_short(last.start),
+        fmt_short(last.end),
+        ui::fmt_duration(last.end.saturating_sub(last.start)),
+        st.outcome_color(&last.status, &last.status)
+    );
+    st.event(st.outcome(&last.status), "Last backup", &detail)
+}
+
+/// `status -w`: redraws the progress line in place until the backup ends, then shows how.
+fn follow(st: &ui::Style) {
+    println!();
+    let mut out = std::io::stdout();
+    while let Some(line) = progress_line(st) {
+        let _ = write!(out, "\r\x1b[2K{line}");
+        let _ = out.flush();
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    let _ = write!(out, "\r\x1b[2K");
+    // The backup process records its outcome right after clearing the progress.
+    let mut last = state::LastRun::load();
+    for _ in 0..20 {
+        if last.status != "running" {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        last = state::LastRun::load();
+    }
+    if last.status == "running" {
+        println!("{}", st.event(ui::Mark::Warn, "Backup", "the backup process ended without recording an outcome"));
+    } else {
+        println!("{}", last_backup_line(st, &last));
+    }
+}
+
+fn status(watch: bool) {
     let st = ui::Style::for_fd(1);
     let sess = load();
     let sep = format!(" {} ", st.sep());
@@ -257,30 +311,15 @@ fn status() {
     if last.status == "running" {
         let ago = host::now().saturating_sub(last.start);
         println!("{}", st.event(ui::Mark::Run, "Backing up", &format!("started {} ({} ago)", fmt_short(last.start), ui::fmt_duration(ago))));
-        match state::Progress::load() {
-            Some(p) if p.phase == "sending" && p.total > 0 => println!("{}", st.progress(p.done, p.total, p.rate)),
-            Some(p) if p.phase == "finishing" => println!("  {} {}", st.mark(ui::Mark::Busy), st.dim("all sent, the server is checking the version")),
-            Some(_) => println!("  {} {}", st.mark(ui::Mark::Busy), st.dim("preparing: snapshots and plan of what to send")),
-            None => {}
+        if !watch && let Some(line) = progress_line(&st) {
+            println!("{line}");
         }
     } else if !running.is_empty() {
         let what = if running.iter().any(|r| r.status == 1) { "running" } else { "queued" };
         println!("{}", st.event(ui::Mark::Run, &format!("Backup {what} on the server"), ""));
     }
     if last.status != "running" && last.start != 0 {
-        let server = if last.server_status.is_empty() || last.server_status == last.status {
-            String::new()
-        } else {
-            format!("{sep}on the server: {}", last.server_status)
-        };
-        let detail = format!(
-            "{} → {} ({}){sep}{}{server}",
-            fmt_short(last.start),
-            fmt_short(last.end),
-            ui::fmt_duration(last.end.saturating_sub(last.start)),
-            st.outcome_color(&last.status, &last.status)
-        );
-        println!("{}", st.event(st.outcome(&last.status), "Last backup", &detail));
+        println!("{}", last_backup_line(&st, &last));
     }
     if last.last_ok_start != 0 && last.status != "complete" {
         println!("{}", st.row("Last success", &format!("started {}", fmt_short(last.last_ok_start))));
@@ -301,6 +340,9 @@ fn status() {
     }
     for w in warnings {
         println!("{}", st.event(ui::Mark::Warn, "Version", &w));
+    }
+    if watch && last.status == "running" {
+        follow(&st);
     }
 }
 
