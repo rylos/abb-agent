@@ -107,7 +107,8 @@ pub fn run(sess: Session, worker: Sender<LocalTrigger>) {
                 Err(e) => eprintln!("get_task: {e}"),
             }
         }
-        if !control::busy() {
+        // A backup started by hand (`abb-agent backup`) holds the lock in another process.
+        if !control::busy() && !crate::backup::in_progress() {
             let t = now();
             let console = task.as_ref().and_then(console_due).filter(|&d| d <= t);
             let local = local_due(&config::get().schedule, &LastRun::load()).filter(|d| d.0 <= t);

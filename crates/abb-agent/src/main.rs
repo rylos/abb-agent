@@ -412,9 +412,10 @@ fn daemon() {
                 let last = state::LastRun::load();
                 if let Err(e) = backup::run(&s, backup::Trigger::Local { trigger_type, trigger_event }) {
                     eprintln!("backup: {e}");
-                    // Failed before starting (e.g. server unreachable): retry later.
+                    // Failed before starting (e.g. server unreachable): retry later. Not when
+                    // a backup started by hand holds the lock: that one is running.
                     let mut l = state::LastRun::load();
-                    if l.start == last.start {
+                    if l.start == last.start && !backup::in_progress() {
                         l.start = host::now();
                         l.status = "error".into();
                         let _ = l.save();
@@ -595,7 +596,7 @@ fn fetch_result(sess: &Session) {
             return;
         }
     };
-    let stale = last.status == "running" && !control::busy();
+    let stale = last.status == "running" && !control::busy() && !backup::in_progress();
     if status.is_empty() || (status == last.server_status && !stale) {
         return;
     }
@@ -603,7 +604,7 @@ fn fetch_result(sess: &Session) {
         eprintln!("result {} on the server: {status}", last.result_id);
     }
     last.server_status = status.clone();
-    if last.status == "running" && !control::busy() {
+    if stale {
         // The process that ran this backup ended without recording how (killed, power loss):
         // the server's outcome is the one that counts.
         let local = match status.as_str() {
