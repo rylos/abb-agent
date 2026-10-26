@@ -76,17 +76,25 @@ pub fn console_due(task: &TaskInfo) -> Option<u64> {
         c => c,
     };
     let off = control::server_offset();
-    let next = task.schedule.next_after(checked as i64 + off)?;
-    Some(to_utc(next, off) as u64)
+    let skew = off - crate::host::utc_offset(now() as i64);
+    let next = task.schedule.next_after(to_server(checked as i64, off, skew))?;
+    Some(to_utc(next, off, skew) as u64)
 }
 
 /// Server wall-clock seconds to UTC. The server gives only its current offset; when it matches
 /// the local one (same time zone, clocks within a few minutes) the local rules also cover a
 /// daylight saving change before `t` (the console's 03:00 stays 03:00 after the switch).
-fn to_utc(t: i64, off: i64) -> i64 {
-    let skew = off - crate::host::utc_offset(now() as i64);
+/// `skew`: server offset less the local one now.
+fn to_utc(t: i64, off: i64, skew: i64) -> i64 {
     let utc = if skew.abs() < 900 { t - crate::host::utc_offset(t - off) - skew } else { t - off };
     utc.max(0)
+}
+
+/// UTC seconds to server wall-clock, with the offset in force at `t` as in `to_utc`: after a
+/// switch back to standard time the last check (Friday 03:00 summer time) must not become
+/// Friday 02:00 and make that 03:00 start due again.
+fn to_server(t: i64, off: i64, skew: i64) -> i64 {
+    if skew.abs() < 900 { t + crate::host::utc_offset(t) + skew } else { t + off }
 }
 
 pub fn refresh_timezone(sess: &Session) {
@@ -142,5 +150,24 @@ pub fn run(sess: Session, worker: Sender<LocalTrigger>) {
             }
         }
         std::thread::sleep(Duration::from_secs(30));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn last_check_before_the_switch_to_standard_time() {
+        // Meaningful only with TZ=Europe/Rome (or another zone switching on 2026-10-25 01:00 UTC).
+        let fri_0300 = 1_792_717_200; // 2026-10-23 01:00 UTC, 03:00 summer time
+        let sun_0222 = 1_792_891_320; // 2026-10-25 01:22 UTC, after the switch
+        if crate::host::utc_offset(fri_0300) != 7200 || crate::host::utc_offset(sun_0222) != 3600 {
+            return;
+        }
+        let off = 3600; // the server's offset after the switch
+        let wall = to_server(fri_0300, off, 0);
+        assert_eq!(wall % 86400, 3 * 3600); // still Friday 03:00, already done
+        assert_eq!(to_utc(wall, off, 0), fri_0300);
     }
 }
