@@ -1,5 +1,6 @@
-# abb-agent configuration. Nothing is set here: every line is a comment, and the agent uses the
-# default shown for each setting. Uncomment and edit what you want to change.
+# abb-agent configuration. Nothing is set here: every setting is a comment, and the agent uses the
+# default shown for it. Uncomment and edit what you want to change, and leave each setting under
+# its [section] line.
 # Apply changes with `systemctl restart abb-agent`; `abb-agent config` shows the
 # configuration in effect.
 #
@@ -18,7 +19,7 @@
 # Empty: all internal disks (not removable, not USB, not virtual).
 # disks = []
 
-# [schedule]
+[schedule]
 # The schedule, backup window, source (whole device, system volumes or selected volumes),
 # bandwidth limit and pre/post scripts are set on the task in the ABB console, and the agent
 # follows them. The settings below add what the console does not offer for Linux.
@@ -38,7 +39,7 @@
 # Checked every 30 s while a backup is due; the console and `abb-agent backup` ignore it.
 # only_if = "ip neigh show 192.168.1.254 | grep -qi 'aa:bb:cc:dd:ee:ff'"
 
-# [btrfs]
+[btrfs]
 # Subvolumes to leave out of the image, as paths from the top-level subvolume (`*` and `?`
 # allowed). In the restored system they no longer exist: btrfs removes them on the first mount.
 # Their data is not sent unless other subvolumes (e.g. snapshots of them) still use it, so list
@@ -46,7 +47,7 @@
 # Example: exclude_subvolumes = ["@games", "btrbk_snapshots/@games.*"]
 # exclude_subvolumes = []
 
-# [ext]
+[ext]
 # ext2/3/4 filesystems mounted read-write (the root filesystem too) are frozen for an instant
 # while their metadata is read, then the files are read with the system running: the image is a
 # consistent filesystem, files written during the backup may have mixed content (logged).
@@ -55,17 +56,17 @@
 # which are always frozen only for an instant.
 # freeze_mounted = false
 
-# [performance]
+[performance]
 # Threads that read, verify and compress data (0 = one per CPU, at most 8).
 # workers = 0
 
-# [agent]
+[agent]
 # Build of the official agent to announce instead of abb-agent's 5554. Only if the NAS refuses
 # this agent ("client version too low"), until an abb-agent release announces the new build:
 # the 4-digit build of the official agent the NAS offers (`abb-agent status` shows it).
 # announce_build = ""
 
-# [hooks]
+[hooks]
 # Shell commands (run as root with /bin/sh, at most 5 minutes each). on_finish gets
 # ABB_STATUS (complete, partial, error or cancel) and ABB_EXIT (0 only when complete).
 # Example, a healthchecks.io check:

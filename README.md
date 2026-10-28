@@ -61,8 +61,9 @@ This project is not affiliated with, endorsed or supported by Synology Inc. "Syn
 
    The device and its backup task appear in the ABB console. Rename the task or set its
    retention there if you like.
-4. **Configure** `/etc/abb-agent.toml`. As installed it contains only comments: uncomment at least
-   the disks to back up, e.g. `disks = ["system"]`, and the schedule you want.
+4. **Configure** `/etc/abb-agent.toml`. As installed every setting is a comment: uncomment at least
+   the disks to back up, e.g. `disks = ["system"]`, and the schedule you want. Each setting stays
+   under its `[section]` line.
 5. **Start** the service. The first backup runs right away (after every boot by default), the
    following ones are incremental:
 
@@ -210,9 +211,9 @@ cargo build --release --target x86_64-unknown-linux-musl -p abb-restore
    The password is asked interactively, or read from `ABB_PASSWORD`. The server
    certificate is pinned on first contact.
 
-2. Edit `/etc/abb-agent.toml`. As installed it contains only comments, so every setting has its
+2. Edit `/etc/abb-agent.toml`. As installed every setting is a comment, so each has its
    default (all internal disks, a backup after every boot): uncomment what you want, at least the
-   disks (e.g. `disks = ["system"]`).
+   disks (e.g. `disks = ["system"]`), and leave each setting under its `[section]` line.
 
 3. Start the service:
 

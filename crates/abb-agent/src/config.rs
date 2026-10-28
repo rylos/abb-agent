@@ -94,14 +94,47 @@ pub fn path() -> String {
 pub fn load() -> Result<&'static Config, String> {
     let path = path();
     let config = match std::fs::read_to_string(&path) {
-        Ok(text) => toml::from_str(&text).map_err(|e| format!("{path}: {e}"))?,
+        Ok(text) => toml::from_str(&text).map_err(|e| format!("{path}: {e}{}", misplaced(&e.to_string())))?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Config::default(),
         Err(e) => return Err(format!("{path}: {e}")),
     };
     Ok(CONFIG.get_or_init(|| config))
 }
 
+/// For an unknown field that is a setting of a section (a key uncommented without its
+/// `[section]` line, or put in another section): where it belongs.
+fn misplaced(error: &str) -> String {
+    let Some(key) = error.split("unknown field `").nth(1).and_then(|r| r.split('`').next()) else {
+        return String::new();
+    };
+    let Ok(toml::Value::Table(sections)) = toml::Value::try_from(Config::default()) else {
+        return String::new();
+    };
+    sections
+        .iter()
+        .find(|(_, v)| v.as_table().is_some_and(|t| t.contains_key(key)))
+        .map(|(name, _)| format!("`{key}` is a setting of [{name}]: it must come after the `[{name}]` line"))
+        .unwrap_or_default()
+}
+
 /// The configuration in effect (defaults if [`load`] was never called).
 pub fn get() -> &'static Config {
     CONFIG.get_or_init(Config::default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shipped_file_parses_and_keys_need_their_section() {
+        let shipped = include_str!("../../../packaging/abb-agent.toml");
+        toml::from_str::<Config>(shipped).unwrap();
+        // Uncommenting a setting under its section line works.
+        let edited = shipped.replace("# on_boot = true", "on_boot = false");
+        assert!(!toml::from_str::<Config>(&edited).unwrap().schedule.on_boot);
+        // Without the section line, the error says where it belongs.
+        let e = toml::from_str::<Config>("on_boot = false").unwrap_err().to_string();
+        assert!(misplaced(&e).contains("[schedule]"), "{e}");
+    }
 }
