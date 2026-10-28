@@ -1,6 +1,6 @@
 [package]
 name = "btrfs-image"
-version = "0.2.12"
+version = "0.2.13"
 edition.workspace = true
 license.workspace = true
 description = "Read-only access to btrfs from the raw device: map of used blocks and an image consistent with one generation"
