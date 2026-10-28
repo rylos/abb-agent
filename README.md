@@ -268,6 +268,25 @@ kernel names it differently later.
 
 The server stores one image per disk. Files can be browsed and restored from the ABB portal.
 
+### Files from the ABB portal
+
+In the portal, pick a version, select files or folders and either **Download** them or
+**Restore** them onto the device, to their original place or to another folder. A restore onto
+the device is carried out by the running agent: files are written next to their destination
+under a temporary name and renamed into place, with owner, permissions and times; folders get
+theirs once their content is written. *Skip* keeps whatever already exists, otherwise it is
+replaced. Missing parent folders are created. Progress and the outcome of each file appear in the
+portal; a restore can be cancelled there.
+
+What the server sends limits what comes back:
+
+- **Symbolic links, FIFOs, sockets and device files are not restored**: the server sends only
+  regular files and folders, and lists the others as not supported (the restore is then
+  *partial*). The bare-metal restore below brings back everything.
+- **Hard links** come back as separate copies of the file.
+- **Sparse files** stay sparse: blocks of zeros are not written.
+- Extended attributes and ACLs are not restored.
+
 ### Bare-metal restore with abb-restore
 
 `abb-restore` is a single static binary (no dependencies) that restores a whole machine from any

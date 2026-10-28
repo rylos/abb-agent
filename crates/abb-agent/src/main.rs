@@ -5,6 +5,7 @@ mod backup;
 mod config;
 mod control;
 mod disk;
+mod filerestore;
 mod fixup;
 mod hooks;
 mod host;
@@ -50,6 +51,10 @@ fn main() {
     let opt = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned();
     let cfg = config::load().unwrap_or_else(|e| die(format!("configuration: {e}")));
     version::apply_config().unwrap_or_else(|e| die(format!("configuration: {e}")));
+    if matches!(args.get(1).map(String::as_str), Some("config" | "status" | "version" | "disks")) {
+        // Output piped into `head` and the like: end quietly when the reader goes away.
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+    }
     match args.get(1).map(String::as_str) {
         Some("config") => {
             println!("# {}", config::path());
@@ -529,8 +534,9 @@ fn daemon() {
 
     let mut sess = sess;
     let mut poll: Option<Connection> = None;
-    // A backup may already be queued at startup.
+    // A backup or a file restore may already be queued at startup.
     let _ = tx.send(None);
+    filerestore::check(&sess);
     loop {
         if poll.is_none() {
             match sess.connect() {
@@ -581,7 +587,10 @@ fn daemon() {
                     control::tasks_changed();
                     check_tasks = true;
                 }
-                "update_running_task" => check_tasks = true,
+                "update_running_task" => {
+                    check_tasks = true;
+                    filerestore::check(&sess);
+                }
                 "update_backup_bandwidth" => {
                     match sess.connect().and_then(|mut c| sess.call(&mut c, "get_backup_bandwidth", vec![])) {
                         Ok(r) => control::set_bandwidth(r.get("backup_bandwidth").and_then(Value::as_int).unwrap_or(0)),
