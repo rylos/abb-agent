@@ -151,10 +151,13 @@ fn plan(d: &Disk, volumes: &mut Vec<Partition>, sel: &Selection) -> Vec<Interval
             (5, Source::Excluded(Skip::Swap))
         } else if !sel.selects(p) {
             (5, Source::Excluded(Skip::NotSelected))
+        } else if unreadable(p).is_some() {
+            (5, Source::Excluded(Skip::Unsupported))
         } else if vol {
             volumes.push(p.clone());
             (1, Source::Vol(volumes.len() - 1))
         } else if matches!(p.fs, Fs::None | Fs::Vfat) {
+            // A vfat in use cannot be frozen: checked for changes after it is read.
             (2, Source::Raw)
         } else {
             (5, Source::Excluded(Skip::Unsupported))
@@ -166,6 +169,32 @@ fn plan(d: &Disk, volumes: &mut Vec<Partition>, sel: &Selection) -> Vec<Interval
         out.push(gap(pos, d.size));
     }
     out
+}
+
+/// Why a partition that would be copied cannot be read consistently, if it cannot: an unknown
+/// filesystem someone may be writing to, or an ext held by the kernel but not mounted here (it
+/// cannot be frozen).
+fn unreadable(p: &Partition) -> Option<&'static str> {
+    match p.fs {
+        Fs::None if p.in_use() => Some("unknown filesystem in use (mounted read-write, or held by the kernel)"),
+        Fs::Ext(_) if p.mount_path.is_empty() && p.busy => Some("in use but not mounted here: it cannot be frozen"),
+        _ => None,
+    }
+}
+
+/// Digest of a whole partition, to tell whether it changed while it was read.
+fn partition_digest(d: &Disk, p: &Partition) -> Result<u64> {
+    let dev = btrfs_image::device::Device::open(&d.device())?;
+    let mut h = xxhash_rust::xxh3::Xxh3::new();
+    let mut buf = vec![0u8; (4 * MIB) as usize];
+    let mut o = p.offset;
+    while o < p.offset + p.length {
+        let n = (p.offset + p.length - o).min(4 * MIB) as usize;
+        dev.read_exact_at(&mut buf[..n], o)?;
+        h.update(&buf[..n]);
+        o += n as u64;
+    }
+    Ok(h.digest())
 }
 
 fn skip_of(intervals: &[Interval], p: &Partition) -> Option<Skip> {
@@ -606,6 +635,10 @@ fn scan_disks(sel: &Selection) -> Result<(Scan, bool)> {
         };
         let mut parts = Vec::new();
         let iv = plan(&d, &mut parts, sel);
+        for p in unsupported(&d, &iv) {
+            let why = unreadable(p).map_or_else(|| format!("{} not supported", p.fs.name()), str::to_string);
+            eprintln!("{}: left out ({why}): partial backup", alias(p));
+        }
         let wanted = *sel == Selection::WholeDevice
             || iv.iter().any(|i| i.part.is_some() && !matches!(i.source, Source::Excluded(_)));
         if !wanted {
@@ -911,6 +944,14 @@ fn run_inner(
     }
     let snapshot_time = t.elapsed();
     let result = (|| -> Result<bool> {
+        // vfat partitions in use, copied as they are: their digest before anything is read and
+        // after everything is, to tell whether the copy is consistent.
+        let live: Vec<(&Disk, &Partition)> = disks
+            .iter()
+            .flat_map(|(d, iv)| iv.iter().filter(|i| i.source == Source::Raw).filter_map(move |i| Some((d, i.part.as_ref()?))))
+            .filter(|(_, p)| p.fs == Fs::Vfat && p.in_use())
+            .collect();
+        let before = live.iter().map(|(d, p)| partition_digest(d, p)).collect::<Result<Vec<u64>>>()?;
         let used: Vec<u64> = disks.iter().map(|(d, iv)| used_estimate(iv, &volumes, d)).collect();
         let mut plans: Vec<Vec<Piece>> = disks
             .iter()
@@ -953,6 +994,13 @@ fn run_inner(
         job.log(c, LOG_UPLOAD_SPEC_DONE, None);
 
         stream::upload(job, c, disks, &plans, &volumes, prev, snapshot_time, (task.compression, task.encryption), raws)?;
+        let mut consistent = true;
+        for ((d, p), h) in live.iter().zip(before) {
+            if partition_digest(d, p)? != h {
+                eprintln!("{}: changed while the backup read it (vfat cannot be frozen): its copy may be inconsistent, partial backup", alias(p));
+                consistent = false;
+            }
+        }
         server_accepted(job, c)?;
         raws.save(disks, version_id);
         for (p, v) in volume_parts.iter().zip(&volumes) {
@@ -970,7 +1018,7 @@ fn run_inner(
                 Err(e) => eprintln!("saving CBT for {}: {e}", alias(p)),
             }
         }
-        let complete = disks.iter().all(|(d, iv)| unsupported(d, iv).is_empty()) && volumes.iter().all(|v| !v.incomplete());
+        let complete = consistent && disks.iter().all(|(d, iv)| unsupported(d, iv).is_empty()) && volumes.iter().all(|v| !v.incomplete());
         Ok(complete)
     })();
     volumes.into_iter().for_each(Vol::cleanup);
@@ -1031,6 +1079,28 @@ mod tests {
 
     fn disk(name: &str, parts: Vec<Partition>) -> Disk {
         Disk { name: name.into(), image: name.into(), size: 4 << 30, sector_size: 512, layout: "GPT".into(), partitions: parts }
+    }
+
+    #[test]
+    fn partitions_in_use_are_copied_only_if_consistent() {
+        let mut esp = part("zzsda1", 1, 1 << 20, Fs::Vfat, "AB-CD");
+        let mut ntfs = part("zzsda2", 2, 2 << 20, Fs::None, "");
+        let mut ext = part("zzsda3", 3, 3 << 20, Fs::Ext(4), "u");
+        let d = disk("zzsda", vec![esp.clone(), ntfs.clone(), ext.clone()]);
+        let sources = |d: &Disk| plan(d, &mut Vec::new(), &Selection::WholeDevice).iter().filter(|i| i.part.is_some()).map(|i| i.source).collect::<Vec<_>>();
+        // Unmounted: copied raw, ext as a volume.
+        assert_eq!(sources(&d), [Source::Raw, Source::Raw, Source::Vol(0)]);
+        // Mounted read-write: vfat still copied (checked afterwards), the unknown filesystem left
+        // out; held by the kernel elsewhere: the same, and ext cannot be frozen.
+        (esp.mount_path, esp.read_only) = ("/boot".into(), false);
+        (ntfs.mount_path, ntfs.read_only) = ("/data".into(), false);
+        ext.busy = true;
+        let d = disk("zzsda", vec![esp.clone(), ntfs.clone(), ext.clone()]);
+        assert_eq!(sources(&d), [Source::Raw, Source::Excluded(Skip::Unsupported), Source::Excluded(Skip::Unsupported)]);
+        // Mounted read-only: copied.
+        ntfs.read_only = true;
+        let d = disk("zzsda", vec![esp, ntfs, ext]);
+        assert_eq!(sources(&d)[1], Source::Raw);
     }
 
     #[test]
