@@ -452,7 +452,7 @@ impl Vol {
         if x.overlay.is_empty() {
             return None;
         }
-        let then = &x.inodes.as_ref()?.sigs;
+        let inodes = x.inodes.as_ref()?;
         // The inode tables on the device lag behind the journal: ask the kernel instead, by
         // inode number and generation (ext's file handle).
         let dir = std::fs::File::open(x.mount.as_ref()?).ok()?;
@@ -465,7 +465,8 @@ impl Vol {
         }
         const FILEID_INO32_GEN: i32 = 1;
         let mut changed = 0;
-        for (&ino, sig) in then {
+        // The orphan file and quota files are written by the kernel and read under the freeze.
+        for (&ino, sig) in inodes.sigs.iter().filter(|(i, _)| !inodes.internal.contains(i)) {
             let mut h = Handle { bytes: 8, kind: FILEID_INO32_GEN, ino, generation: (sig[3] >> 32) as u32 };
             let fd = unsafe {
                 libc::open_by_handle_at(

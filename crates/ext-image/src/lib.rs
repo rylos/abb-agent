@@ -281,6 +281,8 @@ pub struct Inodes {
     pub file_data: Vec<(u64, u64)>,
     /// Blocks of the journal (inode 8), as byte ranges.
     pub journal: Vec<(u64, u64)>,
+    /// Orphan file and quota files: in `sigs`, but the kernel does not open them by handle.
+    pub internal: Vec<u32>,
 }
 
 /// An ext filesystem read from the device.
@@ -425,7 +427,7 @@ impl ExtFs {
         let uninit_ok = sb.ro_compat & (RO_COMPAT_GDT_CSUM | RO_COMPAT_METADATA_CSUM) != 0;
         let per_block = bs / sb.inode_size;
         let itable_blocks = (sb.inodes_per_group * sb.inode_size).div_ceil(bs);
-        let mut out = Inodes::default();
+        let mut out = Inodes { internal: sb.internal.clone(), ..Default::default() };
         let mut bitmap = vec![0u8; bs as usize];
         for g in 0..sb.groups() {
             let d = &self.descs[(g * sb.desc_size) as usize..((g + 1) * sb.desc_size) as usize];
@@ -874,6 +876,9 @@ mod tests {
         let inodes = fs.inodes().unwrap();
         assert!(inodes.sigs.contains_key(&2));
         assert!(!inodes.journal.is_empty());
+        // e2fsprogs 1.47 creates an orphan file: listed apart, the kernel does not open it by handle.
+        assert!(inodes.internal.iter().all(|i| inodes.sigs.contains_key(i)));
+        assert!(inodes.internal.is_empty() || !inodes.owned.iter().any(|o| inodes.internal.contains(&o.2)));
         // Mark the journal as needing recovery, as after a crash.
         let f = std::fs::OpenOptions::new().read(true).write(true).open(&img).unwrap();
         use std::os::unix::fs::FileExt;
