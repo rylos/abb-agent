@@ -172,6 +172,7 @@ sudo install -Dm755 target/release/abb-agent /usr/bin/abb-agent
 sudo install -Dm755 target/release/abb-restore /usr/bin/abb-restore
 sudo install -Dm644 packaging/systemd/abb-agent.service /usr/lib/systemd/system/abb-agent.service
 sudo install -Dm644 packaging/systemd/abb-agent-fixup.service /usr/lib/systemd/system/abb-agent-fixup.service
+sudo install -Dm644 packaging/systemd/abb-agent.tmpfiles /usr/lib/tmpfiles.d/abb-agent.conf
 sudo install -Dm644 packaging/abb-agent.toml /etc/abb-agent.toml
 ```
 

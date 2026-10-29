@@ -8,13 +8,29 @@ After=network-online.target
 Type=simple
 ExecStart=/usr/bin/abb-agent daemon
 Restart=on-failure
-# A backup being stopped cancels itself and removes its snapshots first.
-TimeoutStopSec=300
 RestartSec=30
+# A backup being stopped cancels itself, removes its snapshots and runs hooks.on_finish (up to
+# 5 min); hooks.on_start (5 min) or a console pre/post script (3 min) may be running when the
+# stop comes. 15 min covers them all plus the cleanup.
+TimeoutStopSec=900
 # Backups run in the background: keep the machine responsive.
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7
+
+# Hardening. The agent reads whole disks, creates and deletes btrfs snapshots, mounts btrfs
+# top-level subvolumes, freezes filesystems, restores files anywhere with their owner and
+# permissions, and runs the configured hooks and the console's scripts as root: no private
+# mount namespace (ProtectSystem, ProtectHome, PrivateTmp, PrivateDevices, ProtectKernel*,
+# ReadOnlyPaths…), no device policy (ProtectClock implies one that would hide the disks), no
+# NoNewPrivileges or RestrictSUIDSGID (hooks may use sudo, restored files keep set-uid bits).
+# The hooks and scripts inherit what is below.
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+# Network (IPv4/IPv6), the journal and D-Bus (Unix), `ip`-style tools in only_if (netlink),
+# arping-style checks (packet).
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET
 
 [Install]
 WantedBy=multi-user.target
