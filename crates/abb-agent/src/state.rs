@@ -52,10 +52,26 @@ impl LastRun {
     }
 
     pub fn save(&self) -> std::io::Result<()> {
-        let tmp = Self::path().with_extension("tmp");
-        fs::write(&tmp, serde_json::to_string_pretty(self).map_err(std::io::Error::other)?)?;
-        fs::rename(tmp, Self::path())
+        write_atomic(&Self::path(), serde_json::to_string_pretty(self).map_err(std::io::Error::other)?.as_bytes(), 0o600)
     }
+}
+
+/// Replaces `path` through a temporary file of its own, synced, then renamed over it: threads
+/// and processes writing the same file at once (the heartbeat renewing the token, the event loop)
+/// never mix their content, and a crash leaves the old file or the new one.
+fn write_atomic(path: &Path, data: &[u8], mode: u32) -> std::io::Result<()> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp.{}.{n}", std::process::id()));
+    let r = fs::OpenOptions::new().create_new(true).write(true).mode(mode).open(&tmp).and_then(|mut f| {
+        f.write_all(data)?;
+        f.sync_all()?;
+        fs::rename(&tmp, path)
+    });
+    if r.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    r
 }
 
 /// Progress of the running backup, for `abb-agent status` (in /run: gone after a reboot).
@@ -152,13 +168,12 @@ impl State {
     }
 
     pub fn save(&self) -> std::io::Result<()> {
+        // One save at a time in this process: the last one called is the one that stays.
+        static SAVING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = SAVING.lock().unwrap_or_else(|e| e.into_inner());
         fs::create_dir_all(STATE_DIR)?;
         fs::set_permissions(STATE_DIR, fs::Permissions::from_mode(0o700))?;
-        let tmp = path().with_extension("tmp");
-        let mut f = fs::OpenOptions::new().create(true).write(true).truncate(true).mode(0o600).open(&tmp)?;
-        f.write_all(serde_json::to_string_pretty(self).map_err(std::io::Error::other)?.as_bytes())?;
-        f.sync_all()?;
-        fs::rename(tmp, path())
+        write_atomic(&path(), serde_json::to_string_pretty(self).map_err(std::io::Error::other)?.as_bytes(), 0o600)
     }
 
     pub fn pin(&self) -> Option<abb_proto::Fingerprint> {
@@ -168,5 +183,35 @@ impl State {
             .filter_map(|h| u8::from_str_radix(h, 16).ok())
             .collect();
         bytes.try_into().ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_atomic_writes_never_mix() {
+        let dir = std::env::temp_dir().join(format!("abb-agent-state-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("state.json");
+        let writers: Vec<_> = (0..8u8)
+            .map(|i| {
+                let file = file.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..50 {
+                        write_atomic(&file, &vec![b'a' + i; 4096 * (i as usize + 1)], 0o600).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+        let data = fs::read(&file).unwrap();
+        assert!(data.iter().all(|&b| b == data[0]) && data.len() == 4096 * (data[0] - b'a' + 1) as usize);
+        assert_eq!(fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1, "temporary files left");
+        fs::remove_dir_all(&dir).unwrap();
     }
 }
