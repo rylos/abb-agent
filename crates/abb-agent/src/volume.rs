@@ -151,7 +151,14 @@ impl Vol {
                 }
                 // Unmounted or read-only, or frozen for the whole upload: read as it is.
                 let freeze = if whole { Some(Freeze::new(&p.mount_path)?) } else { None };
-                let fs = ExtFs::open(&p.device()).map_err(n_err)?;
+                let mut fs = ExtFs::open(&p.device()).map_err(n_err)?;
+                // Not cleanly unmounted (or mounted with noload): the journal has transactions
+                // whose blocks look free in the bitmaps. Freezing writes them out, so only the
+                // filesystem read as it is can be in this state.
+                if fs.needs_recovery && freeze.is_none() {
+                    eprintln!("{name}: ext journal needs recovery: the whole filesystem is read, it is replayed at the first mount after a restore");
+                    fs.assume_all_used();
+                }
                 eprintln!(
                     "{name}: ext, {:.1} GiB used{}",
                     fs.used_bytes() as f64 / (1u64 << 30) as f64,
