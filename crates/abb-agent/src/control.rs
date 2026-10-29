@@ -67,18 +67,41 @@ pub fn stopping() -> bool {
     STOPPING.load(Ordering::SeqCst)
 }
 
-extern "C" fn on_signal(_: libc::c_int) {
-    // Only an atomic store: safe in a signal handler.
+extern "C" fn on_signal(sig: libc::c_int) {
+    // Only an atomic store and async-signal-safe calls.
     STOPPING.store(true, Ordering::SeqCst);
+    if sig == libc::SIGHUP {
+        // The terminal is gone: writing to it would fail (and eprintln! panic) during the
+        // cleanup. Its descriptors go to /dev/null; a pipe to the journal stays.
+        unsafe {
+            let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC);
+            if null >= 0 {
+                for fd in 0..=2 {
+                    let mut st: libc::stat = std::mem::zeroed();
+                    if libc::fstat(fd, &mut st) == 0 && st.st_mode & libc::S_IFMT == libc::S_IFCHR {
+                        libc::dup2(null, fd);
+                    }
+                }
+                libc::close(null);
+            }
+        }
+    }
 }
 
-/// SIGTERM (systemctl stop) and SIGINT (Ctrl-C) cancel the running backup, which then removes
-/// its snapshots and tells the server, instead of killing the process in the middle of it.
+/// SIGTERM (systemctl stop), SIGINT (Ctrl-C) and SIGHUP (the terminal closed) cancel the running
+/// backup, which then removes its snapshots, thaws what it froze and tells the server, instead of
+/// the process dying in the middle of it. System calls restart after the handler (SA_RESTART):
+/// the backup notices the request at its next check, and waits poll it (a lock held by another
+/// backup job, see `backup::flock`).
 pub fn handle_stop_signals() {
-    let handler = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
     unsafe {
-        libc::signal(libc::SIGTERM, handler);
-        libc::signal(libc::SIGINT, handler);
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        sa.sa_flags = libc::SA_RESTART;
+        libc::sigemptyset(&mut sa.sa_mask);
+        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+            libc::sigaction(sig, &sa, std::ptr::null_mut());
+        }
     }
 }
 
