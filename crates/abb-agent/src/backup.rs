@@ -1057,6 +1057,8 @@ fn run_inner(
 /// Offline test: prepares the disks' volumes, then reads, reassembles, verifies and compresses
 /// everything a full backup would send, and reports the timings.
 pub fn bench(names: Vec<String>, limit: Option<u64>, image: Option<&str>) -> Result<()> {
+    // It takes snapshots and may freeze filesystems like a backup: not at the same time as one.
+    let _lock = flock(LOCK, true, false)?;
     let mut disks = Vec::new();
     let mut volume_parts = Vec::new();
     for n in names {
