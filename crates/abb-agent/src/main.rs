@@ -330,10 +330,10 @@ fn status(watch: bool) {
         println!("{}", st.row("Last success", &format!("started {}", fmt_short(last.last_ok_start))));
     }
     if let Ok(off) = sess.server_offset(&mut c) {
-        control::set_server_offset(off);
+        control::set_server_skew(off - host::utc_offset(host::now() as i64));
     }
     let console = tasks.first().and_then(task::TaskInfo::parse).and_then(|t| scheduler::console_due(&t));
-    let local = scheduler::local_due(sc, &last).map(|d| d.0.max(host::now()));
+    let local = scheduler::local_due(sc, &last, scheduler::started()).map(|d| d.0.max(host::now()));
     match [console, local].into_iter().flatten().min() {
         _ if last.status == "running" || !running.is_empty() => {}
         Some(t) => println!("{}", st.event(ui::Mark::Next, "Next backup", &fmt_short(t))),

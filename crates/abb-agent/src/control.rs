@@ -6,14 +6,16 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 static CANCEL: AtomicBool = AtomicBool::new(false);
-/// SIGTERM or SIGINT received: the running backup stops and cleans up, nothing new starts.
+/// SIGTERM, SIGINT or SIGHUP received: the running backup stops and cleans up, nothing new starts.
 static STOPPING: AtomicBool = AtomicBool::new(false);
 static BUSY: AtomicBool = AtomicBool::new(false);
 static RUNNING_TASK: AtomicU64 = AtomicU64::new(0);
 /// Bytes per second, 0 = unlimited.
 static BANDWIDTH: AtomicU64 = AtomicU64::new(0);
-/// Server UTC offset plus clock difference, in seconds (from `get_timezone`).
-static SERVER_OFFSET: AtomicI64 = AtomicI64::new(0);
+/// Server UTC offset less the local one, plus the clock difference, in seconds (from
+/// `get_timezone`); [`UNKNOWN`] until known.
+static SERVER_SKEW: AtomicI64 = AtomicI64::new(UNKNOWN);
+const UNKNOWN: i64 = i64::MIN;
 static WINDOW: Mutex<Option<Schedule>> = Mutex::new(None);
 static TASKS_CHANGED: AtomicBool = AtomicBool::new(false);
 
@@ -105,16 +107,26 @@ pub fn bandwidth() -> u64 {
     BANDWIDTH.load(Ordering::SeqCst)
 }
 
-pub fn set_server_offset(s: i64) {
-    SERVER_OFFSET.store(s, Ordering::SeqCst);
+pub fn set_server_skew(s: i64) {
+    SERVER_SKEW.store(s, Ordering::SeqCst);
 }
 
-pub fn server_offset() -> i64 {
-    SERVER_OFFSET.load(Ordering::SeqCst)
+/// The server's UTC offset less the local one: as last fetched, or as the service saved it.
+pub fn server_skew() -> Option<i64> {
+    match SERVER_SKEW.load(Ordering::SeqCst) {
+        UNKNOWN => {
+            let s = crate::scheduler::saved_skew()?;
+            let _ = SERVER_SKEW.compare_exchange(UNKNOWN, s, Ordering::SeqCst, Ordering::SeqCst);
+            Some(s)
+        }
+        s => Some(s),
+    }
 }
 
+/// The server's wall clock now (as the local one while its offset is unknown).
 pub fn server_now() -> ServerTime {
-    crate::host::now() as i64 + server_offset()
+    let t = crate::host::now() as i64;
+    t + crate::host::utc_offset(t) + server_skew().unwrap_or(0)
 }
 
 static OFFLINE: AtomicBool = AtomicBool::new(false);
