@@ -47,29 +47,49 @@ const USAGE: &str = "usage:
   abb-agent version                                      agent version";
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let opt = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned();
+    let all: Vec<String> = std::env::args().collect();
+    let cmd = all.get(1).map_or("", String::as_str);
+    // What each command accepts: flags, options with a value, at most so many other words.
+    let (flags, opts, words): (&[&str], &[&str], usize) = match cmd {
+        "connect" => (&[], &["-a", "-u", "-p", "--otp"], 0),
+        "status" => (&["-w", "--watch"], &[], 0),
+        "backup" => (&["-v", "--verbose"], &[], 0),
+        "disks" | "probe" => (&[], &[], 1),
+        "bench" => (&[], &["--limit", "--image"], usize::MAX),
+        "config" | "restore-fixup" | "version" | "--version" | "-V" | "daemon" | "cleanup" => (&[], &[], 0),
+        _ => usage(),
+    };
+    let args = Args::parse(&all[2..], flags, opts, words).unwrap_or_else(|e| {
+        eprintln!("abb-agent {cmd}: {e}");
+        usage()
+    });
+    match cmd {
+        // Neither depends on the configuration: early at boot (abb-agent-fixup.service) the
+        // fixup must run even if /etc/abb-agent.toml has an error.
+        "restore-fixup" => return fixup::run(),
+        "version" | "--version" | "-V" => return println!("abb-agent {}", env!("CARGO_PKG_VERSION")),
+        _ => {}
+    }
     let cfg = config::load().unwrap_or_else(|e| die(format!("configuration: {e}")));
     version::apply_config().unwrap_or_else(|e| die(format!("configuration: {e}")));
-    if matches!(args.get(1).map(String::as_str), Some("config" | "status" | "version" | "disks")) {
+    if matches!(cmd, "config" | "status" | "disks") {
         // Output piped into `head` and the like: end quietly when the reader goes away.
         unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     }
-    match args.get(1).map(String::as_str) {
-        Some("config") => {
+    match cmd {
+        "config" => {
             println!("# {}", config::path());
             print!("{}", toml::to_string_pretty(cfg).unwrap_or_else(|e| die(e)));
         }
-        // Early at boot (abb-agent-fixup.service): recreate excluded subvolumes after a restore.
-        Some("restore-fixup") => fixup::run(),
-        Some("version" | "--version" | "-V") => println!("abb-agent {}", env!("CARGO_PKG_VERSION")),
-        Some("connect") => {
-            let server = opt("-a").unwrap_or_else(|| usage());
-            let user = opt("-u").unwrap_or_else(|| usage());
-            let port = opt("-p").map_or(DEFAULT_PORT, |p| p.parse().unwrap_or_else(|_| usage()));
+        "connect" => {
+            let server = args.opt("-a").unwrap_or_else(|| usage()).to_string();
+            let user = args.opt("-u").unwrap_or_else(|| usage()).to_string();
+            let port = args.opt("-p").map_or(DEFAULT_PORT, |p| p.parse().unwrap_or_else(|_| usage()));
+            let _instance =
+                instance_lock("the abb-agent service is running: stop it first (sudo systemctl stop abb-agent), pair, then start it again");
             let password = std::env::var("ABB_PASSWORD").unwrap_or_else(|_| prompt_password(&user));
-            let otp = opt("--otp");
-            let state = match session::pair(&server, port, &user, &password, otp.as_deref()) {
+            let otp = args.opt("--otp");
+            let state = match session::pair(&server, port, &user, &password, otp) {
                 // 0x1005: the account has two-factor authentication and no code was given.
                 Err(abb_proto::Error::Server { code: 0x1005, .. }) if otp.is_none() => {
                     eprint!("two-factor code for {user}: ");
@@ -84,13 +104,13 @@ fn main() {
             state.save().unwrap_or_else(|e| die(e));
             println!("paired with {server} as {user}: the device and its task are in the ABB console");
         }
-        Some("status") => status(args.iter().any(|a| a == "-w" || a == "--watch")),
-        Some("cleanup") => backup::startup_cleanup(),
-        Some("backup") => {
+        "status" => status(args.flag("-w") || args.flag("--watch")),
+        "cleanup" => backup::startup_cleanup(),
+        "backup" => {
             control::handle_stop_signals();
             let sess = load();
             // On a terminal: steps and progress bar, the log to the journal; -v keeps the log here.
-            let view = !args.iter().any(|a| a == "-v" || a == "--verbose") && ui::start();
+            let view = !(args.flag("-v") || args.flag("--verbose")) && ui::start();
             let res = sess.auth_by_token(false).and_then(|()| {
                 let trigger = backup::Trigger::Local { trigger_type: backup::TRIGGER_MANUAL, trigger_event: None };
                 backup::run(&sess, trigger)
@@ -103,9 +123,9 @@ fn main() {
                 die(e);
             }
         }
-        Some("daemon") => daemon(),
-        Some("disks") => {
-            let name = args.get(2).cloned().unwrap_or_else(|| disk::system_disk().unwrap_or_else(|e| die(e)));
+        "daemon" => daemon(),
+        "disks" => {
+            let name = args.words.first().cloned().unwrap_or_else(|| disk::system_disk().unwrap_or_else(|e| die(e)));
             let d = disk::scan(&name).unwrap_or_else(|e| die(e));
             println!("{} {} bytes, sector {}, {}", d.name, d.size, d.sector_size, d.layout);
             for p in &d.partitions {
@@ -121,18 +141,13 @@ fn main() {
                 );
             }
         }
-        Some("bench") => {
-            let names = args[2..].to_vec();
-            let limit = opt("--limit").map(|g| g.parse::<u64>().unwrap_or_else(|_| usage()) << 30);
-            let names: Vec<String> = names
-                .into_iter()
-                .filter(|a| !a.starts_with("--") && Some(a) != opt("--limit").as_ref() && Some(a) != opt("--image").as_ref())
-                .collect();
-            let names = if names.is_empty() { vec![disk::system_disk().unwrap_or_else(|e| die(e))] } else { names };
-            backup::bench(names, limit, opt("--image").as_deref()).unwrap_or_else(|e| die(e));
+        "bench" => {
+            let limit = args.opt("--limit").map(|g| g.parse::<u64>().unwrap_or_else(|_| usage()) << 30);
+            let names = if args.words.is_empty() { vec![disk::system_disk().unwrap_or_else(|e| die(e))] } else { args.words.clone() };
+            backup::bench(names, limit, args.opt("--image")).unwrap_or_else(|e| die(e));
         }
-        Some("probe") => {
-            let host = args.get(2).cloned().unwrap_or_else(|| usage());
+        "probe" => {
+            let host = args.words.first().cloned().unwrap_or_else(|| usage());
             let mut c = Connection::open(&host, DEFAULT_PORT, None).unwrap_or_else(|e| die(e));
             println!("certificate: {}", fingerprint_hex(&c.fingerprint));
             let r = c.call(&request("query_server_info", vec![])).unwrap_or_else(|e| die(e));
@@ -140,6 +155,74 @@ fn main() {
         }
         _ => usage(),
     }
+}
+
+/// The arguments after the command.
+#[derive(Debug, Default)]
+struct Args {
+    flags: Vec<String>,
+    opts: Vec<(String, String)>,
+    words: Vec<String>,
+}
+
+impl Args {
+    /// Anything the command does not accept is an error: `backup --dry-run` must not back up.
+    fn parse(args: &[String], flags: &[&str], opts: &[&str], max_words: usize) -> Result<Args, String> {
+        let mut out = Args::default();
+        let mut it = args.iter();
+        while let Some(a) = it.next() {
+            if flags.contains(&a.as_str()) {
+                out.flags.push(a.clone());
+            } else if opts.contains(&a.as_str()) {
+                let v = it.next().ok_or_else(|| format!("{a} needs a value"))?;
+                out.opts.push((a.clone(), v.clone()));
+            } else if a.starts_with('-') && a.len() > 1 {
+                return Err(format!("unknown option {a}"));
+            } else if out.words.len() < max_words {
+                out.words.push(a.clone());
+            } else {
+                return Err(format!("unexpected argument {a}"));
+            }
+        }
+        Ok(out)
+    }
+
+    fn flag(&self, f: &str) -> bool {
+        self.flags.iter().any(|x| x == f)
+    }
+
+    fn opt(&self, o: &str) -> Option<&str> {
+        self.opts.iter().rev().find(|(k, _)| k == o).map(|(_, v)| v.as_str())
+    }
+}
+
+/// One `daemon` or `connect` at a time: both write the agent state, and a pairing made while
+/// the service runs would be overwritten by it. The lock is a root-only file in the state
+/// directory, held until the process ends; `busy` is the error when another process holds it.
+fn instance_lock(busy: &str) -> std::fs::File {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    let dir = std::path::Path::new(state::STATE_DIR);
+    let path = dir.join("instance.lock");
+    let fail = |e: std::io::Error| -> ! {
+        match e.kind() {
+            std::io::ErrorKind::PermissionDenied => die("permission denied: run it with sudo"),
+            std::io::ErrorKind::WouldBlock => die(busy),
+            _ => die(format!("{}: {e}", path.display())),
+        }
+    };
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).unwrap_or_else(|e| fail(e));
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+        .unwrap_or_else(|e| fail(e));
+    if unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&f), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        fail(std::io::Error::last_os_error());
+    }
+    f
 }
 
 fn usage() -> ! {
@@ -152,21 +235,63 @@ fn die(e: impl std::fmt::Display) -> ! {
     std::process::exit(1);
 }
 
-fn prompt_password(user: &str) -> String {
-    eprint!("password for {user}: ");
-    let _ = std::io::stderr().flush();
-    let fd = 0;
-    let mut term: libc::termios = unsafe { std::mem::zeroed() };
-    let tty = unsafe { libc::tcgetattr(fd, &mut term) } == 0;
-    if tty {
+/// Terminal settings to put back if a signal ends the process at the password prompt.
+static SAVED_TERM: std::sync::atomic::AtomicPtr<libc::termios> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+extern "C" fn restore_term(sig: libc::c_int) {
+    // Async-signal-safe calls only; then the signal's default action (the process ends).
+    let t = SAVED_TERM.load(std::sync::atomic::Ordering::SeqCst);
+    unsafe {
+        if !t.is_null() {
+            libc::tcsetattr(0, libc::TCSANOW, t);
+        }
+        libc::signal(sig, libc::SIG_DFL);
+        libc::raise(sig);
+    }
+}
+
+const PROMPT_SIGNALS: [libc::c_int; 4] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT];
+
+/// Echo off on the terminal while it lives; back on when dropped or when Ctrl-C ends the process.
+struct NoEcho(Box<libc::termios>);
+
+impl NoEcho {
+    fn new(fd: libc::c_int) -> Option<NoEcho> {
+        let mut term: libc::termios = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(fd, &mut term) } != 0 {
+            return None;
+        }
+        let mut saved = NoEcho(Box::new(term));
+        SAVED_TERM.store(&mut *saved.0, std::sync::atomic::Ordering::SeqCst);
+        let handler = restore_term as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        for sig in PROMPT_SIGNALS {
+            unsafe { libc::signal(sig, handler) };
+        }
         let mut quiet = term;
         quiet.c_lflag &= !libc::ECHO;
         unsafe { libc::tcsetattr(fd, libc::TCSANOW, &quiet) };
+        Some(saved)
     }
+}
+
+impl Drop for NoEcho {
+    fn drop(&mut self) {
+        unsafe { libc::tcsetattr(0, libc::TCSANOW, &*self.0) };
+        SAVED_TERM.store(std::ptr::null_mut(), std::sync::atomic::Ordering::SeqCst);
+        for sig in PROMPT_SIGNALS {
+            unsafe { libc::signal(sig, libc::SIG_DFL) };
+        }
+    }
+}
+
+fn prompt_password(user: &str) -> String {
+    eprint!("password for {user}: ");
+    let _ = std::io::stderr().flush();
+    let quiet = NoEcho::new(0);
     let mut line = String::new();
     let _ = std::io::stdin().lock().read_line(&mut line);
-    if tty {
-        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &term) };
+    if quiet.is_some() {
+        drop(quiet);
         eprintln!();
     }
     line.trim_end_matches(['\n', '\r']).to_string()
@@ -330,10 +455,10 @@ fn status(watch: bool) {
         println!("{}", st.row("Last success", &format!("started {}", fmt_short(last.last_ok_start))));
     }
     if let Ok(off) = sess.server_offset(&mut c) {
-        control::set_server_offset(off);
+        control::set_server_skew(off - host::utc_offset(host::now() as i64));
     }
     let console = tasks.first().and_then(task::TaskInfo::parse).and_then(|t| scheduler::console_due(&t));
-    let local = scheduler::local_due(sc, &last).map(|d| d.0.max(host::now()));
+    let local = scheduler::local_due(sc, &last, scheduler::started()).map(|d| d.0.max(host::now()));
     match [console, local].into_iter().flatten().min() {
         _ if last.status == "running" || !running.is_empty() => {}
         Some(t) => println!("{}", st.event(ui::Mark::Next, "Next backup", &fmt_short(t))),
@@ -404,11 +529,12 @@ fn fmt_short(t: u64) -> String {
 /// Service: heartbeat, schedule and backups each in a thread of their own; the main thread
 /// handles the server's events, also while a backup runs (cancel, bandwidth, console requests).
 fn daemon() {
+    let _instance = instance_lock("another abb-agent daemon (or `abb-agent connect`) is running");
     let sess = load();
     control::handle_stop_signals();
     backup::startup_cleanup();
     // On SIGTERM: wait for the running backup to cancel and clean up, then exit.
-    std::thread::spawn(|| {
+    spawn_vital("stop", || {
         loop {
             std::thread::sleep(Duration::from_millis(200));
             if control::stopping() && !control::busy() {
@@ -445,7 +571,7 @@ fn daemon() {
     fetch_result(&sess);
 
     let hb_state = sess.state.clone();
-    std::thread::spawn(move || {
+    spawn_vital("heartbeat", move || {
         let s = Session::new(hb_state);
         let mut conn: Option<Connection> = None;
         let mut last_auth = Instant::now();
@@ -494,7 +620,7 @@ fn daemon() {
     // means "run what the server has queued".
     let (tx, rx) = std::sync::mpsc::channel::<Option<scheduler::LocalTrigger>>();
     let worker_state = sess.state.clone();
-    std::thread::spawn(move || {
+    spawn_vital("worker", move || {
         let s = Session::new(worker_state);
         for req in rx {
             if control::stopping() {
@@ -522,9 +648,9 @@ fn daemon() {
 
     let sched_state = sess.state.clone();
     let sched_tx = tx.clone();
-    std::thread::spawn(move || {
+    spawn_vital("scheduler", move || {
         let (stx, srx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
+        spawn_vital("scheduler queue", move || {
             for t in srx {
                 let _ = sched_tx.send(Some(t));
             }
@@ -623,6 +749,20 @@ fn daemon() {
     }
 }
 
+/// Starts a thread the service cannot do without. If it panics the process ends with a failure
+/// (and systemd starts it again): a service whose worker or scheduler died would stay up doing
+/// nothing, marked busy, and hang on stop. Panics caught inside it (the read pipeline) are not
+/// concerned.
+fn spawn_vital(name: &'static str, f: impl FnOnce() + Send + 'static) {
+    std::thread::spawn(move || {
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err() {
+            // Not eprintln!: if writing to stderr is what panicked, it must not stop the exit.
+            let _ = writeln!(std::io::stderr(), "{name} thread panicked: exiting so that the service starts again");
+            std::process::exit(1);
+        }
+    });
+}
+
 /// Final status of our last backup on the server. A version the server rejects after the
 /// upload (e.g. its verification failed) counts as a failed backup, so it is retried.
 fn fetch_result(sess: &Session) {
@@ -712,6 +852,19 @@ pub fn run_pending(sess: &Session) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arguments_are_checked() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let a = Args::parse(&v(&["-a", "nas", "-u", "me"]), &[], &["-a", "-u", "-p", "--otp"], 0).unwrap();
+        assert_eq!((a.opt("-a"), a.opt("-u"), a.opt("-p")), (Some("nas"), Some("me"), None));
+        assert!(Args::parse(&v(&["--dry-run"]), &["-v", "--verbose"], &[], 0).unwrap_err().contains("--dry-run"));
+        assert!(Args::parse(&v(&["-v"]), &["-v", "--verbose"], &[], 0).unwrap().flag("-v"));
+        assert!(Args::parse(&v(&["-a"]), &[], &["-a"], 0).unwrap_err().contains("needs a value"));
+        assert!(Args::parse(&v(&["sda", "sdb"]), &[], &[], 1).is_err());
+        let b = Args::parse(&v(&["sda", "--limit", "4", "sdb"]), &[], &["--limit", "--image"], usize::MAX).unwrap();
+        assert_eq!((&b.words, b.opt("--limit")), (&v(&["sda", "sdb"]), Some("4")));
+    }
 
     #[test]
     fn status_formats() {

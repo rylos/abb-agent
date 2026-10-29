@@ -478,21 +478,40 @@ pub const TRIGGER_EVENT: u64 = 3;
 pub const EVENT_STARTUP: u64 = 3;
 
 const LOCK: &str = "/run/lock/abb-agent.lock";
+/// Exclusive flock on `path` (created if `create`: root's only, or anyone could hold it and block
+/// every backup). A wait polls, so that a stop request (SIGTERM, Ctrl-C) ends it from any thread.
 fn flock(path: &str, create: bool, wait: bool) -> Result<Option<std::fs::File>> {
-    let f = match std::fs::OpenOptions::new().read(true).write(create).create(create).open(path) {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut o = std::fs::OpenOptions::new();
+    o.read(true);
+    if create {
+        o.write(true).create(true).mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let f = match o.open(path) {
         Ok(f) => f,
         Err(e) if !create && e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-    let op = libc::LOCK_EX | if wait { 0 } else { libc::LOCK_NB };
-    if unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&f), op) } != 0 {
+    if create {
+        // Left readable by an older version.
+        let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
+    loop {
+        if unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&f), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(Some(f));
+        }
         let e = std::io::Error::last_os_error();
-        if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        if e.raw_os_error() != Some(libc::EWOULDBLOCK) {
+            return Err(e.into());
+        }
+        if !wait {
             return Err(Error::Protocol("a backup is already running".into()));
         }
-        return Err(e.into());
+        if control::stopping() {
+            return Err(Error::Protocol(format!("stopped while waiting for {path}")));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
     }
-    Ok(Some(f))
 }
 
 /// A backup holds the lock, in this process or another (`abb-agent backup` by hand).

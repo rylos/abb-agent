@@ -50,19 +50,39 @@ pub fn ours() -> u64 {
 }
 
 /// `agent.announce_build` from the configuration, checked: 4 digits, above the server's
-/// highest threshold, and not below abb-agent's own build.
+/// highest threshold. One older than abb-agent's own build (left over after an update that
+/// announces a newer one) is ignored with a warning: it must not stop the service.
 pub fn apply_config() -> Result<(), String> {
     let b = crate::config::get().agent.announce_build.trim();
+    let own: u64 = AGENT_BUILD.parse().unwrap_or(0);
+    match check_override(b, own)? {
+        Override::Use => abb_proto::transport::announce_build(b),
+        Override::Older => eprintln!(
+            "agent.announce_build {b} in {} ignored: abb-agent {} announces build {own}, a newer one; remove the setting",
+            crate::config::path(),
+            env!("CARGO_PKG_VERSION")
+        ),
+        Override::None => {}
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Override {
+    None,
+    Use,
+    Older,
+}
+
+fn check_override(b: &str, own: u64) -> Result<Override, String> {
     if b.is_empty() {
-        return Ok(());
+        return Ok(Override::None);
     }
     let n: u64 = b.parse().map_err(|_| format!("agent.announce_build {b:?} is not a number"))?;
-    let own: u64 = AGENT_BUILD.parse().unwrap_or(0);
-    if b.len() != 4 || n <= 4496 || n < own {
+    if b.len() != 4 || n <= 4496 {
         return Err(format!("agent.announce_build {b}: give the 4-digit build of the official agent the NAS offers (above {own})"));
     }
-    abb_proto::transport::announce_build(b);
-    Ok(())
+    Ok(if n < own { Override::Older } else { Override::Use })
 }
 
 /// The announced build comes from the configuration.
@@ -243,6 +263,17 @@ mod tests {
         assert_eq!(AGENT_BUILD.len(), 4);
         let b: u64 = AGENT_BUILD.parse().unwrap();
         assert!(b % 10000 > 4496);
+    }
+
+    #[test]
+    fn announce_build_override() {
+        assert_eq!(check_override("", 5554), Ok(Override::None));
+        assert_eq!(check_override("5600", 5554), Ok(Override::Use));
+        // Left over from before an update that announces a newer build: ignored, not an error.
+        assert_eq!(check_override("5500", 5554), Ok(Override::Older));
+        assert!(check_override("55x0", 5554).is_err());
+        assert!(check_override("4400", 5554).is_err());
+        assert!(check_override("15600", 5554).is_err());
     }
 
     #[test]

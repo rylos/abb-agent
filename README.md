@@ -172,6 +172,7 @@ sudo install -Dm755 target/release/abb-agent /usr/bin/abb-agent
 sudo install -Dm755 target/release/abb-restore /usr/bin/abb-restore
 sudo install -Dm644 packaging/systemd/abb-agent.service /usr/lib/systemd/system/abb-agent.service
 sudo install -Dm644 packaging/systemd/abb-agent-fixup.service /usr/lib/systemd/system/abb-agent-fixup.service
+sudo install -Dm644 packaging/systemd/abb-agent.tmpfiles /usr/lib/tmpfiles.d/abb-agent.conf
 sudo install -Dm644 packaging/abb-agent.toml /etc/abb-agent.toml
 ```
 
@@ -229,7 +230,8 @@ cargo build --release --target x86_64-unknown-linux-musl -p abb-restore
 | `server error 0x1005: Requires OTP` | the account has two-factor authentication: enter the code when asked, or pass `--otp <code>` |
 | `server error 0x100f: Create Task Failed due to invalid parameters` | the default template's destination does not exist: fix it in ABB → *Settings* → *Template*, then connect again |
 | `permission denied: run it with sudo` | the agent's state is readable by root only |
-| `the NAS refuses this agent as too old` (status: *Refused*) | an Active Backup update raised the minimum agent build: update abb-agent; until a release is out, set `announce_build` in `[agent]` of `/etc/abb-agent.toml` to the build of the official agent the NAS offers (shown by `abb-agent status`) and restart the service |
+| `the NAS refuses this agent as too old` (status: *Refused*) | an Active Backup update raised the minimum agent build: update abb-agent; until a release is out, set `announce_build` in `[agent]` of `/etc/abb-agent.toml` to the build of the official agent the NAS offers (shown by `abb-agent status`) and restart the service. Once abb-agent announces a newer build itself, the setting is ignored (with a warning in the journal): remove it |
+| `the abb-agent service is running: stop it first` | `abb-agent connect` writes the agent state the service uses: `sudo systemctl stop abb-agent`, pair, then start it again |
 | `the NAS no longer knows this device` | the device was removed in the ABB console: pair again with `abb-agent connect` |
 | backup ends with `partial` | a volume could not be backed up (unsupported filesystem…): see `journalctl -u abb-agent` |
 
@@ -240,8 +242,15 @@ Other commands:
 | `abb-agent status [-w]` | connection, tasks, last backup and next scheduled one; `-w` follows a running backup with a live progress bar until it ends |
 | `abb-agent backup [-v]` | run a backup now, in the foreground: steps and a progress bar on a terminal, the detailed log in the journal (`journalctl -t abb-agent`); `-v` prints the log instead |
 | `abb-agent config` | show the configuration in effect |
+| `abb-agent cleanup` | delete the snapshots left by an interrupted backup (the service does it when it starts) |
 | `abb-agent disks [disk]` | disks, partitions and filesystems as the agent sees them |
 | `abb-agent bench [disk] [--limit GiB]` | everything a full backup does except sending, to measure speed |
+| `abb-agent probe <server>` | the NAS's certificate and Active Backup version, without pairing |
+| `abb-agent version` | the agent's version |
+
+An option a command does not take is refused (exit status 2), so that a typo cannot start a
+real backup. `abb-agent backup` stops cleanly (snapshots removed, filesystems thawed, the
+server told) on Ctrl-C, on `kill` and when its terminal is closed.
 
 ### What the ABB console controls
 
@@ -250,7 +259,7 @@ The task settings in the ABB console apply as they do with the official agent:
 | console setting | behaviour |
 |---|---|
 | Source type | *Entire device*: every internal disk. *System volume*: the volumes holding `/` and `/boot` plus the EFI/BIOS boot partitions. *Custom volume*: the volumes picked in the console (btrfs volumes are offered too). Partition tables are always kept, so the disks can be restored bare-metal with all their partitions; volumes left out are restored empty. |
-| Schedule and backup window | followed in server time; a run missed while the machine was off happens when it comes back; a backup still running when the window closes is cancelled |
+| Schedule and backup window | followed in server time; a run missed while the machine was off happens when it comes back; a backup still running when the window closes is cancelled. On the nights the clocks change, a start in the skipped hour (02:30 in spring) runs once when the clocks jump, at 03:00 summer time, and one in the repeated hour runs once, the first time. Until the agent has had the NAS's time zone once, it does not follow the console schedule |
 | Bandwidth limit | applied to the upload, also when changed during a backup |
 | Transfer compression and encryption | followed: LZ4 blocks or raw ones, TLS or plaintext data connection (on a fast LAN, turning both off leaves more of the NAS CPU for the backup) |
 | Pre/post scripts | the pre script runs before the snapshots, the post script right after them, as root with `/bin/sh` (180 s limit); output and result are reported to the server |
@@ -258,7 +267,8 @@ The task settings in the ABB console apply as they do with the official agent:
 | Retention, permissions, backup verification | handled by the server |
 
 On top of that, `/etc/abb-agent.toml` can add a backup after every boot (on by default), a fixed
-interval, retries after a failure, lock files to wait for, a condition for the agent's own
+interval (counted from the start of the last backup, failed ones too, or from the first start of
+the service), retries after a failure, lock files to wait for, a condition for the agent's own
 backups (`only_if`, e.g. a laptop only on the home network), and commands to run when a backup
 starts and ends (e.g. to ping a monitoring service). Disks can be named by stable paths
 (`/dev/disk/by-id/…`) or as `system`, and each disk keeps its image on the server even if the

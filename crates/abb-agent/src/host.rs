@@ -82,6 +82,13 @@ pub fn now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
 }
 
+/// Offset of local time from UTC at Unix time `t`, in seconds (daylight saving included).
+pub fn utc_offset(t: i64) -> i64 {
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe { libc::localtime_r(&(t as libc::time_t), &mut tm) };
+    tm.tm_gmtoff
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,11 +99,4 @@ mod tests {
         assert_eq!(os_name("Arch Linux", None), "Linux - Arch Linux (64-bit)");
         assert_eq!(os_name("Fedora Linux", Some("42")), "Linux - Fedora Linux 42 (64-bit)");
     }
-}
-
-/// Offset of local time from UTC at Unix time `t`, in seconds (daylight saving included).
-pub fn utc_offset(t: i64) -> i64 {
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    unsafe { libc::localtime_r(&(t as libc::time_t), &mut tm) };
-    tm.tm_gmtoff
 }

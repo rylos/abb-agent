@@ -1,0 +1,5 @@
+# Root's only: the agent's mounts of btrfs top-level subvolumes and the backup progress.
+d /run/abb-agent 0700 root root -
+# The lock of the running backup, created before anyone else can (whoever opens it can hold it
+# and block every backup).
+f /run/lock/abb-agent.lock 0600 root root -

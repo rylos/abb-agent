@@ -179,10 +179,10 @@ pub fn start() -> bool {
     unsafe { libc::close(fds[1]) };
     let reader = unsafe { std::fs::File::from_raw_fd(fds[0]) };
     let forwarder = std::thread::spawn(move || {
-        for line in std::io::BufReader::new(reader).lines().map_while(Result::ok) {
+        forward_lines(std::io::BufReader::new(reader), |line| {
             let msg = format!("SYSLOG_IDENTIFIER=abb-agent\nPRIORITY=6\nMESSAGE={line}\n");
             let _ = journal.send(msg.as_bytes());
-        }
+        })
     });
     let st = Style::for_fd(tty_fd);
     let mut v = View {
@@ -208,6 +208,22 @@ pub fn start() -> bool {
         }
     });
     true
+}
+
+/// Passes each line of `r` to `send` until the writers close it. Bytes that are not UTF-8 (a
+/// hook printing a file name) are replaced, not a reason to stop reading: the closed pipe would
+/// make the next eprintln! of the backup panic.
+fn forward_lines(mut r: impl BufRead, mut send: impl FnMut(&str)) {
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match r.read_until(b'\n', &mut buf) {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+        let line = String::from_utf8_lossy(&buf);
+        send(line.strip_suffix('\n').unwrap_or(&line));
+    }
 }
 
 impl View {
@@ -305,5 +321,18 @@ pub fn finish(status: &str, detail: &str) {
     unsafe { libc::dup2(std::os::fd::AsRawFd::as_raw_fd(&v.tty), 2) };
     if let Some(f) = v.forwarder.take() {
         let _ = f.join();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forwarding_survives_bytes_that_are_not_utf8() {
+        let input: &[u8] = b"first\nname \xff\xfe.txt\nlast";
+        let mut lines = Vec::new();
+        forward_lines(input, |l| lines.push(l.to_string()));
+        assert_eq!(lines, ["first", "name \u{fffd}\u{fffd}.txt", "last"]);
     }
 }
