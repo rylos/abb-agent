@@ -115,9 +115,36 @@ pub struct ExtVol {
     freeze: std::sync::Mutex<Option<Freeze>>,
 }
 
+/// Snapshots and mounts of a prepared btrfs volume: released by `Vol::cleanup`, or when dropped
+/// (an error before the volume is ready, a panic).
+pub struct Snap(Option<Prepared>);
+
+impl std::ops::Deref for Snap {
+    type Target = Prepared;
+    fn deref(&self) -> &Prepared {
+        self.0.as_ref().expect("released")
+    }
+}
+
+impl Snap {
+    fn release(&mut self) {
+        if let Some(p) = self.0.take()
+            && let Err(e) = p.cleanup()
+        {
+            eprintln!("snapshot cleanup: {e}");
+        }
+    }
+}
+
+impl Drop for Snap {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 #[allow(clippy::large_enum_variant)] // few volumes, never copied
 pub enum Vol {
-    Btrfs { prep: Prepared, digests: Digests },
+    Btrfs { prep: Snap, digests: Digests },
     Ext(ExtVol),
 }
 
@@ -140,6 +167,8 @@ impl Vol {
                 let own: Vec<std::path::PathBuf> = crate::backup::cbt_subvolume().into_iter().collect();
                 let prep = prepare(&p.device(), &p.fs_uuid, run_name, exclude, &own, &mut record)
                     .map_err(|e| Error::Protocol(format!("preparing {name}: {e}")))?;
+                // From here on the snapshots go away with `prep`, whatever happens.
+                let prep = Snap(Some(prep));
                 let td = std::time::Instant::now();
                 let digests = Digests::compute(&prep.fs, &prep.cap, &prep.map)
                     .map_err(|e| Error::Protocol(format!("digests of {name}: {e}")))?;
@@ -511,11 +540,10 @@ impl Vol {
         matches!(self, Vol::Btrfs { prep, .. } if !prep.unpinned.is_empty())
     }
 
+    /// Removes the snapshots, unmounts, thaws (also done when dropped).
     pub fn cleanup(self) {
-        if let Vol::Btrfs { prep, .. } = self
-            && let Err(e) = prep.cleanup()
-        {
-            eprintln!("snapshot cleanup: {e}");
+        if let Vol::Btrfs { mut prep, .. } = self {
+            prep.release();
         }
     }
 }
