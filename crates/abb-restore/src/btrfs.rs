@@ -40,10 +40,28 @@ struct Piece {
     mirrors: Vec<u64>,
 }
 
+/// Offsets come from the image, that is from the server: nothing may be written outside the
+/// partition.
+fn inside(offset: u64, length: u64, part_len: u64) -> bool {
+    offset.checked_add(length).is_some_and(|end| end <= part_len)
+}
+
+fn check_pieces(pieces: &[Piece], part_len: u64) -> Result<(), String> {
+    for p in pieces {
+        for o in std::iter::once(p.offset).chain(p.mirrors.iter().copied()) {
+            if !inside(o, p.length, part_len) {
+                return Err(format!("{} bytes at {o} are outside the partition ({part_len} bytes)", p.length));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn fetch(ctx: &mut Ctx, sp: &Special, pieces: &[Piece], what: &str, report: &mut dyn FnMut(Event)) -> Result<(), String> {
     if pieces.is_empty() {
         return Ok(());
     }
+    check_pieces(pieces, sp.part.length).map_err(|e| format!("{}: {what}: {e}", sp.part.label))?;
     let d = &ctx.version.disks[sp.disk];
     let p = &sp.part;
     let jobs: Vec<Job> = pieces
@@ -69,14 +87,18 @@ fn fetch(ctx: &mut Ctx, sp: &Special, pieces: &[Piece], what: &str, report: &mut
     let (task, version, mode) = (ctx.task, ctx.version, ctx.mode);
     let start = |s: &mut Server, ranges: &[Range]| s.start(task.device_id, task.task_id, version.id, mode, &crate::local::machine_uuid(), ranges);
     transfer(ctx.server, &start, jobs, ctx.devices, ctx.cancel, report)?;
-    ctx.devices[sp.dev].file.sync_all().map_err(|e| e.to_string())
+    let dev = &ctx.devices[sp.dev];
+    dev.file.sync_all().map_err(|e| format!("disk: {}: {e}", dev.path.display()))
 }
 
 /// Pieces covering the chunks of `kind`: the first stripe downloaded, the others as mirrors.
-fn chunk_pieces<'a>(chunks: impl Iterator<Item = &'a Chunk>, kind: impl Fn(u64) -> bool) -> Vec<Piece> {
+fn chunk_pieces<'a>(chunks: impl Iterator<Item = &'a Chunk>, kind: impl Fn(u64) -> bool) -> Result<Vec<Piece>, String> {
     chunks
         .filter(|c| kind(c.kind))
-        .map(|c| Piece { offset: c.stripes[0], length: c.length, mirrors: c.stripes[1..].to_vec() })
+        .map(|c| match c.stripes.split_first() {
+            Some((&first, rest)) => Ok(Piece { offset: first, length: c.length, mirrors: rest.to_vec() }),
+            None => Err(format!("chunk at {} without a stripe", c.logical)),
+        })
         .collect()
 }
 
@@ -94,8 +116,12 @@ pub fn restore(mut ctx: Ctx, sp: &Special, patterns: &[String], report: &mut dyn
     let dev = &ctx.devices[sp.dev];
     let base = (sp.part.offset as i64 + sp.delta) as u64;
     let err = |e: btrfs_image::Error| format!("{}: {e}", sp.part.label);
+    let label = |e: String| format!("{}: {e}", sp.part.label);
 
     // 1. Superblock, then the system chunks.
+    if sp.part.length < MIB {
+        return Err(label("too small for btrfs".into()));
+    }
     fetch(&mut ctx, sp, &[Piece { offset: 0, length: MIB, mirrors: vec![] }], "superblock", report)?;
     let mut raw = vec![0u8; SUPER_SIZE];
     dev.file.read_exact_at(&mut raw, base + SUPER_OFFSET).map_err(|e| e.to_string())?;
@@ -110,11 +136,11 @@ pub fn restore(mut ctx: Ctx, sp: &Special, patterns: &[String], report: &mut dyn
         o += size;
         sys.push(c);
     }
-    fetch(&mut ctx, sp, &chunk_pieces(sys.iter(), |_| true), "chunk tree", report)?;
+    fetch(&mut ctx, sp, &chunk_pieces(sys.iter(), |_| true).map_err(label)?, "chunk tree", report)?;
 
     // 2. All metadata.
     let fs = Filesystem::open_at(&dev.path, base).map_err(err)?;
-    let meta = chunk_pieces(fs.chunks.values(), |k| k & (BLOCK_GROUP_METADATA | BLOCK_GROUP_SYSTEM) != 0 && k & BLOCK_GROUP_SYSTEM == 0);
+    let meta = chunk_pieces(fs.chunks.values(), |k| k & (BLOCK_GROUP_METADATA | BLOCK_GROUP_SYSTEM) != 0 && k & BLOCK_GROUP_SYSTEM == 0).map_err(label)?;
     let meta_size: u64 = meta.iter().map(|p| p.length).sum();
     fetch(&mut ctx, sp, &meta, &format!("metadata ({})", crate::local::size_str(meta_size)), report)?;
 
@@ -131,7 +157,10 @@ pub fn restore(mut ctx: Ctx, sp: &Special, patterns: &[String], report: &mut dyn
             )));
             for (logical, node) in &ex.nodes {
                 for phys in fs.physical(*logical).map_err(err)? {
-                    dev.file.write_all_at(node, base + phys).map_err(|e| e.to_string())?;
+                    if !inside(phys, node.len() as u64, sp.part.length) {
+                        return Err(label(format!("tree node at {phys} outside the partition")));
+                    }
+                    dev.file.write_all_at(node, base + phys).map_err(|e| format!("disk: {}: {e}", dev.path.display()))?;
                 }
             }
             (ex.data.clone(), Left { recreate: picked.clone(), deleted: ex.ids.clone() })
@@ -205,6 +234,19 @@ fn join(mut used: Vec<(u64, u64, bool)>, waste: u64) -> Vec<(u64, u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pieces_inside_the_partition() {
+        let piece = |offset, length, mirrors: Vec<u64>| Piece { offset, length, mirrors };
+        assert!(check_pieces(&[piece(0, 100, vec![100])], 200).is_ok());
+        assert!(check_pieces(&[piece(150, 100, vec![])], 200).is_err());
+        assert!(check_pieces(&[piece(0, 100, vec![150])], 200).is_err());
+        assert!(check_pieces(&[piece(u64::MAX, 2, vec![])], u64::MAX).is_err());
+        let chunk = |stripes: Vec<u64>| Chunk { logical: 0, length: 10, kind: BLOCK_GROUP_METADATA, stripes };
+        let pieces = chunk_pieces([chunk(vec![5, 50])].iter(), |_| true).unwrap();
+        assert_eq!((pieces[0].offset, pieces[0].mirrors.clone()), (5, vec![50]));
+        assert!(chunk_pieces([chunk(vec![])].iter(), |_| true).is_err());
+    }
 
     #[test]
     fn joining() {
