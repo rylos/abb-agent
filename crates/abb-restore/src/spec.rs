@@ -168,6 +168,9 @@ fn disks(doc: &Json, objects: &[(String, u64, u64)]) -> Option<Vec<Disk>> {
                     excluded: p["is_excluded"].as_bool().unwrap_or(false),
                 }
             })
+            // An empty (or impossible) partition holds nothing to restore, and no partition table
+            // can describe it.
+            .filter(|p| p.length > 0 && p.offset.checked_add(p.length).is_some())
             .collect();
         partitions.sort_by_key(|p| p.offset);
         let sector_size = parts.first().map_or(512, |p| num(&p["bytes_per_sector"]).max(512));
@@ -186,4 +189,25 @@ fn disks(doc: &Json, objects: &[(String, u64, u64)]) -> Option<Vec<Disk>> {
     }
     out.sort_by_key(|d| d.name());
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_partitions_left_out() {
+        let doc = serde_json::json!({
+            "device_spec": {
+                "images": [{"image_name": "sda.img", "length": 1 << 30}],
+                "disk_layout": {"0": [
+                    {"partition_number": 1, "offset": 1048576, "length": 0, "bytes_per_sector": 512},
+                    {"partition_number": 2, "offset": 2097152, "length": 1048576, "mount_path": "/"},
+                    {"partition_number": 3, "offset": u64::MAX, "length": 1048576},
+                ]},
+            },
+        });
+        let disks = disks(&doc, &[("v/sda.img".into(), 1, 1 << 30)]).unwrap();
+        assert_eq!(disks[0].partitions.iter().map(|p| p.number).collect::<Vec<_>>(), vec![2]);
+    }
 }

@@ -15,7 +15,7 @@ use ratatui::widgets::{Block, Borders, Cell, Clear, Gauge, List, ListItem, ListS
 use ratatui::{DefaultTerminal, Frame};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, channel};
+use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
 const ACCENT: Color = Color::Rgb(0x10, 0x87, 0xe8);
@@ -96,6 +96,14 @@ pub fn run() {
         std::process::exit(1);
     }
     let mut terminal = ratatui::init();
+    // The hook of ratatui gives the terminal back on a panic: only for the interface itself. A
+    // panic of the restore is caught and shown as its result.
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if std::thread::current().name() == Some("main") {
+            hook(info);
+        }
+    }));
     let mut app = App {
         page: Page::Welcome,
         login: Login { fields: [String::new(), String::new(), String::new(), String::new()], focus: 0 },
@@ -126,6 +134,14 @@ pub fn run() {
     if let Err(e) = res {
         eprintln!("abb-restore: {e}");
     }
+}
+
+const INTERNAL: &str = "internal error: the restore stopped unexpectedly. The disks being restored are incomplete: do not use them before the restore is run again.";
+
+/// The error shown for a panic of the restore thread.
+fn panic_message(p: &(dyn std::any::Any + Send)) -> String {
+    let what = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_default();
+    format!("{INTERNAL} ({what})")
 }
 
 fn date(t: u64) -> String {
@@ -198,7 +214,19 @@ impl App {
         while !self.quit {
             terminal.draw(|f| self.draw(f))?;
             if let Some(r) = &mut self.running {
-                while let Ok(m) = r.rx.try_recv() {
+                loop {
+                    let m = match r.rx.try_recv() {
+                        Ok(m) => m,
+                        Err(TryRecvError::Empty) => break,
+                        // The worker is gone without a word: it cannot have finished.
+                        Err(TryRecvError::Disconnected) => {
+                            if r.result.is_none() {
+                                r.result = Some(Err(INTERNAL.into()));
+                                r.ended = Some(Instant::now());
+                            }
+                            break;
+                        }
+                    };
                     match m {
                         Msg::Event(Event::Step(s)) => r.steps.push((false, s)),
                         Msg::Event(Event::Warning(s)) => r.steps.push((true, s)),
@@ -401,15 +429,7 @@ impl App {
                 let mut plan = Plan { mode, disks: vec![None; v.disks.len()], volumes: vec![], grow: self.grow, efi_fallback: self.efi_fallback, exclude_subvolumes: vec![] };
                 match mode {
                     Mode::Device => plan.disks = plan::auto_map(v, &self.locals),
-                    Mode::System => {
-                        // Only disks that hold system volumes.
-                        let auto = plan::auto_map(v, &self.locals);
-                        for (i, d) in v.disks.iter().enumerate() {
-                            if d.partitions.iter().any(|p| p.is_system()) {
-                                plan.disks[i] = auto[i];
-                            }
-                        }
-                    }
+                    Mode::System => plan.disks = plan::system_map(v, &self.locals),
                     Mode::Volumes => {
                         if self.chosen.is_empty() {
                             self.message = Some((true, "Choose at least one volume with the space bar.".into()));
@@ -418,10 +438,12 @@ impl App {
                         let mut chosen = self.chosen.clone();
                         chosen.sort();
                         for (disk, part) in chosen {
-                            let local = (0..self.locals.len())
-                                .find(|&j| plan::first_fit(v, &self.locals, j, disk, part, &plan.volumes).is_some() && self.locals[j].busy.is_none())
-                                .unwrap_or(0);
-                            let place = plan::first_fit(v, &self.locals, local, disk, part, &plan.volumes).map_or(Place::Partition(1), Place::Free);
+                            // Free space if some disk has it; no target otherwise (an existing
+                            // partition is for the user to choose).
+                            let fit = (0..self.locals.len())
+                                .filter(|&j| self.locals[j].busy.is_none())
+                                .find_map(|j| plan::first_fit(v, &self.locals, j, disk, part, &plan.volumes).map(|s| (j, s)));
+                            let (local, place) = fit.map_or((0, None), |(j, s)| (j, Some(Place::Free(s))));
                             plan.volumes.push(VolumeTarget { disk, part, local, place });
                         }
                     }
@@ -486,17 +508,21 @@ impl App {
                     return;
                 }
                 let t = &plan.volumes[item];
-                let cur = targets.iter().position(|(j, p)| *j == t.local && *p == t.place).unwrap_or(0);
-                let (local, place) = targets[step(forward, targets.len(), cur)].clone();
+                let next = match targets.iter().position(|(j, p)| *j == t.local && Some(p) == t.place.as_ref()) {
+                    Some(cur) => step(forward, targets.len(), cur),
+                    None if forward => 0,
+                    None => targets.len() - 1,
+                };
+                let (local, place) = targets[next].clone();
                 plan.volumes[item].local = local;
-                plan.volumes[item].place = place;
+                plan.volumes[item].place = Some(place);
                 // Later volumes on free space may have to move.
                 for k2 in item + 1..plan.volumes.len() {
                     let o = plan.volumes[k2].clone();
-                    if let Place::Free(_) = o.place
+                    if let Some(Place::Free(_)) = o.place
                         && let Some(s) = plan::first_fit(v, locals, o.local, o.disk, o.part, &plan.volumes[..k2])
                     {
-                        plan.volumes[k2].place = Place::Free(s);
+                        plan.volumes[k2].place = Some(Place::Free(s));
                     }
                 }
             }
@@ -539,13 +565,17 @@ impl App {
         let plan = self.plan.clone().unwrap();
         let locals = self.locals.clone();
         let c = cancel.clone();
-        std::thread::spawn(move || {
+        let worker = std::thread::Builder::new().name("restore".into());
+        worker.spawn(move || {
             let tx2 = tx.clone();
-            let res = restore::run(&mut server, &task, &versions[version_index], &plan, &locals, &c, &mut |e| {
-                let _ = tx2.send(Msg::Event(e));
-            });
-            let _ = tx.send(Msg::Finished(res));
-        });
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                restore::run(&mut server, &task, &versions[version_index], &plan, &locals, &c, &mut |e| {
+                    let _ = tx2.send(Msg::Event(e));
+                })
+            }));
+            let _ = tx.send(Msg::Finished(res.unwrap_or_else(|p| Err(panic_message(p.as_ref())))));
+        })
+        .expect("cannot start the restore thread");
         self.running = Some(Running { rx, cancel, started: Instant::now(), ended: None, done: 0, total: 1, steps: vec![], result: None });
         self.page = Page::Progress;
     }
@@ -746,18 +776,23 @@ impl App {
             Mode::Volumes => {
                 for (i, t) in p.volumes.iter().enumerate() {
                     let src = &v.disks[t.disk].partitions[t.part];
-                    let l = &self.locals[t.local];
-                    let target = match &t.place {
-                        Place::Partition(n) => {
-                            let q = l.partitions.iter().find(|q| q.number == *n);
-                            format!("{} ({}, overwritten)", l.partition_path(*n).display(), q.map_or("?".into(), |q| size_str(q.length)))
+                    let (target, status) = match (&t.place, self.locals.get(t.local)) {
+                        (Some(place), Some(l)) => {
+                            let target = match place {
+                                Place::Partition(n) => {
+                                    let q = l.partitions.iter().find(|q| q.number == *n);
+                                    format!("{} ({}, overwritten)", l.partition_path(*n).display(), q.map_or("?".into(), |q| size_str(q.length)))
+                                }
+                                Place::Free(s) => format!("/dev/{}: new partition at {}", l.name, size_str(s * l.sector_size)),
+                            };
+                            let free = plan::free_areas(v, l, t.local, &p.volumes[..i]);
+                            let status = match plan::place_room(src, l, place, &free) {
+                                Ok(_) => Span::from("  ✓").green(),
+                                Err(e) => Span::from(format!("  ✗ {e}")).red(),
+                            };
+                            (target, status)
                         }
-                        Place::Free(s) => format!("/dev/{}: new partition at {}", l.name, size_str(s * l.sector_size)),
-                    };
-                    let free = plan::free_areas(v, l, t.local, &p.volumes[..i]);
-                    let status = match plan::place_room(src, l, &t.place, &free) {
-                        Ok(_) => Span::from("  ✓").green(),
-                        Err(e) => Span::from(format!("  ✗ {e}")).red(),
+                        _ => ("?".to_string(), Span::from("  ✗ no free space anywhere: choose a target with ←→").red()),
                     };
                     lines.push(Line::from(vec![Span::styled(format!("{:<20} {:>10}  →  {target}", src.label, size_str(src.length)), sel(i)), status]));
                 }
@@ -831,8 +866,8 @@ impl App {
                 for t in &p.volumes {
                     let l = &self.locals[t.local];
                     let target = match t.place {
-                        Place::Partition(n) => l.partition_path(n).display().to_string(),
-                        Place::Free(_) => format!("new partition on /dev/{}", l.name),
+                        Some(Place::Partition(n)) => l.partition_path(n).display().to_string(),
+                        _ => format!("new partition on /dev/{}", l.name),
                     };
                     lines.push(Line::from(format!("  {}  →  {target}", v.disks[t.disk].partitions[t.part].label)));
                 }
@@ -975,6 +1010,9 @@ mod screenshots {
             busy: busy.map(str::to_string),
             partitions: vec![],
             gpt: None,
+            content: None,
+            rdev: 0,
+            id: String::new(),
         }
     }
 
@@ -1085,8 +1123,8 @@ mod screenshots {
         shoot(&mut app, "7-summary");
         let (_tx, rx) = channel();
         let steps = [
-            "Preparing the disks",
             "Starting the restore on the server",
+            "Preparing the disks",
             "Restoring",
             "/: superblock",
             "/: chunk tree",

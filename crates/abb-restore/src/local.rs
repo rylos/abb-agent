@@ -2,6 +2,7 @@
 
 use crate::gpt::Gpt;
 use std::fs;
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug)]
@@ -26,6 +27,13 @@ pub struct LocalDisk {
     pub busy: Option<String>,
     pub partitions: Vec<LocalPartition>,
     pub gpt: Option<Gpt>,
+    /// What the start of the disk holds when it has no GPT (an MBR, a filesystem…), if anything
+    /// is recognised.
+    pub content: Option<&'static str>,
+    /// Device number, and the serial or WWN the kernel reports (empty if none): to make sure the
+    /// disk opened for writing is the one scanned.
+    pub rdev: u64,
+    pub id: String,
 }
 
 impl LocalDisk {
@@ -65,6 +73,45 @@ fn busy_reason(name: &str) -> Option<String> {
     None
 }
 
+/// Serial or WWN of the disk at `sys` (a /sys/block entry), empty if the kernel has none.
+fn disk_id(sys: &Path) -> String {
+    ["wwid", "device/wwid", "device/serial"].iter().map(|f| read(sys.join(f))).find(|s| !s.is_empty()).unwrap_or_default()
+}
+
+/// Serial or WWN of the disk with device number `rdev`, as the kernel sees it now.
+pub fn current_id(rdev: u64) -> String {
+    disk_id(Path::new(&format!("/sys/dev/block/{}:{}", libc::major(rdev), libc::minor(rdev))))
+}
+
+/// Offset and number of a partition device as the kernel sees it now (bytes).
+pub fn partition_now(name: &str) -> (u64, u64) {
+    let sys = Path::new("/sys/class/block").join(name);
+    (read_u64(sys.join("start")) * 512, read_u64(sys.join("partition")))
+}
+
+/// What the first 128 KiB of a disk without a GPT hold, as far as a partition table or a
+/// filesystem can be recognised.
+pub fn content(head: &[u8]) -> Option<&'static str> {
+    let at = |o: usize, magic: &[u8]| head.get(o..o + magic.len()) == Some(magic);
+    if at(0, b"LUKS\xba\xbe") {
+        Some("LUKS")
+    } else if at(0, b"XFSB") {
+        Some("an XFS filesystem")
+    } else if at(512, b"LABELONE") {
+        Some("an LVM physical volume")
+    } else if at(0x10040, b"_BHRfS_M") {
+        Some("a btrfs filesystem")
+    } else if at(1024 + 56, &[0x53, 0xEF]) {
+        Some("an ext filesystem")
+    } else if at(4096 - 10, b"SWAPSPACE2") {
+        Some("swap")
+    } else if at(510, &[0x55, 0xAA]) {
+        Some("an MBR partition table or a boot sector")
+    } else {
+        None
+    }
+}
+
 pub fn disks() -> Vec<LocalDisk> {
     let mut out = Vec::new();
     let Ok(dir) = fs::read_dir("/sys/block") else { return out };
@@ -101,7 +148,19 @@ pub fn disks() -> Vec<LocalDisk> {
             .collect();
         partitions.sort_by_key(|p| p.offset);
         let sector_size = read_u64(sys.join("queue/logical_block_size")).max(512);
-        let gpt = fs::File::open(Path::new("/dev").join(&name)).ok().and_then(|f| Gpt::read(&f, sector_size).ok().flatten());
+        let dev = fs::File::open(Path::new("/dev").join(&name)).ok();
+        let gpt = dev.as_ref().and_then(|f| Gpt::read(f, sector_size).ok().flatten());
+        let mut head = vec![0u8; 128 << 10];
+        let content = match &dev {
+            _ if gpt.is_some() => None,
+            Some(f) if f.read_exact_at(&mut head, 0).is_ok() => content(&head),
+            // Unreadable: not to be taken for an empty disk.
+            _ => Some("data that could not be read"),
+        };
+        let rdev = read(sys.join("dev"))
+            .split_once(':')
+            .and_then(|(a, b)| Some(libc::makedev(a.parse().ok()?, b.parse().ok()?)))
+            .unwrap_or(0);
         let model = [read(sys.join("device/vendor")), read(sys.join("device/model"))]
             .iter()
             .filter(|s| !s.is_empty())
@@ -117,6 +176,9 @@ pub fn disks() -> Vec<LocalDisk> {
             model,
             partitions,
             gpt,
+            content,
+            rdev,
+            id: disk_id(&sys),
         });
     }
     out
@@ -137,4 +199,23 @@ pub fn size_str(b: u64) -> String {
         i += 1;
     }
     if i == 0 { format!("{b} B") } else { format!("{v:.1} {}", units[i]) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognised_content() {
+        let mut head = vec![0u8; 128 << 10];
+        assert_eq!(content(&head), None);
+        head[510..512].copy_from_slice(&[0x55, 0xAA]);
+        assert!(content(&head).unwrap().contains("MBR"));
+        head[1024 + 56..1024 + 58].copy_from_slice(&[0x53, 0xEF]);
+        assert!(content(&head).unwrap().contains("ext"));
+        head[0x10040..0x10048].copy_from_slice(b"_BHRfS_M");
+        assert!(content(&head).unwrap().contains("btrfs"));
+        // A short read recognises nothing past its end.
+        assert_eq!(content(&[0u8; 100]), None);
+    }
 }

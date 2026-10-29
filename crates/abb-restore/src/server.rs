@@ -5,6 +5,9 @@ use abb_proto::transport::{Error, Fingerprint, Result};
 use abb_proto::{Connection, Value, request};
 use std::time::Duration;
 
+/// Biggest piece of image data accepted in one message (the server sends up to 1 MiB).
+const MAX_CHUNK: u64 = 64 << 20;
+
 #[derive(Clone)]
 pub struct Server {
     pub host: String,
@@ -212,6 +215,9 @@ impl Server {
             if length == 0 {
                 sink(Chunk::EndOfRange { image_path, offset })?;
                 continue;
+            }
+            if length > MAX_CHUNK {
+                return Err(Error::Protocol(format!("offset {offset}: a piece of {length} bytes")));
             }
             let data = match m.get("buffer") {
                 Some(Value::Buffer(b)) | Some(Value::String(b)) => {

@@ -119,6 +119,9 @@ fn main() {
                 for p in &d.partitions {
                     println!("  {:<3} {:<12} {:>10} at {}", p.number, p.name, size_str(p.length), size_str(p.offset));
                 }
+                if let Some(c) = d.content {
+                    println!("  no GPT; holds {c}");
+                }
                 if let Some(g) = &d.gpt {
                     for (start, end) in g.free(d.size) {
                         println!("  free         {:>10} at sector {start}", size_str((end - start + 1) * d.sector_size));
@@ -181,7 +184,7 @@ fn main() {
                 Mode::Device | Mode::System => {
                     let maps = opts("--map");
                     if maps.is_empty() {
-                        plan.disks = plan::auto_map(v, &locals);
+                        plan.disks = if mode == Mode::System { plan::system_map(v, &locals) } else { plan::auto_map(v, &locals) };
                     }
                     for m in maps {
                         let (a, b) = m.split_once('=').unwrap_or_else(|| usage());
@@ -202,13 +205,16 @@ fn main() {
                         let (ldisk, place) = target.split_once(':').unwrap_or_else(|| usage());
                         let li = local_index(ldisk);
                         let place = if place == "free" {
+                            if let Some(why) = plan::free_refused(&locals[li]) {
+                                die(format!("{ldisk}: {why}"));
+                            }
                             plan::first_fit(v, &locals, li, disk, part, &plan.volumes)
                                 .map(Place::Free)
                                 .unwrap_or_else(|| die(format!("no free space for {vol} on {ldisk}")))
                         } else {
                             Place::Partition(place.parse().unwrap_or_else(|_| usage()))
                         };
-                        plan.volumes.push(VolumeTarget { disk, part, local: li, place });
+                        plan.volumes.push(VolumeTarget { disk, part, local: li, place: Some(place) });
                     }
                 }
             }
@@ -223,7 +229,7 @@ fn main() {
                 }
             }
             for o in &plan.volumes {
-                println!("  {} → /dev/{} {:?}", v.disks[o.disk].partitions[o.part].label, locals[o.local].name, o.place);
+                println!("  {} → /dev/{} {:?}", v.disks[o.disk].partitions[o.part].label, locals[o.local].name, o.place.as_ref().unwrap());
             }
             if !has("--yes") {
                 die("everything on the targets above will be overwritten: add --yes to go ahead");
