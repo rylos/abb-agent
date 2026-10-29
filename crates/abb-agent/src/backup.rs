@@ -827,8 +827,22 @@ fn run_locked(sess: &Session, trigger: Trigger) -> Result<()> {
         format!("full · version {version_id}")
     });
 
-    let outcome = run_inner(&job, &mut c, &task, start_time, &disks, &volume_parts, &tables, prev.as_deref(), &raws, version_id)
-        .map(|complete| complete && !missed);
+    let check_complete = |status: &str| -> Result<()> {
+        let mut c = sess.connect()?;
+        sess.call(
+            &mut c,
+            "backup",
+            vec![
+                ("subaction", Value::str("check_complete")),
+                ("is_cbt", Value::Int(is_cbt)),
+                ("result_id", Value::Int(result_id)),
+                ("running_task_id", Value::Int(rt.running_task_id)),
+                ("status", Value::str(status)),
+            ],
+        )?;
+        Ok(())
+    };
+    let outcome = run_inner(&job, &mut c, &task, start_time, &disks, &volume_parts, &tables, prev.as_deref(), &raws, version_id, missed, &check_complete);
     let status = match &outcome {
         Ok(true) => "complete",
         Ok(false) => "partial",
@@ -840,26 +854,31 @@ fn run_locked(sess: &Session, trigger: Trigger) -> Result<()> {
     if let Err(e) = &outcome {
         eprintln!("backup failed: {e}");
     }
+    // A successful backup is final only once the server confirmed it (`check_complete` in
+    // `run_inner`): until then neither the result nor the CBT tables change.
     last.end = now();
     last.status = status.into();
     if outcome.is_ok() {
         last.last_ok_start = start_time;
     }
-    let _ = last.save();
-    let mut c = sess.connect()?;
-    sess.call(
-        &mut c,
-        "backup",
-        vec![
-            ("subaction", Value::str("check_complete")),
-            ("is_cbt", Value::Int(is_cbt)),
-            ("result_id", Value::Int(result_id)),
-            ("running_task_id", Value::Int(rt.running_task_id)),
-            ("status", Value::str(status)),
-        ],
-    )?;
+    if let Err(e) = last.save() {
+        eprintln!("saving the result: {e}");
+    }
+    if outcome.is_err()
+        && let Err(e) = check_complete(status)
+    {
+        eprintln!("check_complete: {e}");
+    }
     eprintln!("backup finished: {status}");
     outcome.map(|_| ())
+}
+
+/// The server's result says it did not store the version. Only failures count: before
+/// `check_complete` the result of a version still being written has no final status yet (its
+/// value then is not documented), so anything else, empty included, cannot be read as a refusal;
+/// `check_complete` is what confirms the version.
+fn rejected(status: &str) -> bool {
+    ["fail", "error", "cancel"].iter().any(|f| status.starts_with(f))
 }
 
 /// The server answers the stream's `close` even when it failed to store it (it drains the
@@ -867,7 +886,7 @@ fn run_locked(sess: &Session, trigger: Trigger) -> Result<()> {
 fn server_accepted(job: &Job, c: &mut Connection) -> Result<()> {
     let r = job.sess.call(c, "get_running_task_result", vec![("result_id", Value::Int(job.result_id))])?;
     let status = r.get("running_task_result").and_then(|t| t.get("status")).and_then(Value::as_str).unwrap_or("");
-    if ["fail", "error", "cancel"].iter().any(|f| status.starts_with(f)) {
+    if rejected(status) {
         return Err(Error::Protocol(format!("the server did not store the version (status {status}): see its log in the ABB console")));
     }
     Ok(())
@@ -904,6 +923,8 @@ fn run_inner(
     prev: Option<&[Option<Digests>]>,
     raws: &stream::RawTables,
     version_id: u64,
+    missed: bool,
+    check_complete: &dyn Fn(&str) -> Result<()>,
 ) -> Result<bool> {
     let sess = job.sess;
     job.log(c, LOG_DEVICE_INFO, None);
@@ -1002,13 +1023,18 @@ fn run_inner(
             }
         }
         server_accepted(job, c)?;
-        raws.save(disks, version_id);
         for (p, v) in volume_parts.iter().zip(&volumes) {
             if let Some(n) = v.changed_while_read().filter(|&n| n > 0) {
                 eprintln!("{}: {n} files changed while the backup read them: their content in this version may be inconsistent, the next backup reads them again", alias(p));
             }
         }
-        // The version is on the server: the digests become the base for the next incremental.
+        let complete = !missed
+            && consistent
+            && disks.iter().all(|(d, iv)| unsupported(d, iv).is_empty())
+            && volumes.iter().all(|v| !v.incomplete());
+        check_complete(if complete { "complete" } else { "partial" })?;
+        // The server took the version: the digests become the base for the next incremental.
+        raws.save(disks, version_id);
         for ((p, v), t) in volume_parts.iter().zip(&volumes).zip(tables) {
             match std::fs::create_dir_all(t.path.parent().unwrap()).and_then(|_| v.save_digests(&t.path, version_id, p.offset, &t.owner)) {
                 Ok(()) => {
@@ -1018,7 +1044,6 @@ fn run_inner(
                 Err(e) => eprintln!("saving CBT for {}: {e}", alias(p)),
             }
         }
-        let complete = consistent && disks.iter().all(|(d, iv)| unsupported(d, iv).is_empty()) && volumes.iter().all(|v| !v.incomplete());
         Ok(complete)
     })();
     volumes.into_iter().for_each(Vol::cleanup);
@@ -1101,6 +1126,16 @@ mod tests {
         ntfs.read_only = true;
         let d = disk("zzsda", vec![esp, ntfs, ext]);
         assert_eq!(sources(&d)[1], Source::Raw);
+    }
+
+    #[test]
+    fn server_refusals() {
+        for s in ["failure", "fail", "error", "cancel", "canceled"] {
+            assert!(rejected(s), "{s}");
+        }
+        for s in ["", "complete", "partial", "success", "running", "backing_up"] {
+            assert!(!rejected(s), "{s}");
+        }
     }
 
     #[test]
