@@ -76,7 +76,7 @@ impl RawTables {
         for ((d, _), blocks) in disks.iter().zip(cur.iter()) {
             let m: serde_json::Map<String, serde_json::Value> = blocks.iter().map(|(k, v)| (k.to_string(), (*v).into())).collect();
             let j = serde_json::json!({ "version_id": version_id, "blocks": m });
-            if let Err(e) = std::fs::write(Self::path(d), j.to_string()) {
+            if let Err(e) = crate::state::write_atomic(&Self::path(d), j.to_string().as_bytes(), 0o644) {
                 eprintln!("saving the digests of {}: {e}", d.name);
             }
         }

@@ -31,11 +31,7 @@ pub fn record(uuid: &str, paths: &[PathBuf]) -> std::io::Result<()> {
         r.insert(uuid.to_string(), paths.to_vec());
     }
     std::fs::create_dir_all(STATE_DIR)?;
-    let tmp = path().with_extension("tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(&r).map_err(std::io::Error::other)?)?;
-    let f = std::fs::File::open(&tmp)?;
-    f.sync_all()?;
-    std::fs::rename(tmp, path())
+    crate::state::write_atomic(&path(), serde_json::to_string_pretty(&r).map_err(std::io::Error::other)?.as_bytes(), 0o644)
 }
 
 /// A device of the mounted btrfs filesystem `uuid`, from /sys/fs/btrfs.
