@@ -74,9 +74,8 @@ fn load() -> Saved {
 
 /// Written only by the scheduler thread of the service.
 fn save(s: &Saved) {
-    let (path, tmp) = (saved_path(), saved_path().with_extension("tmp"));
     if let Ok(text) = serde_json::to_string(s) {
-        let _ = std::fs::write(&tmp, text).and_then(|_| std::fs::rename(&tmp, &path));
+        let _ = crate::state::write_atomic(&saved_path(), text.as_bytes(), 0o644);
     }
 }
 
@@ -95,7 +94,7 @@ type LocalOffset = fn(i64) -> i64;
 
 /// Server offset less the local one at `at`: what stays the same when both switch to or from
 /// daylight saving time together.
-fn skew_of(off: i64, at: i64, local: LocalOffset) -> i64 {
+pub fn skew_of(off: i64, at: i64, local: LocalOffset) -> i64 {
     off - local(at)
 }
 

@@ -362,7 +362,7 @@ fn receive(sess: &Session, r: &Restore, writer: &mut Writer, report: &mut Report
             }
             continue;
         };
-        writer.handle(file, report).map_err(Stop::Failed)?;
+        writer.handle(file, report);
         if int(&msg, "has_more") == 0 {
             return Ok(());
         }
@@ -585,11 +585,11 @@ impl Writer {
         }
     }
 
-    fn handle(&mut self, f: &Value, report: &mut Report) -> std::result::Result<(), String> {
+    fn handle(&mut self, f: &Value, report: &mut Report) {
         let id = int(f, "id");
         let raw_path = text(f, "path");
         if self.finished.contains(&id) {
-            return Ok(());
+            return;
         }
         let path = match target(&self.dest, &raw_path) {
             Ok(p) => p,
@@ -597,7 +597,7 @@ impl Writer {
                 eprintln!("file restore: {e}");
                 self.finished.insert(id);
                 report.finish(id, DONE_ERROR, LOG_ERROR, &raw_path, json!({}));
-                return Ok(());
+                return;
             }
         };
         let compressed = compressed(f, report.r.compression);
@@ -609,7 +609,7 @@ impl Writer {
         if int(f, "skip") != 0 {
             self.abandon();
             done(self, DONE_OK, LOG_SKIPPED, json!({}));
-            return Ok(());
+            return;
         }
         match int(f, "file_type") {
             TYPE_DIR => {
@@ -652,7 +652,6 @@ impl Writer {
                 done(self, DONE_UNSUPPORTED, LOG_UNSUPPORTED, json!({}));
             }
         }
-        Ok(())
     }
 
     /// Opens the directory `path` from "/", one component at a time, never following a symlink

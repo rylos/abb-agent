@@ -186,7 +186,7 @@ impl Undo {
         let errs = self.finish(true);
         if errs.is_empty() {
             format!(
-                "{e}\nThe disks are incomplete: their partition tables and the signatures of the volumes written so far have been cleared, so that they are not taken for restored ones. Run the restore again."
+                "{e}\nThe restore is incomplete: the partition table of each whole disk restored and the signature of each volume restored into a partition have been cleared, so that they are not taken for restored ones. Run the restore again."
             )
         } else {
             format!("{e}\nThe disks are incomplete, and clearing them failed ({}): do not use them before the restore is run again.", errs.join("; "))
@@ -443,8 +443,13 @@ fn layout(v: &Version, plan: &Plan, locals: &[LocalDisk]) -> Result<Layout, Stri
                     let mut t = Target { local: j, partition: None, discard: vec![], wipe: vec![], zero: vec![], undo: vec![] };
                     if l.partitions.is_empty() {
                         jobs.push(head(range(d, None, 0, first), dev));
+                        // Up to the first partition (a boot loader may live in the gap).
+                        let p0 = d.partitions.first().map_or(first, |p| p.offset).min(l.size);
+                        if p0 > first {
+                            jobs.push(job(range(d, None, first, p0 - first), dev, 0));
+                        }
                         t.zero = tables_at.clone();
-                        t.zero.push((0, first));
+                        t.zero.push((0, p0.max(first)));
                         t.undo = tables_at;
                     }
                     for p in d.partitions.iter().filter(|p| p.is_system() && !p.excluded) {

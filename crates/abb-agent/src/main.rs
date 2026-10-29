@@ -455,7 +455,7 @@ fn status(watch: bool) {
         println!("{}", st.row("Last success", &format!("started {}", fmt_short(last.last_ok_start))));
     }
     if let Ok(off) = sess.server_offset(&mut c) {
-        control::set_server_skew(off - host::utc_offset(host::now() as i64));
+        control::set_server_skew(scheduler::skew_of(off, host::now() as i64, host::utc_offset));
     }
     let console = tasks.first().and_then(task::TaskInfo::parse).and_then(|t| scheduler::console_due(&t));
     let local = scheduler::local_due(sc, &last, scheduler::started()).map(|d| d.0.max(host::now()));

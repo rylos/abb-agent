@@ -77,12 +77,12 @@ impl Partition {
         self.type_guid == GUID_BIOS_BOOT
     }
 
-    /// `attribute` mask of the device spec (1 normal, |8 ESP, |0x40 BIOS boot).
     /// Someone may be writing to it while it is read: mounted read-write, or held by the kernel.
     pub fn in_use(&self) -> bool {
         if self.mount_path.is_empty() { self.busy } else { !self.read_only }
     }
 
+    /// `attribute` mask of the device spec (1 normal, |8 ESP, |0x40 BIOS boot).
     pub fn attribute(&self) -> u32 {
         if self.is_esp() {
             9

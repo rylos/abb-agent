@@ -231,7 +231,8 @@ impl Vol {
                 // Not cleanly unmounted (or mounted with noload): the journal has transactions
                 // whose blocks look free in the bitmaps. Freezing writes them out, so only the
                 // filesystem read as it is can be in this state.
-                if fs.needs_recovery && freeze.is_none() {
+                let recovering = fs.needs_recovery && freeze.is_none();
+                if recovering {
                     eprintln!("{name}: ext journal needs recovery: the whole filesystem is read, it is replayed at the first mount after a restore");
                     fs.assume_all_used();
                 }
@@ -241,7 +242,8 @@ impl Vol {
                     if freeze.is_some() { ", frozen until the upload ends" } else { "" }
                 );
                 let n = fs.size.div_ceil(cbt::BLOCK) as usize;
-                let inodes = fs.inodes().map_err(|e| eprintln!("{name}: reading the inodes: {e}")).ok();
+                // Without the journal the inode tables cannot be trusted: nothing is skipped.
+                let inodes = if recovering { None } else { fs.inodes().map_err(|e| eprintln!("{name}: reading the inodes: {e}")).ok() };
                 Ok(Vol::Ext(ExtVol { fs, table: (0..n).map(|_| AtomicU64::new(0)).collect(), inodes, skip: vec![], overlay: vec![], mount: None, freeze: std::sync::Mutex::new(freeze) }))
             }
             _ => Err(Error::Protocol(format!("{name}: unsupported filesystem"))),
@@ -583,10 +585,7 @@ fn save_inodes(path: &std::path::Path, version_id: u64, sigs: &std::collections:
             out.extend(v.to_le_bytes());
         }
     }
-    let raw = lz4_flex::block::compress_prepend_size(&out);
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, raw)?;
-    std::fs::rename(tmp, path)
+    crate::state::write_atomic(path, &lz4_flex::block::compress_prepend_size(&out), 0o600)
 }
 
 /// The signatures saved by `save_inodes`, if they belong to `version_id`.

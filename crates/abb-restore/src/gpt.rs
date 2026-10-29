@@ -72,6 +72,11 @@ fn u32_at(b: &[u8], o: usize) -> u32 {
     u32::from_le_bytes(b[o..o + 4].try_into().unwrap())
 }
 
+/// Sector 0 is an MBR with partitions of its own (not just the protective one of a GPT).
+fn mbr_partitions(mbr: &[u8]) -> bool {
+    mbr.len() >= 512 && mbr[510..512] == [0x55, 0xAA] && (0..4).map(|i| mbr[446 + 16 * i + 4]).any(|t| t != 0 && t != 0xEE)
+}
+
 fn u64_at(b: &[u8], o: usize) -> u64 {
     u64::from_le_bytes(b[o..o + 8].try_into().unwrap())
 }
@@ -165,6 +170,10 @@ impl Gpt {
         };
         if let Some(g) = Gpt::load(&read, sector, 1) {
             return Ok(Some(g));
+        }
+        // A disk turned to MBR may keep the old backup GPT: it is not a GPT disk.
+        if read(0, 512).is_some_and(|mbr| mbr_partitions(&mbr)) {
+            return Ok(None);
         }
         let size = (&*dev).seek(SeekFrom::End(0))?;
         let sectors = size / sector;
@@ -423,5 +432,18 @@ mod tests {
         assert!(Gpt::new(512).write(&f, 8192, true).is_err());
         assert_eq!(Gpt::new(512).last_usable(8192), 0);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn mbr_with_partitions_is_not_gpt() {
+        let mut mbr = vec![0u8; 512];
+        mbr[510..512].copy_from_slice(&[0x55, 0xAA]);
+        assert!(!mbr_partitions(&mbr));
+        mbr[446 + 4] = 0xEE;
+        assert!(!mbr_partitions(&mbr));
+        mbr[446 + 16 + 4] = 0x83;
+        assert!(mbr_partitions(&mbr));
+        mbr[510] = 0;
+        assert!(!mbr_partitions(&mbr));
     }
 }

@@ -297,7 +297,6 @@ pub fn top_unmount(top: &Path) {
 }
 
 impl Prepared {
-    /// Deletes this run's snapshots and unmounts the root if we mounted it.
     /// Deletes this run's snapshots and unmounts the volume root if mounted here. Goes on after
     /// an error (the root is always unmounted) and returns the first one.
     pub fn cleanup(self) -> Result<(), Error> {

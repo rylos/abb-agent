@@ -25,7 +25,8 @@ fn run(name: &str, cmd: &str, env: &[(&str, String)]) {
 }
 
 /// Runs `cmd` with /bin/sh; Ok if it exits with 0 within `timeout` (an empty command is Ok).
-/// It runs in a process group of its own: on timeout everything it started is killed too.
+/// It runs in a process group of its own (out of reach of the terminal's Ctrl-C): on timeout, or
+/// when the agent is stopping, everything it started is killed too.
 fn exec(cmd: &str, env: &[(&str, String)], timeout: Duration) -> Result<(), String> {
     if cmd.trim().is_empty() {
         return Ok(());
@@ -43,9 +44,12 @@ fn exec(cmd: &str, env: &[(&str, String)], timeout: Duration) -> Result<(), Stri
         match child.try_wait() {
             Ok(Some(s)) if s.success() => return Ok(()),
             Ok(Some(s)) => return Err(s.to_string()),
-            Ok(None) if start.elapsed() > timeout => {
+            Ok(None) if start.elapsed() > timeout || crate::control::stopping() => {
                 unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
                 let _ = child.wait();
+                if crate::control::stopping() {
+                    return Err("killed: the agent is stopping".into());
+                }
                 return Err(format!("killed after {} s", timeout.as_secs()));
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(200)),

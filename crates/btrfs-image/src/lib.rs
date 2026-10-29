@@ -5,6 +5,9 @@
 //! Every node read is verified (checksum, bytenr, fsid, generation): a node reused after N is
 //! reported as [`Error::Changed`] and the caller can retry the run.
 
+/// Visitor of `walk_parallel`: gets a node, returns the children (logical address, generation) to read.
+pub type Visit<'a> = dyn FnMut(&Node) -> Result<Vec<(u64, u64)>, Error> + 'a;
+
 pub mod capture;
 pub mod cbt;
 pub mod device;
@@ -258,7 +261,7 @@ impl Filesystem {
     pub fn walk_parallel(
         &self,
         roots: &[(u64, u64)],
-        visit: &mut dyn FnMut(&Node) -> Result<Vec<(u64, u64)>, Error>,
+        visit: &mut Visit,
     ) -> Result<(), Error> {
         let mut seen = std::collections::HashSet::new();
         let mut frontier: Vec<(u64, u64)> = roots.to_vec();
