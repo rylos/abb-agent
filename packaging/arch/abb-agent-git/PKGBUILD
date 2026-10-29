@@ -1,7 +1,7 @@
 # Maintainer: Marco Ziliani (rylos)
 pkgname=abb-agent-git
 _pkgname=abb-agent
-pkgver=0.1.0
+pkgver=0.2.13.r0.g9b05093
 pkgrel=1
 pkgdesc="Replacement for the Synology Active Backup for Business Linux agent: any distro and kernel, first-class btrfs, bare-metal restore (https://github.com/rylos/abb-agent)"
 arch=('x86_64' 'aarch64')
@@ -9,7 +9,7 @@ url="https://github.com/rylos/abb-agent"
 license=('GPL-3.0-or-later')
 depends=('glibc' 'libgcc')
 makedepends=('cargo' 'git')
-provides=("$_pkgname")
+provides=("$_pkgname=${pkgver%%.r*}")
 conflicts=("$_pkgname" "$_pkgname-bin")
 backup=('etc/abb-agent.toml')
 # ring compiles C code: GCC LTO objects cannot be linked by the Rust toolchain.
@@ -18,9 +18,11 @@ install=abb-agent.install
 source=("$_pkgname::git+$url.git")
 sha256sums=('SKIP')
 
+# Last release tag, commits since it and the commit (0.2.13.r5.g1a2b3c4): sorts after that
+# release and before the next one.
 pkgver() {
   cd "$_pkgname"
-  printf "0.1.0.r%s.g%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+  git describe --long --tags --abbrev=7 --match 'v[0-9]*' | sed 's/^v//;s/\([^-]*-g\)/r\1/;s/-/./g'
 }
 
 prepare() {
