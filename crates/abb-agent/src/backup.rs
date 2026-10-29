@@ -480,7 +480,7 @@ fn table_mismatch(meta: &CbtMeta, base_version_id: u64, offset: u64, owner: &str
 /// On btrfs the CBT tables live in a subvolume of their own, left out of the images: they are
 /// rewritten after every backup (a hundred MB on a 1 TB disk) and would otherwise be sent again
 /// each time. Turns an existing directory into a subvolume. Returns its path if it is one.
-pub fn cbt_subvolume() -> Option<std::path::PathBuf> {
+pub fn cbt_subvolume() -> Option<PathBuf> {
     use std::os::unix::fs::MetadataExt;
     const BTRFS_SUPER_MAGIC: i64 = 0x9123_683e;
     let state = Path::new(crate::state::STATE_DIR);
@@ -491,24 +491,40 @@ pub fn cbt_subvolume() -> Option<std::path::PathBuf> {
     if unsafe { libc::statfs(c.as_ptr(), &mut st) } != 0 || st.f_type as i64 != BTRFS_SUPER_MAGIC {
         return None;
     }
+    let is_subvol = |p: &Path| std::fs::metadata(p).is_ok_and(|m| m.ino() == 256);
+    if let Err(e) = finish_swap(state, is_subvol) {
+        eprintln!("CBT subvolume: {e}");
+        return None;
+    }
     match std::fs::metadata(&dir) {
         Ok(m) if m.ino() == 256 => return Some(dir),
         Ok(_) => {
             let new = state.join("cbt.new");
-            if std::fs::metadata(&new).is_ok_and(|m| m.ino() == 256) {
+            if is_subvol(&new) {
                 let _ = btrfs_image::snapshot::destroy(state, "cbt.new");
             }
             btrfs_image::snapshot::create_subvolume(state, "cbt.new").map_err(|e| eprintln!("CBT subvolume: {e}")).ok()?;
-            // Files cannot be renamed across subvolumes: copied, then removed.
+            // Files cannot be renamed across subvolumes: copied and synced, then the directory is
+            // moved aside, the copy put in its place, and the old directory removed. A crash at
+            // any point is completed or undone by `finish_swap`.
             let moved = (|| -> std::io::Result<()> {
                 for e in std::fs::read_dir(&dir)?.flatten() {
                     std::fs::copy(e.path(), new.join(e.file_name()))?;
                 }
-                std::fs::remove_dir_all(&dir)?;
-                std::fs::rename(&new, &dir)
+                let f = std::fs::File::open(&new)?;
+                if unsafe { libc::syncfs(std::os::fd::AsRawFd::as_raw_fd(&f)) } != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                std::fs::rename(&dir, state.join("cbt.old"))?;
+                std::fs::rename(&new, &dir)?;
+                std::fs::File::open(state)?.sync_all()?;
+                std::fs::remove_dir_all(state.join("cbt.old"))
             })();
             if let Err(e) = moved {
                 eprintln!("CBT subvolume: {e}");
+                if !dir.exists() {
+                    let _ = std::fs::rename(state.join("cbt.old"), &dir);
+                }
                 let _ = btrfs_image::snapshot::destroy(state, "cbt.new");
                 return None;
             }
@@ -516,6 +532,24 @@ pub fn cbt_subvolume() -> Option<std::path::PathBuf> {
         Err(_) => btrfs_image::snapshot::create_subvolume(state, "cbt").map_err(|e| eprintln!("CBT subvolume: {e}")).ok()?,
     }
     Some(dir)
+}
+
+/// Completes a conversion of `cbt` into a subvolume interrupted by a crash: `cbt` moved aside
+/// to `cbt.old` means the copy in `cbt.new` is complete and takes its place; a `cbt.old` left
+/// next to `cbt` is removed. (A `cbt.new` next to `cbt` is an unfinished copy: started again.)
+fn finish_swap(state: &Path, is_subvol: impl Fn(&Path) -> bool) -> std::io::Result<()> {
+    let (dir, new, old) = (state.join("cbt"), state.join("cbt.new"), state.join("cbt.old"));
+    if !dir.exists() && old.exists() {
+        if is_subvol(&new) {
+            std::fs::rename(&new, &dir)?;
+        } else {
+            std::fs::rename(&old, &dir)?;
+        }
+    }
+    if old.exists() {
+        std::fs::remove_dir_all(&old)?;
+    }
+    Ok(())
 }
 
 /// CBT tables of the previous backup, by volume: `None` for a volume whose table does not match
@@ -1148,6 +1182,32 @@ mod tests {
         let jobs = vec![(0, 0, 1 << 20, None), (0, 1 << 20, 2 << 20, None), (0, 2 << 20, 3 << 20, None), (0, 0x2ff000, 0x301000, None)];
         assert_eq!(stream::last_reads(&disks, &jobs, 3), [Some(3), Some(3), None]);
         assert_eq!(stream::last_reads(&disks, &jobs[..3], 3), [Some(2), None, None]);
+    }
+
+    #[test]
+    fn interrupted_cbt_conversion() {
+        let state = std::env::temp_dir().join(format!("abb-cbtswap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state);
+        let put = |d: &str, f: &str| {
+            std::fs::create_dir_all(state.join(d)).unwrap();
+            std::fs::write(state.join(d).join(f), d).unwrap();
+        };
+        let subvol = |p: &Path| p.ends_with("cbt.new") && p.exists();
+        // Crash after the old directory was moved aside: the complete copy takes its place.
+        put("cbt.old", "a.cbt");
+        put("cbt.new", "a.cbt");
+        finish_swap(&state, subvol).unwrap();
+        assert_eq!(std::fs::read_to_string(state.join("cbt/a.cbt")).unwrap(), "cbt.new");
+        assert!(!state.join("cbt.old").exists() && !state.join("cbt.new").exists());
+        // Crash while removing the old directory.
+        put("cbt.old", "a.cbt");
+        finish_swap(&state, subvol).unwrap();
+        assert!(!state.join("cbt.old").exists() && state.join("cbt/a.cbt").exists());
+        // Moved aside but no copy: put back.
+        std::fs::rename(state.join("cbt"), state.join("cbt.old")).unwrap();
+        finish_swap(&state, subvol).unwrap();
+        assert_eq!(std::fs::read_to_string(state.join("cbt/a.cbt")).unwrap(), "cbt.new");
+        std::fs::remove_dir_all(&state).unwrap();
     }
 
     #[test]
