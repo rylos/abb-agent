@@ -277,6 +277,31 @@ impl Connection {
     pub fn set_read_timeout(&self, t: Option<Duration>) -> Result<()> {
         Ok(self.stream.sock().set_read_timeout(t)?)
     }
+
+    /// Waits up to `timeout` for something to read (a message, or the server closing the
+    /// connection): `false` if nothing came, or a signal interrupted the wait.
+    pub fn wait_readable(&mut self, timeout: Duration) -> Result<bool> {
+        if let Stream::Tls(s) = &mut self.stream
+            && s.conn.process_new_packets()?.plaintext_bytes_to_read() > 0
+        {
+            return Ok(true);
+        }
+        let sock = self.stream.sock();
+        let old = sock.read_timeout()?;
+        sock.set_read_timeout(Some(timeout.max(Duration::from_millis(1))))?;
+        let r = sock.peek(&mut [0u8; 1]);
+        sock.set_read_timeout(old)?;
+        match r {
+            // TLS: bytes came, but maybe not a whole record, or not application data.
+            Ok(n) if n > 0 && let Stream::Tls(s) = &mut self.stream => {
+                s.conn.read_tls(&mut s.sock)?;
+                Ok(s.conn.process_new_packets()?.plaintext_bytes_to_read() > 0)
+            }
+            Ok(_) => Ok(true),
+            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
 }
 
 pub fn check_error(resp: &Value) -> Result<()> {

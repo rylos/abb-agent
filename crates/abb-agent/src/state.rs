@@ -6,8 +6,31 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const STATE_DIR: &str = "/var/lib/abb-agent";
+
+/// Replaces `path` with `data` so that a crash leaves either the old file or the new one: written
+/// to a temporary file of its own next to it (created with `mode`), synced, renamed over `path`,
+/// and the directory synced.
+pub fn write_atomic(path: &Path, data: &[u8], mode: u32) -> std::io::Result<()> {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let name = path.file_name().ok_or_else(|| std::io::Error::other(format!("{}: not a file", path.display())))?;
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(".{}.{}-{seq}.tmp", name.to_string_lossy(), std::process::id()));
+    let res = (|| {
+        let mut f = fs::OpenOptions::new().write(true).create_new(true).mode(mode).open(&tmp)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+        fs::rename(&tmp, path)?;
+        fs::File::open(dir)?.sync_all()
+    })();
+    if res.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    res
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct State {
@@ -52,26 +75,8 @@ impl LastRun {
     }
 
     pub fn save(&self) -> std::io::Result<()> {
-        write_atomic(&Self::path(), serde_json::to_string_pretty(self).map_err(std::io::Error::other)?.as_bytes(), 0o600)
+        write_atomic(&Self::path(), serde_json::to_string_pretty(self).map_err(std::io::Error::other)?.as_bytes(), 0o644)
     }
-}
-
-/// Replaces `path` through a temporary file of its own, synced, then renamed over it: threads
-/// and processes writing the same file at once (the heartbeat renewing the token, the event loop)
-/// never mix their content, and a crash leaves the old file or the new one.
-fn write_atomic(path: &Path, data: &[u8], mode: u32) -> std::io::Result<()> {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = path.with_extension(format!("tmp.{}.{n}", std::process::id()));
-    let r = fs::OpenOptions::new().create_new(true).write(true).mode(mode).open(&tmp).and_then(|mut f| {
-        f.write_all(data)?;
-        f.sync_all()?;
-        fs::rename(&tmp, path)
-    });
-    if r.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    r
 }
 
 /// Progress of the running backup, for `abb-agent status` (in /run: gone after a reboot).
@@ -97,10 +102,9 @@ impl Progress {
     }
 
     pub fn save(&self) {
-        let tmp = Path::new(Self::PATH).with_extension("tmp");
-        let _ = fs::create_dir_all(tmp.parent().unwrap())
-            .and_then(|_| fs::write(&tmp, serde_json::to_string(self).unwrap_or_default()))
-            .and_then(|_| fs::rename(&tmp, Self::PATH));
+        let path = Path::new(Self::PATH);
+        let _ = fs::create_dir_all(path.parent().unwrap())
+            .and_then(|_| write_atomic(path, serde_json::to_string(self).unwrap_or_default().as_bytes(), 0o644));
     }
 
     /// Sets the phase of this process's backup.
@@ -156,8 +160,10 @@ pub fn image_names(disks: &mut [crate::disk::Disk]) {
         d.image = name;
     }
     let _ = fs::create_dir_all(STATE_DIR);
-    if let Ok(t) = serde_json::to_string_pretty(&map) {
-        let _ = fs::write(&file, t);
+    if let Ok(t) = serde_json::to_string_pretty(&map)
+        && let Err(e) = write_atomic(&file, t.as_bytes(), 0o644)
+    {
+        eprintln!("saving {}: {e}", file.display());
     }
 }
 
@@ -212,6 +218,25 @@ mod tests {
         assert!(data.iter().all(|&b| b == data[0]) && data.len() == 4096 * (data[0] - b'a' + 1) as usize);
         assert_eq!(fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1, "temporary files left");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn write_atomic_replaces_and_leaves_nothing_behind() {
+        let dir = std::env::temp_dir().join(format!("abb-state-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("x.json");
+        write_atomic(&f, b"one", 0o600).unwrap();
+        assert_eq!(fs::read(&f).unwrap(), b"one");
+        assert_eq!(fs::metadata(&f).unwrap().permissions().mode() & 0o777, 0o600);
+        write_atomic(&f, b"two", 0o600).unwrap();
+        assert_eq!(fs::read(&f).unwrap(), b"two");
+        let names: Vec<_> = fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("x.json")]);
+        // A failed write keeps the old content and removes its temporary file.
+        assert!(write_atomic(&dir.join("missing/y.json"), b"z", 0o600).is_err());
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
         fs::remove_dir_all(&dir).unwrap();
     }
 }

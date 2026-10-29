@@ -59,6 +59,9 @@ pub struct Partition {
     pub mounts: Vec<String>,
     /// Mounted read-only (meaningful only if mounted).
     pub read_only: bool,
+    /// Not mounted here but held by the kernel: mounted in another mount namespace, a member of
+    /// a ZFS pool or md array, mapped by device-mapper. Someone may be writing to it.
+    pub busy: bool,
 }
 
 impl Partition {
@@ -75,6 +78,11 @@ impl Partition {
     }
 
     /// `attribute` mask of the device spec (1 normal, |8 ESP, |0x40 BIOS boot).
+    /// Someone may be writing to it while it is read: mounted read-write, or held by the kernel.
+    pub fn in_use(&self) -> bool {
+        if self.mount_path.is_empty() { self.busy } else { !self.read_only }
+    }
+
     pub fn attribute(&self) -> u32 {
         if self.is_esp() {
             9
@@ -220,7 +228,12 @@ pub fn system_disk() -> std::io::Result<String> {
         .iter()
         .find(|m| m.target == "/")
         .ok_or_else(|| std::io::Error::other("mount of / not found"))?;
-    let dev = fs::canonicalize(&root.source)?;
+    // By device number: the source may be a name such as /dev/root. Btrfs has an anonymous
+    // device number instead, and a real source.
+    let dev = match fs::canonicalize(Path::new("/sys/dev/block").join(&root.dev)) {
+        Ok(sys) => sys,
+        Err(_) => fs::canonicalize(&root.source)?,
+    };
     parent_disk(&dev.file_name().unwrap().to_string_lossy())
 }
 
@@ -229,20 +242,49 @@ pub struct Mount {
     pub target: String,
     /// Superblock options ("rw,…" or "ro,…").
     pub super_options: String,
+    /// Device number "major:minor" (anonymous for btrfs).
+    pub dev: String,
 }
 
 pub fn mounts() -> std::io::Result<Vec<Mount>> {
-    let text = fs::read_to_string("/proc/self/mountinfo")?;
-    Ok(text
-        .lines()
+    Ok(parse_mountinfo(&fs::read_to_string("/proc/self/mountinfo")?))
+}
+
+fn parse_mountinfo(text: &str) -> Vec<Mount> {
+    text.lines()
         .filter_map(|l| {
             let (a, b) = l.split_once(" - ")?;
+            let dev = a.split(' ').nth(2)?.to_string();
             let target = unescape(a.split(' ').nth(4)?);
             let source = unescape(b.split(' ').nth(1)?);
             let super_options = b.split(' ').nth(2).unwrap_or("").to_string();
-            Some(Mount { source, target, super_options })
+            Some(Mount { source, target, super_options, dev })
         })
-        .collect())
+        .collect()
+}
+
+/// Mounts of the block device `devpath` whose number is `dev` ("major:minor", from sysfs). The
+/// number is what identifies it: the source may be /dev/root, a symlink or a stale name. Btrfs
+/// mounts carry an anonymous number, and are recognised by their source.
+fn mounts_of<'a>(mounts: &'a [Mount], dev: &str, devpath: &Path) -> Vec<&'a Mount> {
+    mounts
+        .iter()
+        .filter(|m| {
+            (!dev.is_empty() && m.dev == dev)
+                || Path::new(&m.source) == devpath
+                || fs::canonicalize(&m.source).is_ok_and(|p| p == devpath)
+        })
+        .collect()
+}
+
+/// The kernel holds the block device exclusively (a mount, ZFS, md, device-mapper, swap): an
+/// exclusive open fails with EBUSY.
+fn claimed(devpath: &Path) -> bool {
+    use std::os::unix::fs::OpenOptionsExt;
+    match fs::OpenOptions::new().read(true).custom_flags(libc::O_EXCL).open(devpath) {
+        Ok(_) => false,
+        Err(e) => e.raw_os_error() == Some(libc::EBUSY),
+    }
 }
 
 /// mountinfo encodes spaces and the like as \040.
@@ -284,10 +326,10 @@ pub fn scan(name: &str) -> std::io::Result<Disk> {
         let length = read_u64(psys.join("size"))? * 512;
         let type_guid = gpt.iter().find(|(n, _)| *n == number).map(|(_, g)| g.clone()).unwrap_or_default();
         let (fs, fs_uuid) = probe_fs(&dev, offset, length)?;
-        let pdev = format!("/dev/{pname}");
-        let mine: Vec<&Mount> =
-            mounts.iter().filter(|m| fs::canonicalize(&m.source).is_ok_and(|p| p == Path::new(&pdev))).collect();
+        let pdev = PathBuf::from(format!("/dev/{pname}"));
+        let mine = mounts_of(&mounts, &read_trim(psys.join("dev")).unwrap_or_default(), &pdev);
         let read_only = mine.iter().all(|m| m.super_options.split(',').any(|o| o == "ro"));
+        let busy = mine.is_empty() && claimed(&pdev);
         let mut targets: Vec<&str> = mine.iter().map(|m| m.target.as_str()).collect();
         targets.sort_by_key(|t| (*t != "/", t.len()));
         partitions.push(Partition {
@@ -301,6 +343,7 @@ pub fn scan(name: &str) -> std::io::Result<Disk> {
             mount_path: targets.first().map(|t| t.to_string()).unwrap_or_default(),
             mounts: targets.iter().map(|t| t.to_string()).collect(),
             read_only,
+            busy,
         });
     }
     partitions.sort_by_key(|p| p.offset);
@@ -392,4 +435,62 @@ fn probe_fs(dev: &Device, offset: u64, length: u64) -> std::io::Result<(Fs, Stri
         return Ok((Fs::Swap, uuid_str(&head[1036..1052])));
     }
     Ok((Fs::None, String::new()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MOUNTINFO: &str = "\
+22 1 259:2 / / rw,relatime shared:1 - ext4 /dev/root rw
+23 22 0:31 /@home /home rw,relatime shared:2 - btrfs /dev/nvme0n1p3 rw,subvolid=257,subvol=/@home
+24 22 259:1 / /boot ro,relatime shared:3 - vfat /dev/disk/by-uuid/ABCD-1234 ro,fmask=0022
+25 22 0:22 / /proc rw,nosuid shared:4 - proc proc rw
+26 22 259:4 / /mnt/my\\040disk rw shared:5 - ext4 /dev/nvme0n1p4 rw
+";
+
+    #[test]
+    fn mounts_matched_by_device_number() {
+        let m = parse_mountinfo(MOUNTINFO);
+        assert_eq!(m.len(), 5);
+        assert_eq!((m[0].dev.as_str(), m[0].source.as_str(), m[0].target.as_str()), ("259:2", "/dev/root", "/"));
+        assert_eq!(m[4].target, "/mnt/my disk");
+        // ext4 mounted from /dev/root: found by its number.
+        let root = mounts_of(&m, "259:2", Path::new("/dev/zznvme0n1p2"));
+        assert_eq!(root.iter().map(|m| m.target.as_str()).collect::<Vec<_>>(), ["/"]);
+        assert!(!root[0].super_options.split(',').any(|o| o == "ro"));
+        // vfat mounted through a symlink, read-only.
+        let boot = mounts_of(&m, "259:1", Path::new("/dev/zznvme0n1p1"));
+        assert_eq!(boot.len(), 1);
+        assert!(boot[0].super_options.split(',').any(|o| o == "ro"));
+        // btrfs: anonymous number, found by its source.
+        let home = mounts_of(&m, "259:3", Path::new("/dev/nvme0n1p3"));
+        assert_eq!(home.iter().map(|m| m.target.as_str()).collect::<Vec<_>>(), ["/home"]);
+        // Nothing else claims an unrelated device.
+        assert!(mounts_of(&m, "8:1", Path::new("/dev/zzsda1")).is_empty());
+    }
+
+    #[test]
+    fn in_use() {
+        let mut p = Partition {
+            name: "x".into(),
+            number: 1,
+            offset: 0,
+            length: 0,
+            type_guid: String::new(),
+            fs: Fs::None,
+            fs_uuid: String::new(),
+            mount_path: String::new(),
+            mounts: vec![],
+            read_only: true,
+            busy: false,
+        };
+        assert!(!p.in_use());
+        p.busy = true;
+        assert!(p.in_use());
+        (p.busy, p.mount_path, p.read_only) = (true, "/boot".into(), true);
+        assert!(!p.in_use());
+        p.read_only = false;
+        assert!(p.in_use());
+    }
 }

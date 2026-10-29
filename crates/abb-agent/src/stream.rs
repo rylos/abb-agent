@@ -45,6 +45,9 @@ pub enum Check {
 pub struct RawTables {
     pub prev: Vec<std::collections::HashMap<u64, u64>>,
     pub cur: Mutex<Vec<std::collections::HashMap<u64, u64>>>,
+    /// Server and task the digests belong to: version ids of another server or task say
+    /// nothing about the base.
+    owner: String,
 }
 
 impl RawTables {
@@ -52,14 +55,14 @@ impl RawTables {
         std::path::Path::new(crate::state::STATE_DIR).join("cbt").join(format!("{}.raw", d.image_name()))
     }
 
-    /// The previous backup's digests, if they belong to `base_version_id`.
-    pub fn load(disks: &[(Disk, Vec<Interval>)], base_version_id: u64) -> RawTables {
+    /// The previous backup's digests, if they belong to `base_version_id` of `owner`.
+    pub fn load(disks: &[(Disk, Vec<Interval>)], base_version_id: u64, owner: &str) -> RawTables {
         let prev = disks
             .iter()
             .map(|(d, _)| {
                 let j: Option<serde_json::Value> = std::fs::read(Self::path(d)).ok().and_then(|b| serde_json::from_slice(&b).ok());
                 match j {
-                    Some(j) if j["version_id"].as_u64() == Some(base_version_id) => j["blocks"]
+                    Some(j) if j["version_id"].as_u64() == Some(base_version_id) && j["owner"].as_str() == Some(owner) => j["blocks"]
                         .as_object()
                         .map(|m| m.iter().filter_map(|(k, v)| Some((k.parse().ok()?, v.as_u64()?))).collect())
                         .unwrap_or_default(),
@@ -67,7 +70,7 @@ impl RawTables {
                 }
             })
             .collect();
-        RawTables { prev, cur: Mutex::new(vec![Default::default(); disks.len()]) }
+        RawTables { prev, cur: Mutex::new(vec![Default::default(); disks.len()]), owner: owner.to_string() }
     }
 
     /// Saves this backup's digests as the base for the next one.
@@ -75,8 +78,8 @@ impl RawTables {
         let cur = self.cur.lock().unwrap();
         for ((d, _), blocks) in disks.iter().zip(cur.iter()) {
             let m: serde_json::Map<String, serde_json::Value> = blocks.iter().map(|(k, v)| (k.to_string(), (*v).into())).collect();
-            let j = serde_json::json!({ "version_id": version_id, "blocks": m });
-            if let Err(e) = std::fs::write(Self::path(d), j.to_string()) {
+            let j = serde_json::json!({ "version_id": version_id, "owner": self.owner, "blocks": m });
+            if let Err(e) = crate::state::write_atomic(&Self::path(d), j.to_string().as_bytes(), 0o644) {
                 eprintln!("saving the digests of {}: {e}", d.name);
             }
         }
@@ -173,7 +176,8 @@ pub fn plan_incremental(intervals: &[Interval], volumes: &[Vol], prev: &[Option<
         }
         match i.source {
             Source::Excluded(_) => {
-                out.push(Piece::Run(Run { start: i.start, end: i.end, used: false, changed: false, cbt: false }));
+                // "Changed": whatever the base had there (a volume excluded since) is dropped.
+                out.push(Piece::Run(Run { start: i.start, end: i.end, used: false, changed: true, cbt: false }));
             }
             Source::Raw => {
                 let mut w = i.start;
@@ -239,7 +243,69 @@ pub fn plan_incremental(intervals: &[Interval], volumes: &[Vol], prev: &[Option<
             out.push(Piece::Log(LOG_VOLUME_DONE, a));
         }
     }
-    merge_changed(out)
+    align(merge_changed(out))
+}
+
+const ALIGN: u64 = 4096;
+
+/// Pieces on the 4096-byte grid, as the official agent sends them (`setAlignment(4096)`): where
+/// two pieces meet off the grid (a partition ending at a sector that is not a multiple of 8,
+/// such as the last one before the backup GPT), the 4096 bytes around the boundary become a
+/// data piece of their own, read and sent whatever the sources on either side (excluded areas
+/// read as zeros), and the pieces next to it are shortened.
+fn align(pieces: Vec<Piece>) -> Vec<Piece> {
+    let range = |p: &Piece| match *p {
+        Piece::Data { start, end, .. } | Piece::Run(Run { start, end, .. }) => Some((start, end)),
+        Piece::Log(..) => None,
+    };
+    let ranges: Vec<(u64, u64)> = pieces.iter().filter_map(range).collect();
+    // Grid cells holding a boundary off the grid, joined when they touch.
+    let mut cells: Vec<(u64, u64)> = Vec::new();
+    for w in ranges.windows(2) {
+        let b = w[1].0;
+        if b % ALIGN == 0 || w[0].1 != b {
+            continue;
+        }
+        let cell = (b - b % ALIGN, (b - b % ALIGN + ALIGN).min(ranges.last().unwrap().1));
+        match cells.last_mut() {
+            Some(last) if last.1 >= cell.0 => last.1 = last.1.max(cell.1),
+            _ => cells.push(cell),
+        }
+    }
+    if cells.is_empty() {
+        return pieces;
+    }
+    let mut out = Vec::with_capacity(pieces.len() + 2 * cells.len());
+    let mut next = 0;
+    for p in pieces {
+        let Some((s, e)) = range(&p) else {
+            out.push(p);
+            continue;
+        };
+        // What is left of the piece outside the cells, after the cells before it.
+        let (mut ns, mut ne) = (s, e);
+        for &(cs, ce) in cells[next..].iter().take_while(|c| c.0 < e) {
+            if cs <= ns {
+                ns = ns.max(ce);
+            } else {
+                ne = ne.min(cs);
+            }
+        }
+        if ns >= ne {
+            continue;
+        }
+        while next < cells.len() && cells[next].1 <= ns {
+            out.push(Piece::Data { start: cells[next].0, end: cells[next].1, cbt: false, check: None });
+            next += 1;
+        }
+        out.push(match p {
+            Piece::Data { cbt, check, .. } => Piece::Data { start: ns, end: ne, cbt, check },
+            Piece::Run(r) => Piece::Run(Run { start: ns, end: ne, ..r }),
+            Piece::Log(..) => unreachable!(),
+        });
+    }
+    out.extend(cells[next..].iter().map(|&(start, end)| Piece::Data { start, end, cbt: false, check: None }));
+    out
 }
 
 /// Joins consecutive changed 64 KiB blocks into pieces of up to 1 MiB (never across a MiB
@@ -372,7 +438,7 @@ fn parallel_ordered<T: Send, R>(
 }
 
 /// Data jobs of the plan: (disk, start, end, check).
-type DataJob = (usize, u64, u64, Option<Check>);
+pub(crate) type DataJob = (usize, u64, u64, Option<Check>);
 
 fn data_jobs(plans: &[Vec<Piece>]) -> Vec<DataJob> {
     plans
@@ -416,6 +482,19 @@ fn produce(
     Ok(Ready { packed, len, unchanged, read_time: t.elapsed() })
 }
 
+/// For each volume, the index of the last data job that reads from it (`None`: none does).
+pub(crate) fn last_reads(disks: &[(Disk, Vec<Interval>)], jobs: &[DataJob], nvolumes: usize) -> Vec<Option<usize>> {
+    let mut last = vec![None; nvolumes];
+    for (k, &(n, start, end, _)) in jobs.iter().enumerate() {
+        for i in disks[n].1.iter().filter(|i| i.start < end && i.end > start) {
+            if let Source::Vol(v) = i.source {
+                last[v] = Some(k);
+            }
+        }
+    }
+    last
+}
+
 fn open_devices(disks: &[(Disk, Vec<Interval>)]) -> Result<Vec<Device>> {
     Ok(disks.iter().map(|(d, _)| Device::open(&d.device())).collect::<std::io::Result<_>>()?)
 }
@@ -449,10 +528,19 @@ pub fn upload(
     if open.get("success").and_then(Value::as_int) != Some(1) {
         return Err(Error::Protocol(format!("upload_block rejected: {open:?}")));
     }
+    // Results come in order: once job k is delivered, every job up to k has been read.
+    let last = last_reads(disks, &jobs, volumes.len());
+    let read = |k: Option<usize>| {
+        for (v, l) in last.iter().enumerate() {
+            if l.is_none() || k.is_none() || *l == k {
+                volumes[v].release();
+            }
+        }
+    };
     parallel_ordered(
         jobs.len(),
         |i| produce(&devs, disks, volumes, prev, raws, compress, jobs[i]),
-        |next| send_stream(job, logc, &mut up, disks, plans, snapshot_time, compress, next),
+        |next| send_stream(job, logc, &mut up, disks, plans, snapshot_time, compress, next, &read),
     )
 }
 
@@ -483,7 +571,7 @@ pub fn bench(disks: &[(Disk, Vec<Interval>)], volumes: &[Vol], limit: Option<u64
                 .transpose()
         })
         .collect::<std::io::Result<_>>()?;
-    let raws = RawTables { prev: vec![Default::default(); disks.len()], cur: Mutex::new(vec![Default::default(); disks.len()]) };
+    let raws = RawTables { prev: vec![Default::default(); disks.len()], cur: Mutex::new(vec![Default::default(); disks.len()]), owner: String::new() };
     let t = Instant::now();
     parallel_ordered(
         jobs.len(),
@@ -537,8 +625,12 @@ fn send_stream(
     snapshot_time: Duration,
     compress: bool,
     next: &mut dyn FnMut() -> Result<Ready>,
+    read: &dyn Fn(Option<usize>),
 ) -> Result<()> {
     let t0 = Instant::now();
+    // Volumes nothing is read from are released now; the others after their last data job.
+    read(Some(usize::MAX));
+    let mut job_index = 0;
     RUNS_SENT.store(0, Ordering::Relaxed);
     let mut ctr = Counters::default();
     let mut first_perf = Some(snapshot_time);
@@ -569,6 +661,8 @@ fn send_stream(
                 }
                 Piece::Data { start, end, cbt, check } => {
                     let ready = next()?;
+                    read(Some(job_index));
+                    job_index += 1;
                     ctr.read_time += ready.read_time;
                     ctr.read_bytes += ready.len;
                     progress.done += ready.len;
@@ -628,6 +722,7 @@ fn send_stream(
             send_run(up, &image, &p)?;
         }
     }
+    read(None);
     up.send(&perf(&ctr, None))?;
     eprintln!("all pieces sent after {:.1}s ({blocks} with data, {runs} without), waiting for the server", t0.elapsed().as_secs_f64(), runs = RUNS_SENT.load(Ordering::Relaxed));
     crate::state::Progress { phase: "finishing".into(), done: progress.total, ..progress }.save();
@@ -641,7 +736,17 @@ fn send_stream(
     ));
     crate::ui::busy("the server is checking the version");
     up.send(&Value::map([("close", Value::Int(1))]))?;
-    up.set_read_timeout(Some(Duration::from_secs(3600)))?;
+    // The server checks the version before it answers (up to an hour seen as reasonable): a
+    // cancel or SIGTERM meanwhile still stops the backup.
+    let deadline = Instant::now() + Duration::from_secs(3600);
+    while !up.wait_readable(Duration::from_secs(1))? {
+        if crate::control::cancelled() {
+            return Err(Error::Protocol("backup cancelled".into()));
+        }
+        if Instant::now() > deadline {
+            return Err(Error::Protocol("the server did not answer the stream's close within an hour".into()));
+        }
+    }
     let r = up.recv()?;
     if r.get("close").and_then(Value::as_int) != Some(1) {
         return Err(Error::Protocol(format!("unexpected stream close: {r:?}")));
@@ -709,4 +814,59 @@ fn push_run(up: &mut Connection, image: &str, pending: &mut Option<Run>, r: Run)
     }
     *pending = Some(r);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn data(start: u64, end: u64) -> Piece {
+        Piece::Data { start, end, cbt: true, check: None }
+    }
+
+    fn run(start: u64, end: u64) -> Piece {
+        Piece::Run(Run { start, end, used: true, changed: false, cbt: true })
+    }
+
+    fn shape(pieces: &[Piece]) -> Vec<(char, u64, u64)> {
+        pieces
+            .iter()
+            .map(|p| match *p {
+                Piece::Data { start, end, .. } => ('d', start, end),
+                Piece::Run(r) => ('r', r.start, r.end),
+                Piece::Log(..) => ('l', 0, 0),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pieces_meet_on_the_4096_grid() {
+        // Partition ending at 21474819584 (not a multiple of 4096), then the backup GPT up to the
+        // end of a 20 GiB disk, as in the capture of the official agent.
+        let (pend, size) = (21474819584u64, 21474836480u64);
+        let last = pend - pend % 65536;
+        let plan = vec![
+            run(last - 2 * 65536, last),
+            data(last, pend),
+            Piece::Log(LOG_VOLUME_DONE, "/".into()),
+            Piece::Data { start: pend, end: size, cbt: false, check: Some(Check::Raw) },
+        ];
+        let got = shape(&align(plan));
+        assert_eq!(
+            got,
+            [('r', last - 2 * 65536, last), ('d', last, 21474816000), ('l', 0, 0), ('d', 21474816000, 21474820096), ('d', 21474820096, size)]
+        );
+        for (_, s, e) in got.into_iter().filter(|p| p.0 != 'l') {
+            assert!(s % 4096 == 0 && (e % 4096 == 0 || e == size));
+        }
+    }
+
+    #[test]
+    fn small_pieces_inside_a_cell_are_taken_in() {
+        let plan = vec![run(0, 8192), data(8192, 8704), run(8704, 9216), run(9216, 16384)];
+        assert_eq!(shape(&align(plan)), [('r', 0, 8192), ('d', 8192, 12288), ('r', 12288, 16384)]);
+        // Already aligned: unchanged.
+        let plan = vec![run(0, 8192), data(8192, 65536)];
+        assert_eq!(shape(&align(plan)), [('r', 0, 8192), ('d', 8192, 65536)]);
+    }
 }

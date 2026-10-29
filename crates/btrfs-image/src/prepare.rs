@@ -298,21 +298,34 @@ pub fn top_unmount(top: &Path) {
 
 impl Prepared {
     /// Deletes this run's snapshots and unmounts the root if we mounted it.
+    /// Deletes this run's snapshots and unmounts the volume root if mounted here. Goes on after
+    /// an error (the root is always unmounted) and returns the first one.
     pub fn cleanup(self) -> Result<(), Error> {
-        let mut names: Vec<String> = std::fs::read_dir(&self.run_dir)?
-            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
-            .collect();
-        names.sort();
-        for n in &names {
-            snapshot::destroy(&self.run_dir, n)?;
+        let mut first: Option<Error> = None;
+        match std::fs::read_dir(&self.run_dir) {
+            Ok(rd) => {
+                let mut names: Vec<String> =
+                    rd.filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned())).collect();
+                names.sort();
+                for n in &names {
+                    if let Err(e) = snapshot::destroy(&self.run_dir, n) {
+                        first.get_or_insert(e);
+                    }
+                }
+                if let Err(e) = std::fs::remove_dir(&self.run_dir) {
+                    first.get_or_insert(e.into());
+                }
+            }
+            Err(e) => {
+                first.get_or_insert(e.into());
+            }
         }
-        std::fs::remove_dir(&self.run_dir)?;
         let _ = std::fs::remove_dir(self.top.join(SNAP_DIR));
         if self.mounted_by_us {
             let c = CString::new(self.top.to_string_lossy().as_bytes()).unwrap();
             unsafe { libc::umount2(c.as_ptr(), libc::MNT_DETACH) };
             let _ = std::fs::remove_dir(&self.top);
         }
-        Ok(())
+        first.map_or(Ok(()), Err)
     }
 }

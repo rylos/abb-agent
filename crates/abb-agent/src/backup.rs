@@ -12,9 +12,9 @@ use crate::stream::{self, MIB, Piece};
 use crate::volume::Vol;
 use abb_proto::transport::{Error, Result};
 use abb_proto::{Connection, Value};
-use btrfs_image::cbt::Digests;
+use btrfs_image::cbt::{CbtMeta, Digests};
 use serde_json::{Value as Json, json};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 const GIB: f64 = (1u64 << 30) as f64;
@@ -151,10 +151,13 @@ fn plan(d: &Disk, volumes: &mut Vec<Partition>, sel: &Selection) -> Vec<Interval
             (5, Source::Excluded(Skip::Swap))
         } else if !sel.selects(p) {
             (5, Source::Excluded(Skip::NotSelected))
+        } else if unreadable(p).is_some() {
+            (5, Source::Excluded(Skip::Unsupported))
         } else if vol {
             volumes.push(p.clone());
             (1, Source::Vol(volumes.len() - 1))
         } else if matches!(p.fs, Fs::None | Fs::Vfat) {
+            // A vfat in use cannot be frozen: checked for changes after it is read.
             (2, Source::Raw)
         } else {
             (5, Source::Excluded(Skip::Unsupported))
@@ -166,6 +169,32 @@ fn plan(d: &Disk, volumes: &mut Vec<Partition>, sel: &Selection) -> Vec<Interval
         out.push(gap(pos, d.size));
     }
     out
+}
+
+/// Why a partition that would be copied cannot be read consistently, if it cannot: an unknown
+/// filesystem someone may be writing to, or an ext held by the kernel but not mounted here (it
+/// cannot be frozen).
+fn unreadable(p: &Partition) -> Option<&'static str> {
+    match p.fs {
+        Fs::None if p.in_use() => Some("unknown filesystem in use (mounted read-write, or held by the kernel)"),
+        Fs::Ext(_) if p.mount_path.is_empty() && p.busy => Some("in use but not mounted here: it cannot be frozen"),
+        _ => None,
+    }
+}
+
+/// Digest of a whole partition, to tell whether it changed while it was read.
+fn partition_digest(d: &Disk, p: &Partition) -> Result<u64> {
+    let dev = btrfs_image::device::Device::open(&d.device())?;
+    let mut h = xxhash_rust::xxh3::Xxh3::new();
+    let mut buf = vec![0u8; (4 * MIB) as usize];
+    let mut o = p.offset;
+    while o < p.offset + p.length {
+        let n = (p.offset + p.length - o).min(4 * MIB) as usize;
+        dev.read_exact_at(&mut buf[..n], o)?;
+        h.update(&buf[..n]);
+        o += n as u64;
+    }
+    Ok(h.digest())
 }
 
 fn skip_of(intervals: &[Interval], p: &Partition) -> Option<Skip> {
@@ -392,14 +421,66 @@ fn used_estimate(intervals: &[Interval], volumes: &[Vol], d: &Disk) -> u64 {
     total
 }
 
-fn cbt_path(p: &Partition) -> std::path::PathBuf {
-    Path::new(crate::state::STATE_DIR).join("cbt").join(format!("{}.cbt", p.fs_uuid))
+/// Where the CBT table of a volume is kept, and what ties it to the volume. A table is used only
+/// for the same server and task, the same image on the server (a disk keeps its image, see
+/// `state::image_names`), the same partition and the same filesystem: applied to another volume
+/// it would mark as unchanged blocks that the server then takes from a different base.
+pub struct Table {
+    pub path: PathBuf,
+    pub owner: String,
+    /// Table of agent 0.2.13 and earlier (`cbt/<fs uuid>.cbt`, without owner): removed after the
+    /// next backup.
+    legacy: PathBuf,
+    /// The legacy table may be the base: no other volume of this backup has the same filesystem
+    /// UUID and the disk has a stable id, so its image is the one it was saved for.
+    legacy_ok: bool,
+    /// The file the base table was read from.
+    loaded: Option<PathBuf>,
+}
+
+/// The tables of `volume_parts`, for task `task_uuid` of server `ds_id`.
+fn tables(ds_id: &str, task_uuid: &str, disks: &[(Disk, Vec<Interval>)], volume_parts: &[Partition]) -> Vec<Table> {
+    let dir = Path::new(crate::state::STATE_DIR).join("cbt");
+    (0..volume_parts.len())
+        .map(|v| {
+            let p = &volume_parts[v];
+            let d = disks
+                .iter()
+                .find(|(_, iv)| iv.iter().any(|i| i.source == Source::Vol(v)))
+                .map(|(d, _)| d)
+                .expect("every volume is on a disk");
+            let key = format!("{}-p{}-{}", d.image, p.number, p.fs_uuid);
+            let unique = volume_parts.iter().filter(|q| q.fs_uuid == p.fs_uuid).count() == 1;
+            Table {
+                path: dir.join(format!("{key}.cbt")),
+                owner: format!("{ds_id}/{task_uuid}/{key}"),
+                legacy: dir.join(format!("{}.cbt", p.fs_uuid)),
+                legacy_ok: unique && disk::stable_id(&d.name).is_some(),
+                loaded: None,
+            }
+        })
+        .collect()
+}
+
+/// Why a saved table cannot be the base of this backup (`None` if it can): it must belong to
+/// `owner` (empty for a legacy table), to `base_version_id` and to a partition at `offset`.
+fn table_mismatch(meta: &CbtMeta, base_version_id: u64, offset: u64, owner: &str) -> Option<String> {
+    if meta.owner != owner {
+        return Some(if meta.owner.is_empty() { "has no owner".into() } else { format!("belongs to {}", meta.owner) });
+    }
+    if meta.version_id != base_version_id {
+        return Some(format!("is from version {} (base {base_version_id})", meta.version_id));
+    }
+    if meta.partition_offset != offset {
+        return Some(format!("is for a partition at offset {}", meta.partition_offset));
+    }
+    None
 }
 
 /// On btrfs the CBT tables live in a subvolume of their own, left out of the images: they are
 /// rewritten after every backup (a hundred MB on a 1 TB disk) and would otherwise be sent again
 /// each time. Turns an existing directory into a subvolume. Returns its path if it is one.
-pub fn cbt_subvolume() -> Option<std::path::PathBuf> {
+pub fn cbt_subvolume() -> Option<PathBuf> {
     use std::os::unix::fs::MetadataExt;
     const BTRFS_SUPER_MAGIC: i64 = 0x9123_683e;
     let state = Path::new(crate::state::STATE_DIR);
@@ -410,24 +491,40 @@ pub fn cbt_subvolume() -> Option<std::path::PathBuf> {
     if unsafe { libc::statfs(c.as_ptr(), &mut st) } != 0 || st.f_type as i64 != BTRFS_SUPER_MAGIC {
         return None;
     }
+    let is_subvol = |p: &Path| std::fs::metadata(p).is_ok_and(|m| m.ino() == 256);
+    if let Err(e) = finish_swap(state, is_subvol) {
+        eprintln!("CBT subvolume: {e}");
+        return None;
+    }
     match std::fs::metadata(&dir) {
         Ok(m) if m.ino() == 256 => return Some(dir),
         Ok(_) => {
             let new = state.join("cbt.new");
-            if std::fs::metadata(&new).is_ok_and(|m| m.ino() == 256) {
+            if is_subvol(&new) {
                 let _ = btrfs_image::snapshot::destroy(state, "cbt.new");
             }
             btrfs_image::snapshot::create_subvolume(state, "cbt.new").map_err(|e| eprintln!("CBT subvolume: {e}")).ok()?;
-            // Files cannot be renamed across subvolumes: copied, then removed.
+            // Files cannot be renamed across subvolumes: copied and synced, then the directory is
+            // moved aside, the copy put in its place, and the old directory removed. A crash at
+            // any point is completed or undone by `finish_swap`.
             let moved = (|| -> std::io::Result<()> {
                 for e in std::fs::read_dir(&dir)?.flatten() {
                     std::fs::copy(e.path(), new.join(e.file_name()))?;
                 }
-                std::fs::remove_dir_all(&dir)?;
-                std::fs::rename(&new, &dir)
+                let f = std::fs::File::open(&new)?;
+                if unsafe { libc::syncfs(std::os::fd::AsRawFd::as_raw_fd(&f)) } != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                std::fs::rename(&dir, state.join("cbt.old"))?;
+                std::fs::rename(&new, &dir)?;
+                std::fs::File::open(state)?.sync_all()?;
+                std::fs::remove_dir_all(state.join("cbt.old"))
             })();
             if let Err(e) = moved {
                 eprintln!("CBT subvolume: {e}");
+                if !dir.exists() {
+                    let _ = std::fs::rename(state.join("cbt.old"), &dir);
+                }
                 let _ = btrfs_image::snapshot::destroy(state, "cbt.new");
                 return None;
             }
@@ -437,25 +534,55 @@ pub fn cbt_subvolume() -> Option<std::path::PathBuf> {
     Some(dir)
 }
 
+/// Completes a conversion of `cbt` into a subvolume interrupted by a crash: `cbt` moved aside
+/// to `cbt.old` means the copy in `cbt.new` is complete and takes its place; a `cbt.old` left
+/// next to `cbt` is removed. (A `cbt.new` next to `cbt` is an unfinished copy: started again.)
+fn finish_swap(state: &Path, is_subvol: impl Fn(&Path) -> bool) -> std::io::Result<()> {
+    let (dir, new, old) = (state.join("cbt"), state.join("cbt.new"), state.join("cbt.old"));
+    if !dir.exists() && old.exists() {
+        if is_subvol(&new) {
+            std::fs::rename(&new, &dir)?;
+        } else {
+            std::fs::rename(&old, &dir)?;
+        }
+    }
+    if old.exists() {
+        std::fs::remove_dir_all(&old)?;
+    }
+    Ok(())
+}
+
 /// CBT tables of the previous backup, by volume: `None` for a volume whose table does not match
-/// `base_version_id` (a new disk or volume), which is sent in full within the incremental.
-/// `None` overall when no volume has one: a full backup.
-fn previous_digests(volumes: &[Partition], base_version_id: u64) -> Option<Vec<Option<Digests>>> {
-    if base_version_id == 0 || volumes.is_empty() {
+/// `base_version_id` or the volume (a new disk or volume), which is sent in full within the
+/// incremental. `None` overall when no volume has one: a full backup.
+fn previous_digests(volume_parts: &[Partition], tables: &mut [Table], base_version_id: u64) -> Option<Vec<Option<Digests>>> {
+    if base_version_id == 0 || volume_parts.is_empty() {
         return None;
     }
-    let out: Vec<Option<Digests>> = volumes
+    let out: Vec<Option<Digests>> = volume_parts
         .iter()
-        .map(|p| match Digests::load(&cbt_path(p)) {
-            Ok((d, meta)) if meta.version_id == base_version_id && meta.partition_offset == p.offset => Some(d),
-            Ok((_, meta)) => {
-                eprintln!("{}: CBT table is from version {} (base {base_version_id}): sent in full", alias(p), meta.version_id);
-                None
+        .zip(tables.iter_mut())
+        .map(|(p, t)| {
+            let mut candidates = vec![(t.path.clone(), t.owner.as_str())];
+            if t.legacy_ok && !t.path.exists() {
+                candidates.push((t.legacy.clone(), ""));
             }
-            Err(e) => {
-                eprintln!("{}: no CBT table ({e}): sent in full", alias(p));
-                None
+            let mut why = "no CBT table".to_string();
+            for (path, owner) in candidates {
+                match Digests::load(&path) {
+                    Ok((d, meta)) => match table_mismatch(&meta, base_version_id, p.offset, owner) {
+                        None => {
+                            t.loaded = Some(path);
+                            return Some(d);
+                        }
+                        Some(m) => why = format!("CBT table {m}"),
+                    },
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => why = format!("CBT table: {e}"),
+                }
             }
+            eprintln!("{}: {why}: sent in full", alias(p));
+            None
         })
         .collect();
     out.iter().any(Option::is_some).then_some(out)
@@ -561,6 +688,10 @@ fn scan_disks(sel: &Selection) -> Result<(Scan, bool)> {
         };
         let mut parts = Vec::new();
         let iv = plan(&d, &mut parts, sel);
+        for p in unsupported(&d, &iv) {
+            let why = unreadable(p).map_or_else(|| format!("{} not supported", p.fs.name()), str::to_string);
+            eprintln!("{}: left out ({why}): partial backup", alias(p));
+        }
         let wanted = *sel == Selection::WholeDevice
             || iv.iter().any(|i| i.part.is_some() && !matches!(i.source, Source::Excluded(_)));
         if !wanted {
@@ -615,10 +746,11 @@ fn remove_stale_snapshots(volume_parts: &[Partition]) {
     }
 }
 
-/// At service startup: deletes leftover snapshots (interrupted backups, freshly restored
-/// system), if no backup is running.
+/// At service startup: thaws filesystems an interrupted backup left frozen and deletes leftover
+/// snapshots (interrupted backups, freshly restored system), if no backup is running.
 pub fn startup_cleanup() {
     let Ok(Some(_lock)) = flock(LOCK, true, false) else { return };
+    crate::volume::thaw_leftovers();
     match scan_disks(&Selection::WholeDevice) {
         Ok(((_, parts), _)) => remove_stale_snapshots(&parts),
         Err(e) => eprintln!("cleaning up leftover snapshots: {e}"),
@@ -638,6 +770,8 @@ pub fn run(sess: &Session, trigger: Trigger) -> Result<()> {
         }
         _shared.push(flock(l, false, true)?);
     }
+    // A backup killed while a filesystem was frozen (no service restart since).
+    crate::volume::thaw_leftovers();
 
     crate::hooks::on_start();
     let started = now();
@@ -682,8 +816,9 @@ fn run_locked(sess: &Session, trigger: Trigger) -> Result<()> {
         vec![("subaction", Value::str("get_base_version")), ("task_id", Value::Int(task_id))],
     )?;
     let base_version_id = get_int(&base, "base_version_id")?;
-    let prev = previous_digests(&volume_parts, base_version_id);
-    let raws = stream::RawTables::load(&disks, base_version_id);
+    let mut tables = tables(&sess.state.ds_id, &task.uuid, &disks, &volume_parts);
+    let prev = previous_digests(&volume_parts, &mut tables, base_version_id);
+    let raws = stream::RawTables::load(&disks, base_version_id, &format!("{}/{}", sess.state.ds_id, task.uuid));
     let is_cbt = prev.is_some() as u64;
     let (rt, upd) = match trigger {
         Trigger::Server(rt) => {
@@ -748,8 +883,22 @@ fn run_locked(sess: &Session, trigger: Trigger) -> Result<()> {
         format!("full · version {version_id}")
     });
 
-    let outcome = run_inner(&job, &mut c, &task, start_time, &disks, &volume_parts, prev.as_deref(), &raws, version_id)
-        .map(|complete| complete && !missed);
+    let check_complete = |status: &str| -> Result<()> {
+        let mut c = sess.connect()?;
+        sess.call(
+            &mut c,
+            "backup",
+            vec![
+                ("subaction", Value::str("check_complete")),
+                ("is_cbt", Value::Int(is_cbt)),
+                ("result_id", Value::Int(result_id)),
+                ("running_task_id", Value::Int(rt.running_task_id)),
+                ("status", Value::str(status)),
+            ],
+        )?;
+        Ok(())
+    };
+    let outcome = run_inner(&job, &mut c, &task, start_time, &disks, &volume_parts, &tables, prev.as_deref(), &raws, version_id, missed, &check_complete);
     let status = match &outcome {
         Ok(true) => "complete",
         Ok(false) => "partial",
@@ -761,26 +910,31 @@ fn run_locked(sess: &Session, trigger: Trigger) -> Result<()> {
     if let Err(e) = &outcome {
         eprintln!("backup failed: {e}");
     }
+    // A successful backup is final only once the server confirmed it (`check_complete` in
+    // `run_inner`): until then neither the result nor the CBT tables change.
     last.end = now();
     last.status = status.into();
     if outcome.is_ok() {
         last.last_ok_start = start_time;
     }
-    let _ = last.save();
-    let mut c = sess.connect()?;
-    sess.call(
-        &mut c,
-        "backup",
-        vec![
-            ("subaction", Value::str("check_complete")),
-            ("is_cbt", Value::Int(is_cbt)),
-            ("result_id", Value::Int(result_id)),
-            ("running_task_id", Value::Int(rt.running_task_id)),
-            ("status", Value::str(status)),
-        ],
-    )?;
+    if let Err(e) = last.save() {
+        eprintln!("saving the result: {e}");
+    }
+    if outcome.is_err()
+        && let Err(e) = check_complete(status)
+    {
+        eprintln!("check_complete: {e}");
+    }
     eprintln!("backup finished: {status}");
     outcome.map(|_| ())
+}
+
+/// The server's result says it did not store the version. Only failures count: before
+/// `check_complete` the result of a version still being written has no final status yet (its
+/// value then is not documented), so anything else, empty included, cannot be read as a refusal;
+/// `check_complete` is what confirms the version.
+fn rejected(status: &str) -> bool {
+    ["fail", "error", "cancel"].iter().any(|f| status.starts_with(f))
 }
 
 /// The server answers the stream's `close` even when it failed to store it (it drains the
@@ -788,7 +942,7 @@ fn run_locked(sess: &Session, trigger: Trigger) -> Result<()> {
 fn server_accepted(job: &Job, c: &mut Connection) -> Result<()> {
     let r = job.sess.call(c, "get_running_task_result", vec![("result_id", Value::Int(job.result_id))])?;
     let status = r.get("running_task_result").and_then(|t| t.get("status")).and_then(Value::as_str).unwrap_or("");
-    if ["fail", "error", "cancel"].iter().any(|f| status.starts_with(f)) {
+    if rejected(status) {
         return Err(Error::Protocol(format!("the server did not store the version (status {status}): see its log in the ABB console")));
     }
     Ok(())
@@ -821,9 +975,12 @@ fn run_inner(
     start_time: u64,
     disks: &[(Disk, Vec<Interval>)],
     volume_parts: &[Partition],
+    tables: &[Table],
     prev: Option<&[Option<Digests>]>,
     raws: &stream::RawTables,
     version_id: u64,
+    missed: bool,
+    check_complete: &dyn Fn(&str) -> Result<()>,
 ) -> Result<bool> {
     let sess = job.sess;
     job.log(c, LOG_DEVICE_INFO, None);
@@ -852,10 +1009,11 @@ fn run_inner(
     }
     // ext: blocks of unchanged files need not be read again.
     if let Some(prev) = prev {
-        for ((p, v), _) in volume_parts.iter().zip(volumes.iter_mut()).zip(prev).filter(|((p, _), old)| matches!(p.fs, Fs::Ext(_)) && old.is_some()) {
+        for (((p, v), _), t) in volume_parts.iter().zip(volumes.iter_mut()).zip(prev).zip(tables).filter(|(((p, _), old), _)| matches!(p.fs, Fs::Ext(_)) && old.is_some()) {
             // The CBT table of this volume belongs to the base version (checked when loaded).
-            let Ok((_, meta)) = Digests::load(&cbt_path(p)) else { continue };
-            if let Some(sigs) = crate::volume::load_inodes(&cbt_path(p).with_extension("inodes"), meta.version_id) {
+            let Some(src) = &t.loaded else { continue };
+            let Ok((_, meta)) = Digests::load(src) else { continue };
+            if let Some(sigs) = crate::volume::load_inodes(&src.with_extension("inodes"), meta.version_id) {
                 let n = v.plan_skip(&sigs);
                 eprintln!("{}: {n} blocks of 64 KiB belong to unchanged files, not read", alias(p));
             }
@@ -863,6 +1021,14 @@ fn run_inner(
     }
     let snapshot_time = t.elapsed();
     let result = (|| -> Result<bool> {
+        // vfat partitions in use, copied as they are: their digest before anything is read and
+        // after everything is, to tell whether the copy is consistent.
+        let live: Vec<(&Disk, &Partition)> = disks
+            .iter()
+            .flat_map(|(d, iv)| iv.iter().filter(|i| i.source == Source::Raw).filter_map(move |i| Some((d, i.part.as_ref()?))))
+            .filter(|(_, p)| p.fs == Fs::Vfat && p.in_use())
+            .collect();
+        let before = live.iter().map(|(d, p)| partition_digest(d, p)).collect::<Result<Vec<u64>>>()?;
         let used: Vec<u64> = disks.iter().map(|(d, iv)| used_estimate(iv, &volumes, d)).collect();
         let mut plans: Vec<Vec<Piece>> = disks
             .iter()
@@ -905,21 +1071,36 @@ fn run_inner(
         job.log(c, LOG_UPLOAD_SPEC_DONE, None);
 
         stream::upload(job, c, disks, &plans, &volumes, prev, snapshot_time, (task.compression, task.encryption), raws)?;
+        let mut consistent = true;
+        for ((d, p), h) in live.iter().zip(before) {
+            if partition_digest(d, p)? != h {
+                eprintln!("{}: changed while the backup read it (vfat cannot be frozen): its copy may be inconsistent, partial backup", alias(p));
+                consistent = false;
+            }
+        }
         server_accepted(job, c)?;
-        raws.save(disks, version_id);
         for (p, v) in volume_parts.iter().zip(&volumes) {
             if let Some(n) = v.changed_while_read().filter(|&n| n > 0) {
-                eprintln!("{}: {n} files changed while the backup read them: their content in this version may be inconsistent, the next backup reads them again", alias(p));
+                eprintln!("{}: {n} files changed while the backup read them: their content in this version may be inconsistent (partial backup), the next backup reads them again", alias(p));
+                consistent = false;
             }
         }
-        // The version is on the server: the digests become the base for the next incremental.
-        for (p, v) in volume_parts.iter().zip(&volumes) {
-            let path = cbt_path(p);
-            if let Err(e) = std::fs::create_dir_all(path.parent().unwrap()).and_then(|_| v.save_digests(&path, version_id, p.offset)) {
-                eprintln!("saving CBT for {}: {e}", alias(p));
+        let complete = !missed
+            && consistent
+            && disks.iter().all(|(d, iv)| unsupported(d, iv).is_empty())
+            && volumes.iter().all(|v| !v.incomplete());
+        check_complete(if complete { "complete" } else { "partial" })?;
+        // The server took the version: the digests become the base for the next incremental.
+        raws.save(disks, version_id);
+        for ((p, v), t) in volume_parts.iter().zip(&volumes).zip(tables) {
+            match std::fs::create_dir_all(t.path.parent().unwrap()).and_then(|_| v.save_digests(&t.path, version_id, p.offset, &t.owner)) {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(&t.legacy);
+                    let _ = std::fs::remove_file(t.legacy.with_extension("inodes"));
+                }
+                Err(e) => eprintln!("saving CBT for {}: {e}", alias(p)),
             }
         }
-        let complete = disks.iter().all(|(d, iv)| unsupported(d, iv).is_empty()) && volumes.iter().all(|v| !v.incomplete());
         Ok(complete)
     })();
     volumes.into_iter().for_each(Vol::cleanup);
@@ -929,6 +1110,8 @@ fn run_inner(
 /// Offline test: prepares the disks' volumes, then reads, reassembles, verifies and compresses
 /// everything a full backup would send, and reports the timings.
 pub fn bench(names: Vec<String>, limit: Option<u64>, image: Option<&str>) -> Result<()> {
+    // It takes snapshots and may freeze filesystems like a backup: not at the same time as one.
+    let _lock = flock(LOCK, true, false)?;
     let mut disks = Vec::new();
     let mut volume_parts = Vec::new();
     for n in names {
@@ -956,4 +1139,145 @@ pub fn bench(names: Vec<String>, limit: Option<u64>, image: Option<&str>) -> Res
         raw as f64 / MIB as f64 / s
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn part(name: &str, number: u32, offset: u64, fs: Fs, uuid: &str) -> Partition {
+        Partition {
+            name: name.into(),
+            number,
+            offset,
+            length: 1 << 30,
+            type_guid: String::new(),
+            fs,
+            fs_uuid: uuid.into(),
+            mount_path: String::new(),
+            mounts: vec![],
+            read_only: true,
+            busy: false,
+        }
+    }
+
+    fn disk(name: &str, parts: Vec<Partition>) -> Disk {
+        Disk { name: name.into(), image: name.into(), size: 4 << 30, sector_size: 512, layout: "GPT".into(), partitions: parts }
+    }
+
+    #[test]
+    fn partitions_in_use_are_copied_only_if_consistent() {
+        let mut esp = part("zzsda1", 1, 1 << 20, Fs::Vfat, "AB-CD");
+        let mut ntfs = part("zzsda2", 2, 2 << 20, Fs::None, "");
+        let mut ext = part("zzsda3", 3, 3 << 20, Fs::Ext(4), "u");
+        let d = disk("zzsda", vec![esp.clone(), ntfs.clone(), ext.clone()]);
+        let sources = |d: &Disk| plan(d, &mut Vec::new(), &Selection::WholeDevice).iter().filter(|i| i.part.is_some()).map(|i| i.source).collect::<Vec<_>>();
+        // Unmounted: copied raw, ext as a volume.
+        assert_eq!(sources(&d), [Source::Raw, Source::Raw, Source::Vol(0)]);
+        // Mounted read-write: vfat still copied (checked afterwards), the unknown filesystem left
+        // out; held by the kernel elsewhere: the same, and ext cannot be frozen.
+        (esp.mount_path, esp.read_only) = ("/boot".into(), false);
+        (ntfs.mount_path, ntfs.read_only) = ("/data".into(), false);
+        ext.busy = true;
+        let d = disk("zzsda", vec![esp.clone(), ntfs.clone(), ext.clone()]);
+        assert_eq!(sources(&d), [Source::Raw, Source::Excluded(Skip::Unsupported), Source::Excluded(Skip::Unsupported)]);
+        // Mounted read-only: copied.
+        ntfs.read_only = true;
+        let d = disk("zzsda", vec![esp, ntfs, ext]);
+        assert_eq!(sources(&d)[1], Source::Raw);
+    }
+
+    #[test]
+    fn last_read_of_each_volume() {
+        let d = disk("zzsda", vec![part("zzsda1", 1, 1 << 20, Fs::Ext(4), "a"), part("zzsda2", 2, 3 << 20, Fs::Ext(4), "b")]);
+        let iv = vec![
+            Interval { start: 0, end: 1 << 20, kind: 3, part: None, source: Source::Raw },
+            Interval { start: 1 << 20, end: 3 << 20, kind: 1, part: Some(d.partitions[0].clone()), source: Source::Vol(0) },
+            Interval { start: 3 << 20, end: 4 << 20, kind: 1, part: Some(d.partitions[1].clone()), source: Source::Vol(1) },
+            Interval { start: 4 << 20, end: 5 << 20, kind: 1, part: None, source: Source::Vol(2) },
+        ];
+        let disks = vec![(d, iv)];
+        // The area before the volumes, volume 0 twice, then a piece across both volumes.
+        let jobs = vec![(0, 0, 1 << 20, None), (0, 1 << 20, 2 << 20, None), (0, 2 << 20, 3 << 20, None), (0, 0x2ff000, 0x301000, None)];
+        assert_eq!(stream::last_reads(&disks, &jobs, 3), [Some(3), Some(3), None]);
+        assert_eq!(stream::last_reads(&disks, &jobs[..3], 3), [Some(2), None, None]);
+    }
+
+    #[test]
+    fn interrupted_cbt_conversion() {
+        let state = std::env::temp_dir().join(format!("abb-cbtswap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state);
+        let put = |d: &str, f: &str| {
+            std::fs::create_dir_all(state.join(d)).unwrap();
+            std::fs::write(state.join(d).join(f), d).unwrap();
+        };
+        let subvol = |p: &Path| p.ends_with("cbt.new") && p.exists();
+        // Crash after the old directory was moved aside: the complete copy takes its place.
+        put("cbt.old", "a.cbt");
+        put("cbt.new", "a.cbt");
+        finish_swap(&state, subvol).unwrap();
+        assert_eq!(std::fs::read_to_string(state.join("cbt/a.cbt")).unwrap(), "cbt.new");
+        assert!(!state.join("cbt.old").exists() && !state.join("cbt.new").exists());
+        // Crash while removing the old directory.
+        put("cbt.old", "a.cbt");
+        finish_swap(&state, subvol).unwrap();
+        assert!(!state.join("cbt.old").exists() && state.join("cbt/a.cbt").exists());
+        // Moved aside but no copy: put back.
+        std::fs::rename(state.join("cbt"), state.join("cbt.old")).unwrap();
+        finish_swap(&state, subvol).unwrap();
+        assert_eq!(std::fs::read_to_string(state.join("cbt/a.cbt")).unwrap(), "cbt.new");
+        std::fs::remove_dir_all(&state).unwrap();
+    }
+
+    #[test]
+    fn server_refusals() {
+        for s in ["failure", "fail", "error", "cancel", "canceled"] {
+            assert!(rejected(s), "{s}");
+        }
+        for s in ["", "complete", "partial", "success", "running", "backing_up"] {
+            assert!(!rejected(s), "{s}");
+        }
+    }
+
+    #[test]
+    fn cbt_table_must_match_owner_version_and_offset() {
+        let d = Digests::from_table(vec![1, 2]);
+        let meta = CbtMeta::new(7, 0, 1 << 20, &d).owned("ds/task/vda-p2-u");
+        assert_eq!(table_mismatch(&meta, 7, 1 << 20, "ds/task/vda-p2-u"), None);
+        // Another image (disks renamed), another server or task, a legacy table.
+        assert!(table_mismatch(&meta, 7, 1 << 20, "ds/task/vdb-p2-u").is_some());
+        assert!(table_mismatch(&meta, 7, 1 << 20, "ds2/task/vda-p2-u").is_some());
+        assert!(table_mismatch(&CbtMeta::new(7, 0, 1 << 20, &d), 7, 1 << 20, "ds/task/vda-p2-u").is_some());
+        assert_eq!(table_mismatch(&CbtMeta::new(7, 0, 1 << 20, &d), 7, 1 << 20, ""), None);
+        assert!(table_mismatch(&meta, 8, 1 << 20, "ds/task/vda-p2-u").is_some());
+        assert!(table_mismatch(&meta, 7, 2 << 20, "ds/task/vda-p2-u").is_some());
+    }
+
+    #[test]
+    fn clones_with_the_same_uuid_get_tables_of_their_own() {
+        let mut disks = Vec::new();
+        let mut parts = Vec::new();
+        for name in ["zzvda", "zzvdb"] {
+            let d = disk(name, vec![part(&format!("{name}2"), 2, 1 << 20, Fs::Ext(4), "same")]);
+            let mut mine = Vec::new();
+            let iv: Vec<Interval> = plan(&d, &mut mine, &Selection::WholeDevice)
+                .into_iter()
+                .map(|mut i| {
+                    if let Source::Vol(v) = i.source {
+                        i.source = Source::Vol(parts.len() + v);
+                    }
+                    i
+                })
+                .collect();
+            parts.extend(mine);
+            disks.push((d, iv));
+        }
+        let t = tables("ds", "task", &disks, &parts);
+        assert_eq!(t.len(), 2);
+        assert_ne!(t[0].path, t[1].path);
+        assert_eq!(t[0].owner, "ds/task/zzvda-p2-same");
+        assert_eq!(t[1].owner, "ds/task/zzvdb-p2-same");
+        // The legacy table (by UUID only) could belong to either: never used.
+        assert!(!t[0].legacy_ok && !t[1].legacy_ok);
+    }
 }
