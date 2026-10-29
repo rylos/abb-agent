@@ -22,6 +22,12 @@ const TAG_END: u8 = 0x40;
 const TAG_ARRAY: u8 = 0x41;
 const TAG_MAP: u8 = 0x42;
 
+/// Deepest nesting of arrays and maps accepted in a message.
+pub const MAX_DEPTH: usize = 64;
+/// Largest message accepted from a stream: the biggest legitimate ones carry 32 MiB of file
+/// data (file restore), plus LZ4 overhead and their other fields.
+pub const MAX_MESSAGE: usize = 64 << 20;
+
 #[derive(Clone, PartialEq, Eq)]
 pub enum Value {
     Null,
@@ -43,6 +49,7 @@ pub enum DecodeError {
     BadIntWidth { width: u8, offset: usize },
     BadNullLength { width: u8, offset: usize },
     KeyNotString { offset: usize },
+    TooDeep { offset: usize },
 }
 
 impl fmt::Display for DecodeError {
@@ -57,6 +64,7 @@ impl fmt::Display for DecodeError {
                 write!(f, "null with length {width} (expected 0) at offset {offset}")
             }
             Self::KeyNotString { offset } => write!(f, "non-string map key at offset {offset}"),
+            Self::TooDeep { offset } => write!(f, "more than {MAX_DEPTH} nested arrays or maps at offset {offset}"),
         }
     }
 }
@@ -94,7 +102,9 @@ impl Value {
         }
     }
 
-    pub fn encode(&self, out: &mut Vec<u8>) {
+    /// Appends the encoding; a string longer than 64 KiB or a buffer longer than 4 GiB has no
+    /// encoding and is an error.
+    pub fn encode(&self, out: &mut Vec<u8>) -> io::Result<()> {
         match self {
             Value::Null => out.extend_from_slice(&[TAG_NULL, 0]),
             Value::Int(n) => {
@@ -109,126 +119,166 @@ impl Value {
                 out.push(width as u8);
                 out.extend_from_slice(&bytes[8 - width..]);
             }
-            Value::String(s) => encode_string(s, out),
+            Value::String(s) => encode_string(s, out)?,
             Value::Buffer(b) => {
+                let len = u32::try_from(b.len()).map_err(|_| too_long("buffer", b.len()))?;
                 out.push(TAG_BUFFER);
-                out.extend_from_slice(&(b.len() as u32).to_be_bytes());
+                out.extend_from_slice(&len.to_be_bytes());
                 out.extend_from_slice(b);
             }
             Value::Array(items) => {
                 out.push(TAG_ARRAY);
                 for item in items {
-                    item.encode(out);
+                    item.encode(out)?;
                 }
                 out.push(TAG_END);
             }
             Value::Map(entries) => {
                 out.push(TAG_MAP);
                 for (k, v) in entries {
-                    encode_string(k.as_bytes(), out);
-                    v.encode(out);
+                    encode_string(k.as_bytes(), out)?;
+                    v.encode(out)?;
                 }
                 out.push(TAG_END);
             }
         }
+        Ok(())
     }
 
-    pub fn to_bytes(&self) -> Vec<u8> {
+    pub fn to_bytes(&self) -> io::Result<Vec<u8>> {
         let mut out = Vec::new();
-        self.encode(&mut out);
-        out
+        self.encode(&mut out)?;
+        Ok(out)
     }
 
-    /// Reads a complete PObject from a stream (messages have no framing).
+    /// Reads a complete PObject from a stream (messages have no framing). Messages larger than
+    /// [`MAX_MESSAGE`] or nested deeper than [`MAX_DEPTH`] are refused, and a length is not
+    /// trusted for an allocation before its bytes arrive.
     pub fn read_from(r: &mut impl Read) -> io::Result<Value> {
-        let tag = read_u8(r)?;
-        read_with_tag(r, tag)
+        let mut s = Stream { r, left: MAX_MESSAGE };
+        let tag = s.u8()?;
+        s.value(tag, 0)
     }
 
     /// Decodes a PObject from the start of `buf`; returns the value and the bytes consumed.
     pub fn decode(buf: &[u8]) -> Result<(Value, usize), DecodeError> {
-        let mut d = Decoder { buf, pos: 0 };
+        let mut d = Decoder { buf, pos: 0, depth: 0 };
         let v = d.value()?;
         Ok((v, d.pos))
     }
-}
-
-fn read_u8(r: &mut impl Read) -> io::Result<u8> {
-    let mut b = [0u8; 1];
-    r.read_exact(&mut b)?;
-    Ok(b[0])
-}
-
-fn read_vec(r: &mut impl Read, len: usize) -> io::Result<Vec<u8>> {
-    let mut v = vec![0u8; len];
-    r.read_exact(&mut v)?;
-    Ok(v)
 }
 
 fn bad(msg: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg)
 }
 
-fn read_with_tag(r: &mut impl Read, tag: u8) -> io::Result<Value> {
-    Ok(match tag {
-        TAG_NULL => match read_u8(r)? {
-            0 => Value::Null,
-            n => return Err(bad(format!("null with length {n}"))),
-        },
-        TAG_INT => {
-            let width = read_u8(r)?;
-            if !matches!(width, 1 | 2 | 4 | 8) {
-                return Err(bad(format!("integer width {width}")));
-            }
-            Value::Int(read_vec(r, width as usize)?.iter().fold(0u64, |n, &b| n << 8 | b as u64))
-        }
-        TAG_STRING => {
-            let mut l = [0u8; 2];
-            r.read_exact(&mut l)?;
-            Value::String(read_vec(r, u16::from_be_bytes(l) as usize)?)
-        }
-        TAG_BUFFER => {
-            let mut l = [0u8; 4];
-            r.read_exact(&mut l)?;
-            Value::Buffer(read_vec(r, u32::from_be_bytes(l) as usize)?)
-        }
-        TAG_ARRAY => {
-            let mut items = Vec::new();
-            loop {
-                match read_u8(r)? {
-                    TAG_END => break,
-                    t => items.push(read_with_tag(r, t)?),
-                }
-            }
-            Value::Array(items)
-        }
-        TAG_MAP => {
-            let mut entries = Vec::new();
-            loop {
-                match read_u8(r)? {
-                    TAG_END => break,
-                    TAG_STRING => {
-                        let Value::String(k) = read_with_tag(r, TAG_STRING)? else { unreachable!() };
-                        entries.push((String::from_utf8_lossy(&k).into_owned(), Value::read_from(r)?));
-                    }
-                    t => return Err(bad(format!("map key with tag 0x{t:02x}"))),
-                }
-            }
-            Value::Map(entries)
-        }
-        t => return Err(bad(format!("unknown tag 0x{t:02x}"))),
-    })
+fn too_long(what: &str, len: usize) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, format!("{what} of {len} bytes is too long to encode"))
 }
 
-fn encode_string(s: &[u8], out: &mut Vec<u8>) {
+/// A message being read, with the bytes it may still take.
+struct Stream<'a, R> {
+    r: &'a mut R,
+    left: usize,
+}
+
+impl<R: Read> Stream<'_, R> {
+    fn count(&mut self, n: usize) -> io::Result<()> {
+        self.left = self.left.checked_sub(n).ok_or_else(|| bad(format!("message larger than {} MiB", MAX_MESSAGE >> 20)))?;
+        Ok(())
+    }
+
+    fn array<const N: usize>(&mut self) -> io::Result<[u8; N]> {
+        self.count(N)?;
+        let mut b = [0u8; N];
+        self.r.read_exact(&mut b)?;
+        Ok(b)
+    }
+
+    fn u8(&mut self) -> io::Result<u8> {
+        Ok(self.array::<1>()?[0])
+    }
+
+    /// `len` bytes; a large buffer grows as its bytes arrive.
+    fn bytes(&mut self, len: usize) -> io::Result<Vec<u8>> {
+        self.count(len)?;
+        let mut v = Vec::with_capacity(len.min(64 << 10));
+        (&mut *self.r).take(len as u64).read_to_end(&mut v)?;
+        if v.len() < len {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        Ok(v)
+    }
+
+    fn value(&mut self, tag: u8, depth: usize) -> io::Result<Value> {
+        if matches!(tag, TAG_ARRAY | TAG_MAP) && depth >= MAX_DEPTH {
+            return Err(bad(format!("more than {MAX_DEPTH} nested arrays or maps")));
+        }
+        Ok(match tag {
+            TAG_NULL => match self.u8()? {
+                0 => Value::Null,
+                n => return Err(bad(format!("null with length {n}"))),
+            },
+            TAG_INT => {
+                let width = self.u8()?;
+                if !matches!(width, 1 | 2 | 4 | 8) {
+                    return Err(bad(format!("integer width {width}")));
+                }
+                Value::Int(self.bytes(width as usize)?.iter().fold(0u64, |n, &b| n << 8 | b as u64))
+            }
+            TAG_STRING => Value::String(self.string_body()?),
+            TAG_BUFFER => {
+                let len = u32::from_be_bytes(self.array()?);
+                Value::Buffer(self.bytes(len as usize)?)
+            }
+            TAG_ARRAY => {
+                let mut items = Vec::new();
+                loop {
+                    match self.u8()? {
+                        TAG_END => break,
+                        t => items.push(self.value(t, depth + 1)?),
+                    }
+                }
+                Value::Array(items)
+            }
+            TAG_MAP => {
+                let mut entries = Vec::new();
+                loop {
+                    match self.u8()? {
+                        TAG_END => break,
+                        TAG_STRING => {
+                            let k = self.string_body()?;
+                            let t = self.u8()?;
+                            entries.push((String::from_utf8_lossy(&k).into_owned(), self.value(t, depth + 1)?));
+                        }
+                        t => return Err(bad(format!("map key with tag 0x{t:02x}"))),
+                    }
+                }
+                Value::Map(entries)
+            }
+            t => return Err(bad(format!("unknown tag 0x{t:02x}"))),
+        })
+    }
+
+    fn string_body(&mut self) -> io::Result<Vec<u8>> {
+        let len = u16::from_be_bytes(self.array()?);
+        self.bytes(len as usize)
+    }
+}
+
+fn encode_string(s: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
+    let len = u16::try_from(s.len()).map_err(|_| too_long("string", s.len()))?;
     out.push(TAG_STRING);
-    out.extend_from_slice(&(s.len() as u16).to_be_bytes());
+    out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(s);
+    Ok(())
 }
 
 struct Decoder<'a> {
     buf: &'a [u8],
     pos: usize,
+    /// Arrays and maps open around the current value.
+    depth: usize,
 }
 
 impl Decoder<'_> {
@@ -250,6 +300,15 @@ impl Decoder<'_> {
     }
 
     fn value_with_tag(&mut self, tag: u8, at: usize) -> Result<Value, DecodeError> {
+        if matches!(tag, TAG_ARRAY | TAG_MAP) {
+            if self.depth >= MAX_DEPTH {
+                return Err(DecodeError::TooDeep { offset: at });
+            }
+            self.depth += 1;
+            let v = self.container(tag, at);
+            self.depth -= 1;
+            return v;
+        }
         Ok(match tag {
             TAG_NULL => match self.byte()? {
                 0 => Value::Null,
@@ -271,6 +330,12 @@ impl Decoder<'_> {
                 let len = u32::from_be_bytes(self.take(4)?.try_into().unwrap()) as usize;
                 Value::Buffer(self.take(len)?.to_vec())
             }
+            tag => return Err(DecodeError::BadTag { tag, offset: at }),
+        })
+    }
+
+    fn container(&mut self, tag: u8, at: usize) -> Result<Value, DecodeError> {
+        Ok(match tag {
             TAG_ARRAY => {
                 let mut items = Vec::new();
                 loop {
@@ -346,14 +411,14 @@ mod tests {
             ("buf", Value::Buffer(vec![1, 2, 3])),
             ("list", Value::Array(vec![Value::Null, Value::Int(1)])),
         ]);
-        let bytes = v.to_bytes();
+        let bytes = v.to_bytes().unwrap();
         assert_eq!(Value::decode(&bytes), Ok((v, bytes.len())));
     }
 
     #[test]
     fn int_widths() {
-        assert_eq!(Value::Int(5).to_bytes(), [0x01, 1, 5]);
-        assert_eq!(Value::Int(0x1234).to_bytes(), [0x01, 2, 0x12, 0x34]);
+        assert_eq!(Value::Int(5).to_bytes().unwrap(), [0x01, 1, 5]);
+        assert_eq!(Value::Int(0x1234).to_bytes().unwrap(), [0x01, 2, 0x12, 0x34]);
     }
 
     #[test]
@@ -361,15 +426,15 @@ mod tests {
         // As sent by abb-cli -c: "otp" → 00 00
         let bytes = [0x42, 0x10, 0, 3, b'o', b't', b'p', 0, 0, 0x40];
         let v = Value::map([("otp", Value::Null)]);
-        assert_eq!(v.to_bytes(), bytes);
+        assert_eq!(v.to_bytes().unwrap(), bytes);
         assert_eq!(Value::decode(&bytes), Ok((v, bytes.len())));
     }
 
     #[test]
     fn read_from_stream() {
         let v = Value::map([("a", Value::Array(vec![Value::Null, Value::str("x")])), ("b", Value::Buffer(vec![9; 3]))]);
-        let mut bytes = v.to_bytes();
-        bytes.extend(Value::Int(7).to_bytes());
+        let mut bytes = v.to_bytes().unwrap();
+        bytes.extend(Value::Int(7).to_bytes().unwrap());
         let mut cur = std::io::Cursor::new(bytes);
         assert_eq!(Value::read_from(&mut cur).unwrap(), v);
         assert_eq!(Value::read_from(&mut cur).unwrap(), Value::Int(7));
@@ -377,7 +442,61 @@ mod tests {
 
     #[test]
     fn incomplete() {
-        let bytes = Value::str("agent").to_bytes();
+        let bytes = Value::str("agent").to_bytes().unwrap();
         assert_eq!(Value::decode(&bytes[..3]), Err(DecodeError::Incomplete));
+    }
+
+    #[test]
+    fn nesting_limit() {
+        let nested = |n: usize| {
+            let mut b = vec![TAG_ARRAY; n];
+            b.extend(vec![TAG_END; n]);
+            b
+        };
+        let ok = nested(MAX_DEPTH);
+        assert!(Value::decode(&ok).is_ok());
+        assert!(Value::read_from(&mut std::io::Cursor::new(&ok)).is_ok());
+        // Used to overflow the stack and abort the process.
+        let deep = vec![TAG_ARRAY; 200_000];
+        assert_eq!(Value::decode(&deep), Err(DecodeError::TooDeep { offset: MAX_DEPTH }));
+        let e = Value::read_from(&mut std::io::Cursor::new(&deep)).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+        let mut map = vec![TAG_MAP];
+        for _ in 0..100 {
+            map.extend([TAG_STRING, 0, 1, b'k', TAG_MAP]);
+        }
+        assert!(Value::read_from(&mut std::io::Cursor::new(&map)).is_err());
+    }
+
+    #[test]
+    fn size_limit() {
+        // A length larger than the message: refused before any allocation.
+        let mut huge = vec![TAG_BUFFER];
+        huge.extend(u32::MAX.to_be_bytes());
+        let e = Value::read_from(&mut std::io::Cursor::new(&huge)).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+        // Within the limit but the stream ends early: no allocation of the announced length.
+        let mut short = vec![TAG_BUFFER];
+        short.extend(((MAX_MESSAGE - 5) as u32).to_be_bytes());
+        short.extend([1, 2, 3]);
+        let e = Value::read_from(&mut std::io::Cursor::new(&short)).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::UnexpectedEof);
+        // Many fields together count too.
+        let piece = Value::Buffer(vec![0; 16 << 20]);
+        let big = Value::Array(vec![piece.clone(), piece.clone(), piece]).to_bytes().unwrap();
+        assert!(Value::read_from(&mut std::io::Cursor::new(&big)).is_ok());
+        let piece = Value::Buffer(vec![0; 22 << 20]);
+        let over = Value::Array(vec![piece.clone(), piece.clone(), piece]).to_bytes().unwrap();
+        assert_eq!(Value::read_from(&mut std::io::Cursor::new(&over)).unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn oversize_encode() {
+        let long = Value::String(vec![b'x'; 0x1_0000]);
+        assert_eq!(long.to_bytes().unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+        let key = Value::Map(vec![("k".repeat(0x1_0000), Value::Null)]);
+        assert!(key.to_bytes().is_err());
+        assert!(Value::Array(vec![Value::Null, long]).to_bytes().is_err());
+        assert_eq!(Value::String(vec![b'x'; 0xffff]).to_bytes().unwrap().len(), 3 + 0xffff);
     }
 }
