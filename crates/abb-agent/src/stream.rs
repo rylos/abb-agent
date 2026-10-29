@@ -375,7 +375,7 @@ fn parallel_ordered<T: Send, R>(
 }
 
 /// Data jobs of the plan: (disk, start, end, check).
-type DataJob = (usize, u64, u64, Option<Check>);
+pub(crate) type DataJob = (usize, u64, u64, Option<Check>);
 
 fn data_jobs(plans: &[Vec<Piece>]) -> Vec<DataJob> {
     plans
@@ -419,6 +419,19 @@ fn produce(
     Ok(Ready { packed, len, unchanged, read_time: t.elapsed() })
 }
 
+/// For each volume, the index of the last data job that reads from it (`None`: none does).
+pub(crate) fn last_reads(disks: &[(Disk, Vec<Interval>)], jobs: &[DataJob], nvolumes: usize) -> Vec<Option<usize>> {
+    let mut last = vec![None; nvolumes];
+    for (k, &(n, start, end, _)) in jobs.iter().enumerate() {
+        for i in disks[n].1.iter().filter(|i| i.start < end && i.end > start) {
+            if let Source::Vol(v) = i.source {
+                last[v] = Some(k);
+            }
+        }
+    }
+    last
+}
+
 fn open_devices(disks: &[(Disk, Vec<Interval>)]) -> Result<Vec<Device>> {
     Ok(disks.iter().map(|(d, _)| Device::open(&d.device())).collect::<std::io::Result<_>>()?)
 }
@@ -452,10 +465,19 @@ pub fn upload(
     if open.get("success").and_then(Value::as_int) != Some(1) {
         return Err(Error::Protocol(format!("upload_block rejected: {open:?}")));
     }
+    // Results come in order: once job k is delivered, every job up to k has been read.
+    let last = last_reads(disks, &jobs, volumes.len());
+    let read = |k: Option<usize>| {
+        for (v, l) in last.iter().enumerate() {
+            if l.is_none() || k.is_none() || *l == k {
+                volumes[v].release();
+            }
+        }
+    };
     parallel_ordered(
         jobs.len(),
         |i| produce(&devs, disks, volumes, prev, raws, compress, jobs[i]),
-        |next| send_stream(job, logc, &mut up, disks, plans, snapshot_time, compress, next),
+        |next| send_stream(job, logc, &mut up, disks, plans, snapshot_time, compress, next, &read),
     )
 }
 
@@ -540,8 +562,12 @@ fn send_stream(
     snapshot_time: Duration,
     compress: bool,
     next: &mut dyn FnMut() -> Result<Ready>,
+    read: &dyn Fn(Option<usize>),
 ) -> Result<()> {
     let t0 = Instant::now();
+    // Volumes nothing is read from are released now; the others after their last data job.
+    read(Some(usize::MAX));
+    let mut job_index = 0;
     RUNS_SENT.store(0, Ordering::Relaxed);
     let mut ctr = Counters::default();
     let mut first_perf = Some(snapshot_time);
@@ -572,6 +598,8 @@ fn send_stream(
                 }
                 Piece::Data { start, end, cbt, check } => {
                     let ready = next()?;
+                    read(Some(job_index));
+                    job_index += 1;
                     ctr.read_time += ready.read_time;
                     ctr.read_bytes += ready.len;
                     progress.done += ready.len;
@@ -631,6 +659,7 @@ fn send_stream(
             send_run(up, &image, &p)?;
         }
     }
+    read(None);
     up.send(&perf(&ctr, None))?;
     eprintln!("all pieces sent after {:.1}s ({blocks} with data, {runs} without), waiting for the server", t0.elapsed().as_secs_f64(), runs = RUNS_SENT.load(Ordering::Relaxed));
     crate::state::Progress { phase: "finishing".into(), done: progress.total, ..progress }.save();
@@ -644,7 +673,17 @@ fn send_stream(
     ));
     crate::ui::busy("the server is checking the version");
     up.send(&Value::map([("close", Value::Int(1))]))?;
-    up.set_read_timeout(Some(Duration::from_secs(3600)))?;
+    // The server checks the version before it answers (up to an hour seen as reasonable): a
+    // cancel or SIGTERM meanwhile still stops the backup.
+    let deadline = Instant::now() + Duration::from_secs(3600);
+    while !up.wait_readable(Duration::from_secs(1))? {
+        if crate::control::cancelled() {
+            return Err(Error::Protocol("backup cancelled".into()));
+        }
+        if Instant::now() > deadline {
+            return Err(Error::Protocol("the server did not answer the stream's close within an hour".into()));
+        }
+    }
     let r = up.recv()?;
     if r.get("close").and_then(Value::as_int) != Some(1) {
         return Err(Error::Protocol(format!("unexpected stream close: {r:?}")));

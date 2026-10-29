@@ -693,10 +693,11 @@ fn remove_stale_snapshots(volume_parts: &[Partition]) {
     }
 }
 
-/// At service startup: deletes leftover snapshots (interrupted backups, freshly restored
-/// system), if no backup is running.
+/// At service startup: thaws filesystems an interrupted backup left frozen and deletes leftover
+/// snapshots (interrupted backups, freshly restored system), if no backup is running.
 pub fn startup_cleanup() {
     let Ok(Some(_lock)) = flock(LOCK, true, false) else { return };
+    crate::volume::thaw_leftovers();
     match scan_disks(&Selection::WholeDevice) {
         Ok(((_, parts), _)) => remove_stale_snapshots(&parts),
         Err(e) => eprintln!("cleaning up leftover snapshots: {e}"),
@@ -716,6 +717,8 @@ pub fn run(sess: &Session, trigger: Trigger) -> Result<()> {
         }
         _shared.push(flock(l, false, true)?);
     }
+    // A backup killed while a filesystem was frozen (no service restart since).
+    crate::volume::thaw_leftovers();
 
     crate::hooks::on_start();
     let started = now();
@@ -1127,6 +1130,22 @@ mod tests {
         ntfs.read_only = true;
         let d = disk("zzsda", vec![esp, ntfs, ext]);
         assert_eq!(sources(&d)[1], Source::Raw);
+    }
+
+    #[test]
+    fn last_read_of_each_volume() {
+        let d = disk("zzsda", vec![part("zzsda1", 1, 1 << 20, Fs::Ext(4), "a"), part("zzsda2", 2, 3 << 20, Fs::Ext(4), "b")]);
+        let iv = vec![
+            Interval { start: 0, end: 1 << 20, kind: 3, part: None, source: Source::Raw },
+            Interval { start: 1 << 20, end: 3 << 20, kind: 1, part: Some(d.partitions[0].clone()), source: Source::Vol(0) },
+            Interval { start: 3 << 20, end: 4 << 20, kind: 1, part: Some(d.partitions[1].clone()), source: Source::Vol(1) },
+            Interval { start: 4 << 20, end: 5 << 20, kind: 1, part: None, source: Source::Vol(2) },
+        ];
+        let disks = vec![(d, iv)];
+        // The area before the volumes, volume 0 twice, then a piece across both volumes.
+        let jobs = vec![(0, 0, 1 << 20, None), (0, 1 << 20, 2 << 20, None), (0, 2 << 20, 3 << 20, None), (0, 0x2ff000, 0x301000, None)];
+        assert_eq!(stream::last_reads(&disks, &jobs, 3), [Some(3), Some(3), None]);
+        assert_eq!(stream::last_reads(&disks, &jobs[..3], 3), [Some(2), None, None]);
     }
 
     #[test]

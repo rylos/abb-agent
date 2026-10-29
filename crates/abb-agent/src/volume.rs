@@ -18,9 +18,16 @@ const FITHAW: libc::c_ulong = 0xC004_5878;
 /// digests, logs via journald) and would hang.
 const NEVER_FROZEN: &[&str] = &["/", "/var", "/var/log", "/var/lib/abb-agent", "/tmp", "/run"];
 
+/// Filesystems the agent froze, one file per device number holding the mount path, so that a
+/// start after the agent was killed while one was frozen can thaw it (`thaw_leftovers`). In /run:
+/// never frozen, and gone after a reboot like the freeze itself.
+const FROZEN_DIR: &str = "/run/abb-agent/frozen";
+
 /// Frozen filesystem (FIFREEZE): thawed when dropped.
 struct Freeze {
     dir: std::fs::File,
+    mount: String,
+    marker: std::path::PathBuf,
 }
 
 impl Freeze {
@@ -33,24 +40,63 @@ impl Freeze {
 
     fn new(mount: &str) -> Result<Freeze> {
         let dir = std::fs::File::open(mount)?;
+        let marker = std::path::Path::new(FROZEN_DIR).join(dir.metadata()?.dev().to_string());
+        std::fs::create_dir_all(FROZEN_DIR)?;
+        std::fs::write(&marker, mount)?;
         let mut arg: libc::c_int = 0;
         if unsafe { libc::ioctl(std::os::fd::AsRawFd::as_raw_fd(&dir), FIFREEZE, &mut arg) } != 0 {
-            return Err(std::io::Error::last_os_error().into());
+            let e = std::io::Error::last_os_error();
+            let _ = std::fs::remove_file(&marker);
+            return Err(e.into());
         }
-        Ok(Freeze { dir })
+        Ok(Freeze { dir, mount: mount.to_string(), marker })
     }
+}
+
+/// FITHAW on `dir`: `Ok(false)` if it was not frozen.
+fn thaw(dir: &std::fs::File) -> std::io::Result<bool> {
+    let mut arg: libc::c_int = 0;
+    if unsafe { libc::ioctl(std::os::fd::AsRawFd::as_raw_fd(dir), FITHAW, &mut arg) } != 0 {
+        let e = std::io::Error::last_os_error();
+        return if e.raw_os_error() == Some(libc::EINVAL) { Ok(false) } else { Err(e) };
+    }
+    Ok(true)
 }
 
 impl Drop for Freeze {
     fn drop(&mut self) {
-        let mut arg: libc::c_int = 0;
-        if unsafe { libc::ioctl(std::os::fd::AsRawFd::as_raw_fd(&self.dir), FITHAW, &mut arg) } != 0 {
-            eprintln!("thaw: {}", std::io::Error::last_os_error());
+        match thaw(&self.dir) {
+            Ok(_) => {
+                let _ = std::fs::remove_file(&self.marker);
+            }
+            Err(e) => eprintln!("thaw {}: {e}", self.mount),
         }
     }
 }
 
-
+/// Thaws the filesystems an earlier run of the agent froze and could not thaw (killed while one
+/// was frozen). Only those it recorded, and only if the same filesystem is still mounted there.
+pub fn thaw_leftovers() {
+    let Ok(entries) = std::fs::read_dir(FROZEN_DIR) else { return };
+    for e in entries.flatten() {
+        let marker = e.path();
+        let dev = e.file_name().to_string_lossy().parse::<u64>().ok();
+        if let (Some(dev), Ok(mount)) = (dev, std::fs::read_to_string(&marker))
+            && let Ok(dir) = std::fs::File::open(&mount)
+            && dir.metadata().is_ok_and(|m| m.dev() == dev)
+        {
+            match thaw(&dir) {
+                Ok(true) => eprintln!("{mount}: thawed (left frozen by an interrupted backup)"),
+                Ok(false) => {}
+                Err(e) => {
+                    eprintln!("thaw {mount}: {e}");
+                    continue;
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&marker);
+    }
+}
 
 pub struct ExtVol {
     pub fs: ExtFs,
@@ -65,7 +111,8 @@ pub struct ExtVol {
     overlay: Vec<(u64, Vec<u8>)>,
     /// Mount point, for a filesystem read while in use.
     mount: Option<String>,
-    _freeze: Option<Freeze>,
+    /// Frozen for the whole upload: thawed after the last read (`release`).
+    freeze: std::sync::Mutex<Option<Freeze>>,
 }
 
 #[allow(clippy::large_enum_variant)] // few volumes, never copied
@@ -146,7 +193,7 @@ impl Vol {
                         skip: vec![],
                         overlay,
                         mount: Some(p.mount_path.clone()),
-                        _freeze: None,
+                        freeze: Default::default(),
                     }));
                 }
                 // Unmounted or read-only, or frozen for the whole upload: read as it is.
@@ -159,7 +206,7 @@ impl Vol {
                 );
                 let n = fs.size.div_ceil(cbt::BLOCK) as usize;
                 let inodes = fs.inodes().map_err(|e| eprintln!("{name}: reading the inodes: {e}")).ok();
-                Ok(Vol::Ext(ExtVol { fs, table: (0..n).map(|_| AtomicU64::new(0)).collect(), inodes, skip: vec![], overlay: vec![], mount: None, _freeze: freeze }))
+                Ok(Vol::Ext(ExtVol { fs, table: (0..n).map(|_| AtomicU64::new(0)).collect(), inodes, skip: vec![], overlay: vec![], mount: None, freeze: std::sync::Mutex::new(freeze) }))
             }
             _ => Err(Error::Protocol(format!("{name}: unsupported filesystem"))),
         }
@@ -444,6 +491,18 @@ impl Vol {
                     }
                 }
             }
+        }
+    }
+
+    /// Nothing more is read from the volume: a filesystem frozen for the upload is thawed now,
+    /// not after the server has checked the version.
+    pub fn release(&self) {
+        if let Vol::Ext(x) = self
+            && let Some(f) = x.freeze.lock().unwrap().take()
+        {
+            let mount = f.mount.clone();
+            drop(f);
+            eprintln!("{mount}: thawed after its last read");
         }
     }
 
