@@ -1025,6 +1025,7 @@ mod tests {
             mount_path: String::new(),
             mounts: vec![],
             read_only: true,
+            busy: false,
         }
     }
 
