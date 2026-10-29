@@ -1025,7 +1025,8 @@ fn run_inner(
         server_accepted(job, c)?;
         for (p, v) in volume_parts.iter().zip(&volumes) {
             if let Some(n) = v.changed_while_read().filter(|&n| n > 0) {
-                eprintln!("{}: {n} files changed while the backup read them: their content in this version may be inconsistent, the next backup reads them again", alias(p));
+                eprintln!("{}: {n} files changed while the backup read them: their content in this version may be inconsistent (partial backup), the next backup reads them again", alias(p));
+                consistent = false;
             }
         }
         let complete = !missed
