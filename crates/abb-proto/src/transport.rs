@@ -177,12 +177,22 @@ impl Stream {
 trait ReadWrite: io::Read + Write {}
 impl<T: io::Read + Write> ReadWrite for T {}
 
+/// Connects to the first resolved address that answers, each tried for up to 15 s.
 fn tcp_connect(host: &str, port: u16) -> Result<(TcpStream, std::net::SocketAddr)> {
-    let addr = (host, port)
+    let mut last = None;
+    let (tcp, addr) = (host, port)
         .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| Error::Protocol(format!("could not resolve address: {host}")))?;
-    let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(15))?;
+        .find_map(|addr| match TcpStream::connect_timeout(&addr, Duration::from_secs(15)) {
+            Ok(tcp) => Some((tcp, addr)),
+            Err(e) => {
+                last = Some(e);
+                None
+            }
+        })
+        .ok_or_else(|| match last.take() {
+            Some(e) => Error::Io(e),
+            None => Error::Protocol(format!("could not resolve address: {host}")),
+        })?;
     tcp.set_nodelay(true)?;
     tcp.set_read_timeout(Some(Duration::from_secs(600)))?;
     tcp.set_write_timeout(Some(Duration::from_secs(600)))?;
@@ -204,7 +214,7 @@ impl Connection {
         let (mut tcp, addr) = tcp_connect(host, port)?;
 
         // Plaintext phase.
-        tcp.write_all(&request("encrypt_channel", vec![]).to_bytes())?;
+        tcp.write_all(&request("encrypt_channel", vec![]).to_bytes()?)?;
         let hello = Value::read_from(&mut tcp)?;
         check_error(&hello)?;
 
@@ -241,7 +251,7 @@ impl Connection {
 
     pub fn send(&mut self, msg: &Value) -> Result<()> {
         let io = self.stream.io();
-        io.write_all(&msg.to_bytes())?;
+        io.write_all(&msg.to_bytes()?)?;
         io.flush()?;
         Ok(())
     }
