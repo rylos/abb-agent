@@ -176,7 +176,8 @@ pub fn plan_incremental(intervals: &[Interval], volumes: &[Vol], prev: &[Option<
         }
         match i.source {
             Source::Excluded(_) => {
-                out.push(Piece::Run(Run { start: i.start, end: i.end, used: false, changed: false, cbt: false }));
+                // "Changed": whatever the base had there (a volume excluded since) is dropped.
+                out.push(Piece::Run(Run { start: i.start, end: i.end, used: false, changed: true, cbt: false }));
             }
             Source::Raw => {
                 let mut w = i.start;
@@ -242,7 +243,69 @@ pub fn plan_incremental(intervals: &[Interval], volumes: &[Vol], prev: &[Option<
             out.push(Piece::Log(LOG_VOLUME_DONE, a));
         }
     }
-    merge_changed(out)
+    align(merge_changed(out))
+}
+
+const ALIGN: u64 = 4096;
+
+/// Pieces on the 4096-byte grid, as the official agent sends them (`setAlignment(4096)`): where
+/// two pieces meet off the grid (a partition ending at a sector that is not a multiple of 8,
+/// such as the last one before the backup GPT), the 4096 bytes around the boundary become a
+/// data piece of their own, read and sent whatever the sources on either side (excluded areas
+/// read as zeros), and the pieces next to it are shortened.
+fn align(pieces: Vec<Piece>) -> Vec<Piece> {
+    let range = |p: &Piece| match *p {
+        Piece::Data { start, end, .. } | Piece::Run(Run { start, end, .. }) => Some((start, end)),
+        Piece::Log(..) => None,
+    };
+    let ranges: Vec<(u64, u64)> = pieces.iter().filter_map(range).collect();
+    // Grid cells holding a boundary off the grid, joined when they touch.
+    let mut cells: Vec<(u64, u64)> = Vec::new();
+    for w in ranges.windows(2) {
+        let b = w[1].0;
+        if b % ALIGN == 0 || w[0].1 != b {
+            continue;
+        }
+        let cell = (b - b % ALIGN, (b - b % ALIGN + ALIGN).min(ranges.last().unwrap().1));
+        match cells.last_mut() {
+            Some(last) if last.1 >= cell.0 => last.1 = last.1.max(cell.1),
+            _ => cells.push(cell),
+        }
+    }
+    if cells.is_empty() {
+        return pieces;
+    }
+    let mut out = Vec::with_capacity(pieces.len() + 2 * cells.len());
+    let mut next = 0;
+    for p in pieces {
+        let Some((s, e)) = range(&p) else {
+            out.push(p);
+            continue;
+        };
+        // What is left of the piece outside the cells, after the cells before it.
+        let (mut ns, mut ne) = (s, e);
+        for &(cs, ce) in cells[next..].iter().take_while(|c| c.0 < e) {
+            if cs <= ns {
+                ns = ns.max(ce);
+            } else {
+                ne = ne.min(cs);
+            }
+        }
+        if ns >= ne {
+            continue;
+        }
+        while next < cells.len() && cells[next].1 <= ns {
+            out.push(Piece::Data { start: cells[next].0, end: cells[next].1, cbt: false, check: None });
+            next += 1;
+        }
+        out.push(match p {
+            Piece::Data { cbt, check, .. } => Piece::Data { start: ns, end: ne, cbt, check },
+            Piece::Run(r) => Piece::Run(Run { start: ns, end: ne, ..r }),
+            Piece::Log(..) => unreachable!(),
+        });
+    }
+    out.extend(cells[next..].iter().map(|&(start, end)| Piece::Data { start, end, cbt: false, check: None }));
+    out
 }
 
 /// Joins consecutive changed 64 KiB blocks into pieces of up to 1 MiB (never across a MiB
@@ -751,4 +814,59 @@ fn push_run(up: &mut Connection, image: &str, pending: &mut Option<Run>, r: Run)
     }
     *pending = Some(r);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn data(start: u64, end: u64) -> Piece {
+        Piece::Data { start, end, cbt: true, check: None }
+    }
+
+    fn run(start: u64, end: u64) -> Piece {
+        Piece::Run(Run { start, end, used: true, changed: false, cbt: true })
+    }
+
+    fn shape(pieces: &[Piece]) -> Vec<(char, u64, u64)> {
+        pieces
+            .iter()
+            .map(|p| match *p {
+                Piece::Data { start, end, .. } => ('d', start, end),
+                Piece::Run(r) => ('r', r.start, r.end),
+                Piece::Log(..) => ('l', 0, 0),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pieces_meet_on_the_4096_grid() {
+        // Partition ending at 21474819584 (not a multiple of 4096), then the backup GPT up to the
+        // end of a 20 GiB disk, as in the capture of the official agent.
+        let (pend, size) = (21474819584u64, 21474836480u64);
+        let last = pend - pend % 65536;
+        let plan = vec![
+            run(last - 2 * 65536, last),
+            data(last, pend),
+            Piece::Log(LOG_VOLUME_DONE, "/".into()),
+            Piece::Data { start: pend, end: size, cbt: false, check: Some(Check::Raw) },
+        ];
+        let got = shape(&align(plan));
+        assert_eq!(
+            got,
+            [('r', last - 2 * 65536, last), ('d', last, 21474816000), ('l', 0, 0), ('d', 21474816000, 21474820096), ('d', 21474820096, size)]
+        );
+        for (_, s, e) in got.into_iter().filter(|p| p.0 != 'l') {
+            assert!(s % 4096 == 0 && (e % 4096 == 0 || e == size));
+        }
+    }
+
+    #[test]
+    fn small_pieces_inside_a_cell_are_taken_in() {
+        let plan = vec![run(0, 8192), data(8192, 8704), run(8704, 9216), run(9216, 16384)];
+        assert_eq!(shape(&align(plan)), [('r', 0, 8192), ('d', 8192, 12288), ('r', 12288, 16384)]);
+        // Already aligned: unchanged.
+        let plan = vec![run(0, 8192), data(8192, 65536)];
+        assert_eq!(shape(&align(plan)), [('r', 0, 8192), ('d', 8192, 65536)]);
+    }
 }
