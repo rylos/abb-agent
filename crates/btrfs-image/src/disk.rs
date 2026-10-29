@@ -31,11 +31,40 @@ pub const BLOCK_GROUP_DATA: u64 = 1 << 0;
 pub const BLOCK_GROUP_SYSTEM: u64 = 1 << 1;
 pub const BLOCK_GROUP_METADATA: u64 = 1 << 2;
 pub const BLOCK_GROUP_DUP: u64 = 1 << 5;
-/// All RAID profiles: on a single device only single and DUP are allowed.
-pub const BLOCK_GROUP_PROFILE_MASK: u64 = 0b11_1101_1000;
+/// All profiles: RAID0, RAID1, DUP, RAID10, RAID5, RAID6, RAID1C3, RAID1C4. On a single
+/// device only single (none of them) and DUP are allowed.
+pub const BLOCK_GROUP_PROFILE_MASK: u64 = 0b111_1111_1000;
 
 pub const INCOMPAT_METADATA_UUID: u64 = 1 << 10;
+/// Incompatible features that do not change what is read here: mixed_backref,
+/// default_subvol, mixed_groups, compress_lzo, compress_zstd, big_metadata, extended_iref,
+/// raid56 and raid1c34 (the profiles themselves are refused chunk by chunk), skinny_metadata,
+/// no_holes, metadata_uuid, simple_quota. Refused: zoned, extent_tree_v2, raid_stripe_tree and
+/// anything newer, whose trees or allocation this reader does not know.
+pub const INCOMPAT_SUPPORTED: u64 = 0xfff | 1 << 16;
 pub const CSUM_TYPE_CRC32C: u16 = 0;
+/// Size of the superblock's copy of the system chunks.
+const SYS_CHUNK_ARRAY_MAX: u32 = 2048;
+
+/// Size of the oldest root item format; newer ones add fields after it (uuids, otransid…).
+pub const ROOT_ITEM_MIN: usize = 239;
+
+/// Root node of a tree from its ROOT_ITEM: (bytenr, generation).
+pub fn root_location(item: &[u8]) -> Result<(u64, u64), Error> {
+    if item.len() < ROOT_ITEM_MIN {
+        return Err(Error::Format(format!("root item of {} bytes", item.len())));
+    }
+    Ok((u64_at(item, 176), u64_at(item, 160)))
+}
+
+/// A ROOT_REF or ROOT_BACKREF item: (directory inode, index in it, name).
+pub fn root_ref(item: &[u8]) -> Result<(u64, u64, &[u8]), Error> {
+    let name = item.get(16..18).map(|l| u16::from_le_bytes([l[0], l[1]]) as usize).and_then(|l| item.get(18..18 + l));
+    match name {
+        Some(name) => Ok((u64_at(item, 0), u64_at(item, 8), name)),
+        None => Err(Error::Format("truncated root ref".into())),
+    }
+}
 
 pub fn u16_at(b: &[u8], o: usize) -> u16 {
     u16::from_le_bytes(b[o..o + 2].try_into().unwrap())
@@ -134,6 +163,24 @@ impl Superblock {
         if sb.num_devices != 1 {
             return Err(Error::Unsupported(format!("{} devices in the filesystem (only 1 supported)", sb.num_devices)));
         }
+        let unknown = sb.incompat_flags & !INCOMPAT_SUPPORTED;
+        if unknown != 0 {
+            return Err(Error::Unsupported(format!("incompatible features 0x{unknown:x}")));
+        }
+        // The kernel's checks (btrfs_validate_super) on what sizes and indexes everything else.
+        let (sector, node) = (sb.sectorsize, sb.nodesize);
+        if !sector.is_power_of_two() || !(512..=65536).contains(&sector) {
+            return Err(Error::Format(format!("sector size {sector}")));
+        }
+        if !node.is_power_of_two() || node < sector || node > 65536 || (node as usize) < HEADER_SIZE + KEY_PTR_SIZE {
+            return Err(Error::Format(format!("node size {node}")));
+        }
+        if sb.sys_chunk_array_size > SYS_CHUNK_ARRAY_MAX {
+            return Err(Error::Format(format!("sys_chunk_array_size {}", sb.sys_chunk_array_size)));
+        }
+        if sb.total_bytes == 0 || sb.root_level > 7 || sb.chunk_root_level > 7 {
+            return Err(Error::Format("invalid superblock".into()));
+        }
         Ok(sb)
     }
 
@@ -167,12 +214,18 @@ pub struct Chunk {
 impl Chunk {
     /// `b` starts with the chunk item (after the key); returns the chunk and its length in bytes.
     pub fn parse(logical: u64, b: &[u8], devid: u64) -> Result<(Chunk, usize), Error> {
+        if b.len() < 48 {
+            return Err(Error::Format("truncated chunk item".into()));
+        }
         let length = u64_at(b, 0);
         let kind = u64_at(b, 24);
         let num_stripes = u16_at(b, 44) as usize;
         let size = 48 + num_stripes * 32;
         if b.len() < size {
             return Err(Error::Format("truncated chunk item".into()));
+        }
+        if num_stripes == 0 || length == 0 || logical.checked_add(length).is_none() {
+            return Err(Error::Format(format!("chunk at {logical}: {num_stripes} stripes, length {length}")));
         }
         let mut stripes = Vec::with_capacity(num_stripes);
         for i in 0..num_stripes {
@@ -185,6 +238,9 @@ impl Chunk {
         let profile = kind & BLOCK_GROUP_PROFILE_MASK;
         if profile != 0 && profile != BLOCK_GROUP_DUP {
             return Err(Error::Unsupported(format!("chunk profile 0x{profile:x} (only single and DUP supported)")));
+        }
+        if num_stripes != if profile == BLOCK_GROUP_DUP { 2 } else { 1 } {
+            return Err(Error::Format(format!("chunk at {logical}: {num_stripes} stripes for profile 0x{profile:x}")));
         }
         Ok((Chunk { logical, length, kind, stripes }, size))
     }
@@ -208,6 +264,101 @@ impl NodeHeader {
             owner: u64_at(b, 88),
             nritems: u32_at(b, 96),
             level: b[100],
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn put(b: &mut [u8], o: usize, v: &[u8]) {
+        b[o..o + v.len()].copy_from_slice(v);
+    }
+
+    fn sb_raw(f: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
+        let mut b = vec![0u8; SUPER_SIZE];
+        put(&mut b, 0x40, MAGIC);
+        put(&mut b, 0x70, &(1u64 << 30).to_le_bytes());
+        put(&mut b, 0x88, &1u64.to_le_bytes());
+        put(&mut b, 0x90, &4096u32.to_le_bytes());
+        put(&mut b, 0x94, &16384u32.to_le_bytes());
+        put(&mut b, 0xbc, &(1u64 | 1 << 8).to_le_bytes());
+        f(&mut b);
+        let c = csum(&b[32..]);
+        put(&mut b, 0, &c);
+        b
+    }
+
+    #[test]
+    fn superblock_features_and_sizes() {
+        assert!(Superblock::parse(sb_raw(|_| {})).is_ok());
+        let flags = |v: u64| sb_raw(|b| put(b, 0xbc, &v.to_le_bytes()));
+        // zoned, extent_tree_v2, raid_stripe_tree, unknown.
+        for bit in [12, 13, 14, 15, 17, 40] {
+            assert!(matches!(Superblock::parse(flags(1 | 1 << bit)), Err(Error::Unsupported(_))), "bit {bit}");
+        }
+        assert!(Superblock::parse(flags(0xfff | 1 << 16)).is_ok());
+        let size = |o: usize, v: u32| sb_raw(|b| put(b, o, &v.to_le_bytes()));
+        for (o, v) in [(0x94, 0), (0x94, 3000), (0x94, 2048), (0x94, 1 << 17), (0x90, 0), (0x90, 6000), (0xa0, 2049)] {
+            assert!(matches!(Superblock::parse(size(o, v)), Err(Error::Format(_))), "0x{o:x} = {v}");
+        }
+        let sys = |n: u32| Superblock::parse(sb_raw(|b| put(b, 0xa0, &n.to_le_bytes()))).unwrap().sys_chunk_array().len();
+        assert_eq!(sys(2048), 2048);
+    }
+
+    fn chunk(kind: u64, stripes: &[u64]) -> Vec<u8> {
+        let mut b = vec![0u8; 48 + 32 * stripes.len()];
+        put(&mut b, 0, &(1u64 << 20).to_le_bytes());
+        put(&mut b, 24, &kind.to_le_bytes());
+        put(&mut b, 44, &(stripes.len() as u16).to_le_bytes());
+        for (i, s) in stripes.iter().enumerate() {
+            put(&mut b, 48 + 32 * i, &1u64.to_le_bytes());
+            put(&mut b, 56 + 32 * i, &s.to_le_bytes());
+        }
+        b
+    }
+
+    #[test]
+    fn chunk_profiles_and_stripes() {
+        let (c, size) = Chunk::parse(1 << 20, &chunk(BLOCK_GROUP_METADATA | BLOCK_GROUP_DUP, &[1 << 20, 2 << 20]), 1).unwrap();
+        assert_eq!((c.stripes.len(), size), (2, 112));
+        assert!(Chunk::parse(0, &chunk(BLOCK_GROUP_DATA, &[1 << 20]), 1).is_ok());
+        // RAID1C4 (bit 10) and RAID1C3 (bit 9), RAID1.
+        for p in [1 << 10, 1 << 9, 1 << 4] {
+            assert!(matches!(Chunk::parse(0, &chunk(BLOCK_GROUP_DATA | p, &[0, 1 << 20]), 1), Err(Error::Unsupported(_))));
+        }
+        assert!(matches!(Chunk::parse(0, &chunk(BLOCK_GROUP_DATA, &[]), 1), Err(Error::Format(_))));
+        assert!(matches!(Chunk::parse(0, &chunk(BLOCK_GROUP_DATA | BLOCK_GROUP_DUP, &[0]), 1), Err(Error::Format(_))));
+        assert!(matches!(Chunk::parse(0, &[0u8; 30], 1), Err(Error::Format(_))));
+        assert!(matches!(Chunk::parse(0, &chunk(BLOCK_GROUP_DATA, &[0])[..60], 1), Err(Error::Format(_))));
+    }
+
+    #[test]
+    fn root_refs_bounded() {
+        let mut r = vec![0u8; 18];
+        put(&mut r, 16, &5u16.to_le_bytes());
+        assert!(root_ref(&r).is_err());
+        r.extend(b"@home");
+        assert_eq!(root_ref(&r).unwrap().2, b"@home");
+        assert!(root_ref(&r[..10]).is_err());
+        assert!(root_location(&[0u8; 200]).is_err());
+    }
+
+    #[test]
+    fn random_chunk_items_do_not_panic() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..20000 {
+            let mut b = chunk(BLOCK_GROUP_DUP, &[0, 1 << 20]);
+            for _ in 0..3 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let o = (x % b.len() as u64) as usize;
+                b[o] = (x >> 40) as u8;
+            }
+            let cut = (x >> 50) as usize % (b.len() + 1);
+            let _ = Chunk::parse(0, &b[..cut], 1);
         }
     }
 }

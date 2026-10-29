@@ -78,10 +78,8 @@ pub fn list_subvolumes(fs: &Filesystem, top: &Path) -> Result<Vec<Subvolume>, Er
         if key.kind == ROOT_REF_KEY
             && (FIRST_FREE_OBJECTID..=LAST_FREE_OBJECTID).contains(&key.offset)
         {
-            let dirid = u64_at(data, 0);
-            let name_len = u16_at(data, 16) as usize;
-            let name = String::from_utf8_lossy(&data[18..18 + name_len]).into_owned();
-            refs.push((key.objectid, key.offset, dirid, name));
+            let (dirid, _, name) = root_ref(data)?;
+            refs.push((key.objectid, key.offset, dirid, String::from_utf8_lossy(name).into_owned()));
         }
         Ok(())
     })?;

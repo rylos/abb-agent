@@ -227,7 +227,14 @@ impl Vol {
                 }
                 // Unmounted or read-only, or frozen for the whole upload: read as it is.
                 let freeze = if whole { Some(Freeze::new(&p.mount_path)?) } else { None };
-                let fs = ExtFs::open(&p.device()).map_err(n_err)?;
+                let mut fs = ExtFs::open(&p.device()).map_err(n_err)?;
+                // Not cleanly unmounted (or mounted with noload): the journal has transactions
+                // whose blocks look free in the bitmaps. Freezing writes them out, so only the
+                // filesystem read as it is can be in this state.
+                if fs.needs_recovery && freeze.is_none() {
+                    eprintln!("{name}: ext journal needs recovery: the whole filesystem is read, it is replayed at the first mount after a restore");
+                    fs.assume_all_used();
+                }
                 eprintln!(
                     "{name}: ext, {:.1} GiB used{}",
                     fs.used_bytes() as f64 / (1u64 << 30) as f64,
@@ -375,15 +382,17 @@ impl Vol {
 
     /// ext: with the inodes of the previous backup, finds the 64 KiB blocks that need not be
     /// read: every used byte in them belongs to a file whose inode did not change (same ctime,
-    /// mtime, size, generation and flags, as rustic and restic decide), or to an inode table
-    /// block whose inodes were and are all free. Returns how many.
+    /// mtime, size, generation, flags and block mapping, as rustic and restic decide but for
+    /// the mapping), or to an inode table block whose inodes were and are all free. Active
+    /// swapfiles are written without touching their inode: never skipped. Returns how many.
     pub fn plan_skip(&mut self, prev: &std::collections::HashMap<u32, [u64; 4]>) -> usize {
         let Vol::Ext(x) = self else { return 0 };
         let Some(inodes) = &x.inodes else { return 0 };
+        let swap = swapfiles(x.fs.device());
         let mut safe: Vec<(u64, u64)> = inodes
             .owned
             .iter()
-            .filter(|(_, _, ino)| prev.get(ino).is_some_and(|p| Some(p) == inodes.sigs.get(ino)))
+            .filter(|(_, _, ino)| !swap.contains(ino) && prev.get(ino).is_some_and(|p| Some(p) == inodes.sigs.get(ino)))
             .map(|&(s, l, _)| (s, l))
             .chain(
                 inodes
@@ -546,6 +555,22 @@ impl Vol {
             prep.release();
         }
     }
+}
+
+/// Inodes of the active swapfiles on the filesystem of `device` (from /proc/swaps).
+fn swapfiles(device: &std::path::Path) -> Vec<u32> {
+    let Ok(rdev) = std::fs::metadata(device).map(|m| m.rdev()) else { return Vec::new() };
+    let swaps = std::fs::read_to_string("/proc/swaps").unwrap_or_default();
+    swaps
+        .lines()
+        .skip(1)
+        .filter_map(|l| {
+            let mut f = l.split_whitespace();
+            let (path, kind) = (f.next()?, f.next()?);
+            let m = std::fs::metadata(path.replace("\\040", " ")).ok()?;
+            (kind == "file" && m.dev() == rdev).then_some(m.ino() as u32)
+        })
+        .collect()
 }
 
 /// Inode signatures of a backup, with its version: (inode, signature) little endian.

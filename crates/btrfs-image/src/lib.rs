@@ -91,6 +91,33 @@ impl Node {
     }
 }
 
+/// Items (leaf) or key pointers (internal node) inside the node, so that `Node::items` and
+/// `Node::ptrs` never index past it.
+pub fn node_layout(h: &NodeHeader, data: &[u8]) -> Result<(), String> {
+    let n = h.nritems as usize;
+    if h.level > 7 {
+        return Err(format!("level {}", h.level));
+    }
+    if h.level > 0 {
+        if HEADER_SIZE + n * KEY_PTR_SIZE > data.len() {
+            return Err(format!("{n} pointers"));
+        }
+        return Ok(());
+    }
+    if HEADER_SIZE + n * ITEM_SIZE > data.len() {
+        return Err(format!("{n} items"));
+    }
+    let room = data.len() - HEADER_SIZE;
+    for i in 0..n {
+        let it = &data[HEADER_SIZE + i * ITEM_SIZE..];
+        let (off, size) = (u32_at(it, 17) as usize, u32_at(it, 21) as usize);
+        if off.checked_add(size).is_none_or(|end| end > room) {
+            return Err(format!("item {i} at {off}+{size}"));
+        }
+    }
+    Ok(())
+}
+
 impl Filesystem {
     pub fn open(path: &Path) -> Result<Filesystem, Error> {
         Filesystem::open_at(path, 0)
@@ -105,6 +132,16 @@ impl Filesystem {
         let mut fs = Filesystem { dev, sb, chunks: BTreeMap::new(), cache: None };
         fs.load_sys_chunks()?;
         fs.load_chunk_tree()?;
+        // Every stripe inside the device: physical offsets index tables sized on it.
+        let sector = fs.sb.sectorsize as u64;
+        for c in fs.chunks.values() {
+            if c.logical % sector != 0 || c.length % sector != 0 {
+                return Err(Error::Format(format!("chunk at {} not aligned", c.logical)));
+            }
+            if let Some(s) = c.stripes.iter().find(|&&s| s % sector != 0 || s.checked_add(c.length).is_none_or(|e| e > fs.sb.total_bytes)) {
+                return Err(Error::Format(format!("chunk at {}: stripe at {s} outside the device", c.logical)));
+            }
+        }
         Ok(fs)
     }
 
@@ -112,6 +149,9 @@ impl Filesystem {
         let arr = self.sb.sys_chunk_array().to_vec();
         let mut o = 0;
         while o < arr.len() {
+            if o + 17 > arr.len() {
+                return Err(Error::Format("truncated sys_chunk_array".into()));
+            }
             let key = Key::parse(&arr[o..]);
             o += 17;
             if key.kind != CHUNK_ITEM_KEY {
@@ -177,11 +217,19 @@ impl Filesystem {
             }
             return Ok(Node { header, data: data.clone() });
         }
-        let phys = self.physical(logical)?[0];
-        let mut data = vec![0u8; self.sb.nodesize as usize];
-        self.read_at(&mut data, phys)?;
-        let header = self.verify_node(logical, expected_gen, &data)?;
-        Ok(Node { header, data })
+        // With DUP, a bad first copy is no reason to fail: the second one may be good.
+        let mut first_err = None;
+        for phys in self.physical(logical)? {
+            let mut data = vec![0u8; self.sb.nodesize as usize];
+            let read = self.read_at(&mut data, phys).and_then(|()| self.verify_node(logical, expected_gen, &data));
+            match read {
+                Ok(header) => return Ok(Node { header, data }),
+                Err(e) => {
+                    first_err.get_or_insert(e);
+                }
+            }
+        }
+        Err(first_err.expect("chunks have at least one stripe"))
     }
 
     /// Reads and verifies many nodes at once, in parallel (NVMe drives answer many requests at
@@ -228,9 +276,13 @@ impl Filesystem {
     }
 
     /// Checks that `data` is node `logical` of the generation read: checksum, bytenr, fsid,
-    /// generation not newer than the superblock (and exactly `expected_gen` if ≠ 0).
+    /// generation not newer than the superblock (and exactly `expected_gen` if ≠ 0), and that
+    /// its items fit in it.
     pub fn verify_node(&self, logical: u64, expected_gen: u64, data: &[u8]) -> Result<NodeHeader, Error> {
         let changed = |reason: String| Error::Changed { logical, reason };
+        if data.len() != self.sb.nodesize as usize {
+            return Err(changed(format!("{} bytes", data.len())));
+        }
         if data[..4] != csum(&data[32..]) {
             return Err(changed("bad checksum".into()));
         }
@@ -250,6 +302,8 @@ impl Filesystem {
         if expected_gen != 0 && header.generation != expected_gen {
             return Err(changed(format!("generation {} instead of {expected_gen}", header.generation)));
         }
+        // Checksum right, layout wrong: a corrupt node, not one that changed.
+        node_layout(&header, data).map_err(|e| Error::Format(format!("node {logical}: {e}")))?;
         Ok(header)
     }
 
@@ -278,11 +332,15 @@ impl Filesystem {
         Ok(())
     }
 
-    /// All ROOT_ITEMs of the root tree: (objectid, item data).
+    /// All ROOT_ITEMs of the root tree: (objectid, item data), at least as long as the
+    /// oldest format (239 bytes).
     pub fn root_items(&self) -> Result<Vec<(u64, Vec<u8>)>, Error> {
         let mut out = Vec::new();
         self.walk(self.sb.root, 0, &mut |_, key, data| {
             if key.kind == ROOT_ITEM_KEY {
+                if data.len() < ROOT_ITEM_MIN {
+                    return Err(Error::Format(format!("root item of {} is {} bytes", key.objectid, data.len())));
+                }
                 out.push((key.objectid, data.to_vec()));
             }
             Ok(())
@@ -295,10 +353,78 @@ impl Filesystem {
         let mut found = None;
         self.walk(self.sb.root, 0, &mut |_, key, data| {
             if key.objectid == objectid && key.kind == ROOT_ITEM_KEY && found.is_none() {
-                found = Some((u64_at(data, 176), u64_at(data, 160)));
+                found = Some(root_location(data)?);
             }
             Ok(())
         })?;
         found.ok_or_else(|| Error::Format(format!("tree {objectid} missing from the root tree")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn header(level: u8, nritems: u32) -> NodeHeader {
+        NodeHeader { bytenr: 0, generation: 1, owner: 5, nritems, level }
+    }
+
+    #[test]
+    fn node_layout_bounds() {
+        let mut leaf = vec![0u8; 4096];
+        let item = |n: &mut Vec<u8>, i: usize, off: u32, size: u32| {
+            let h = HEADER_SIZE + i * ITEM_SIZE;
+            n[h + 17..h + 21].copy_from_slice(&off.to_le_bytes());
+            n[h + 21..h + 25].copy_from_slice(&size.to_le_bytes());
+        };
+        item(&mut leaf, 0, 3900, 95);
+        assert!(node_layout(&header(0, 1), &leaf).is_ok());
+        item(&mut leaf, 1, 3900, 96);
+        assert!(node_layout(&header(0, 2), &leaf).is_err(), "item past the end");
+        item(&mut leaf, 1, u32::MAX, 2);
+        assert!(node_layout(&header(0, 2), &leaf).is_err(), "offset overflow");
+        assert!(node_layout(&header(0, 200), &leaf).is_err(), "more items than fit");
+        assert!(node_layout(&header(1, 121), &leaf).is_ok());
+        assert!(node_layout(&header(1, 122), &leaf).is_err(), "more pointers than fit");
+        assert!(node_layout(&header(8, 0), &leaf).is_err(), "level");
+    }
+
+    /// A btrfs made by mkfs.btrfs in a temporary file (None if mkfs.btrfs is missing).
+    pub(crate) fn mkfs(name: &str, args: &[&str]) -> Option<std::path::PathBuf> {
+        let dir = std::env::temp_dir().join(format!("btrfs-image-test-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let img = dir.join("fs.img");
+        std::fs::File::create(&img).unwrap().set_len(256 << 20).unwrap();
+        let ok = std::process::Command::new("mkfs.btrfs").args(["-q", "-f"]).args(args).arg(&img).status().is_ok_and(|s| s.success());
+        if !ok {
+            eprintln!("mkfs.btrfs not available: skipped");
+            return None;
+        }
+        Some(img)
+    }
+
+    #[test]
+    fn bad_dup_copy_read_from_the_other() {
+        use std::os::unix::fs::FileExt;
+        let Some(img) = mkfs("dup", &["-m", "dup"]) else { return };
+        let fs = Filesystem::open(&img).unwrap();
+        let copies = fs.physical(fs.sb.root).unwrap();
+        assert_eq!(copies.len(), 2);
+        let good = fs.read_node(fs.sb.root, 0).unwrap().data;
+        // Corrupt the first copy of the root tree's root.
+        let f = std::fs::OpenOptions::new().write(true).open(&img).unwrap();
+        f.write_all_at(&[0xAA; 64], copies[0] + 300).unwrap();
+        let fs = Filesystem::open(&img).unwrap();
+        assert_eq!(fs.read_node(fs.sb.root, 0).unwrap().data, good);
+        // The image gets the good copy in place of the bad one.
+        let map = usedmap::UsedMap::build(&fs).unwrap();
+        let cap = capture::Capture::default();
+        let start = copies[0] / cbt::BLOCK * cbt::BLOCK;
+        let mut buf = vec![0u8; cbt::BLOCK as usize];
+        fs.read_at(&mut buf, start).unwrap();
+        assert!(image::fill_window(&fs, &cap, &map, start, &mut buf).unwrap());
+        let o = (copies[0] - start) as usize;
+        assert_eq!(&buf[o..o + good.len()], &good[..]);
+        let _ = std::fs::remove_dir_all(img.parent().unwrap());
     }
 }

@@ -10,10 +10,14 @@
 //!
 //! Nested subvolumes go with their parent. Snapshots of an excluded subvolume are excluded
 //! only if they match a pattern themselves; until they are, the data they share stays.
+//!
+//! The directory entry is removed from nodes shared with the agent's snapshots of the parent,
+//! which get the same edit; if another snapshot (snapper, btrbk) shares them, the exclusion is
+//! refused and everything is backed up (see `unlink`).
 
 use crate::capture::Pinned;
 use crate::disk::*;
-use crate::edit::Editor;
+use crate::edit::{self, Editor};
 use crate::snapshot::Subvolume;
 use crate::{Error, Filesystem};
 use std::collections::{HashMap, HashSet};
@@ -137,7 +141,19 @@ pub fn plan(
     patterns: &[String],
     data_extents: impl Iterator<Item = (u64, u64)>,
 ) -> Result<Option<Exclusion>, Error> {
-    let mut excluded: HashSet<u64> = matching(subvols, snap_dir, patterns).iter().map(|s| s.id).collect();
+    let excluded: HashSet<u64> = matching(subvols, snap_dir, patterns).iter().map(|s| s.id).collect();
+    plan_ids(fs, subvols, pinned, snapshots, excluded, data_extents)
+}
+
+/// [`plan`] for the subvolumes `excluded`, by id.
+fn plan_ids(
+    fs: &Filesystem,
+    subvols: &[Subvolume],
+    pinned: &[Pinned],
+    snapshots: &[u64],
+    mut excluded: HashSet<u64>,
+    data_extents: impl Iterator<Item = (u64, u64)>,
+) -> Result<Option<Exclusion>, Error> {
     if excluded.is_empty() {
         return Ok(None);
     }
@@ -179,6 +195,7 @@ pub fn plan(
 
     let mut ed = Editor::new(fs);
     let root = fs.sb.root;
+    let (extent_root, _) = fs.tree_root(EXTENT_TREE_OBJECTID)?;
     let mut ids: Vec<u64> = excluded.iter().copied().collect();
     ids.sort();
     for &id in &ids {
@@ -201,44 +218,152 @@ pub fn plan(
             // The directory entry is inside a tree that goes away too.
             continue;
         }
-        let (dirid, index, nlen) = (u64_at(&rref, 0), u64_at(&rref, 8), u16_at(&rref, 16) as usize);
-        let name = rref[18..18 + nlen].to_vec();
+        let (dirid, index, name) = root_ref(&rref)?;
+        let name = name.to_vec();
         let (ptree, _) = root_of(parent).ok_or_else(|| Error::Format(format!("root of subvolume {parent} not found")))?;
-        ed.delete(ptree, Key { objectid: dirid, kind: DIR_INDEX_KEY, offset: index })?;
-        let dkey = Key { objectid: dirid, kind: DIR_ITEM_KEY, offset: name_hash(&name) };
-        let ditem = ed.get(ptree, dkey)?.ok_or_else(|| Error::Format("directory item of the subvolume not found".into()))?;
-        // A dir item can hold several entries with the same hash: keep the others.
-        let mut rest = Vec::new();
-        let mut o = 0;
-        let mut removed = false;
-        while o + 30 <= ditem.len() {
-            let (dlen, elen) = (u16_at(&ditem, o + 25) as usize, u16_at(&ditem, o + 27) as usize);
-            let end = o + 30 + elen + dlen;
-            if !removed && ditem[o + 30..o + 30 + elen] == name[..] {
-                removed = true;
-            } else {
-                rest.extend_from_slice(&ditem[o..end]);
-            }
-            o = end;
-        }
-        if !removed {
-            return Err(Error::Format("directory entry of the subvolume not found".into()));
-        }
-        if rest.is_empty() {
-            ed.delete(ptree, dkey)?;
-        } else {
-            ed.replace(ptree, dkey, &rest)?;
-        }
-        ed.update(ptree, Key { objectid: dirid, kind: INODE_ITEM_KEY, offset: 0 }, |d| {
-            let size = u64_at(d, 16).saturating_sub(2 * nlen as u64);
-            d[16..24].copy_from_slice(&size.to_le_bytes());
-        })?;
+        // The agent's snapshots of the parent share its nodes: they get the same edit.
+        let copies: Vec<u64> = pinned
+            .iter()
+            .zip(snapshots)
+            .filter(|(p, s)| p.subvol == parent && !excluded.contains(*s))
+            .filter_map(|(_, s)| root_of(*s).map(|r| r.0))
+            .collect();
+        unlink(&mut ed, extent_root, ptree, &copies, dirid, index, &name)
+            .map_err(|e| Error::Unsupported(format!("subvolume {id} ({}): {e}", String::from_utf8_lossy(&name))))?;
     }
 
     let mut gone: Vec<&Subvolume> = subvols.iter().filter(|s| excluded.contains(&s.id)).collect();
     gone.sort_by(|a, b| a.path.cmp(&b.path));
     let (subvolumes, ids) = gone.iter().map(|s| (s.path.clone(), s.id)).unzip();
     Ok(Some(Exclusion { subvolumes, ids, nodes: ed.finish(), data }))
+}
+
+/// References to a tree block in the extent tree: parent nodes and roots pointing to it.
+fn block_refs(ed: &Editor, extent_root: u64, node: u64) -> Result<u64, Error> {
+    for kind in [METADATA_ITEM_KEY, EXTENT_ITEM_KEY] {
+        if let Some((_, item)) = ed.find_first(extent_root, node, kind)?
+            && item.len() >= 8
+        {
+            return Ok(u64_at(&item, 0));
+        }
+    }
+    Err(Error::Format(format!("tree block {node} not in the extent tree")))
+}
+
+/// The first node of `paths` (from tree roots, each referenced by its root item only) that more
+/// parents reference than those on the paths: some other tree reaches it.
+fn shared_node(paths: &[&edit::Path], refs: &mut dyn FnMut(u64) -> Result<u64, Error>) -> Result<Option<u64>, Error> {
+    let mut parents: HashMap<u64, HashSet<u64>> = HashMap::new();
+    for p in paths {
+        for (i, &(node, _)) in p.iter().enumerate() {
+            // 0 stands for the root item.
+            parents.entry(node).or_default().insert(if i == 0 { 0 } else { p[i - 1].0 });
+        }
+    }
+    let mut nodes: Vec<(u64, usize)> = parents.into_iter().map(|(n, p)| (n, p.len())).collect();
+    nodes.sort_unstable();
+    for (node, n) in nodes {
+        if refs(node)? > n as u64 {
+            return Ok(Some(node));
+        }
+    }
+    Ok(None)
+}
+
+/// Removes the entry `name` from a directory item (several names can share a hash): the
+/// remaining entries, or None if `name` is not there.
+fn without_entry(ditem: &[u8], name: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+    let mut rest = Vec::new();
+    let mut o = 0;
+    let mut removed = false;
+    while o + 30 <= ditem.len() {
+        let (dlen, elen) = (u16_at(ditem, o + 25) as usize, u16_at(ditem, o + 27) as usize);
+        let end = o + 30 + elen + dlen;
+        if end > ditem.len() {
+            return Err(Error::Format("truncated directory item".into()));
+        }
+        if !removed && ditem[o + 30..o + 30 + elen] == name[..] {
+            removed = true;
+        } else {
+            rest.extend_from_slice(&ditem[o..end]);
+        }
+        o = end;
+    }
+    Ok(removed.then_some(rest))
+}
+
+/// Removes the directory entry of a subvolume (`name`, index `index` in directory `dirid`) from
+/// file tree `tree` and from `copies`, the agent's snapshots of that tree.
+///
+/// The edits are made on nodes as they are, not on copies (see `edit`): every tree reaching an
+/// edited node sees the edit. `tree` and the agent's snapshots of it get the same edit, and the
+/// key pointers of their own nodes are repaired. Any other tree (snapper's or btrbk's snapshots
+/// sharing the directory) would see its directory change under it, and a pointer of its own to
+/// a node whose first key changed would no longer match (read errors, failed snapshot deletion):
+/// if one reaches any node involved, the exclusion is refused.
+fn unlink(ed: &mut Editor, extent_root: u64, tree: u64, copies: &[u64], dirid: u64, index: u64, name: &[u8]) -> Result<(), Error> {
+    let keys = [
+        Key { objectid: dirid, kind: DIR_INDEX_KEY, offset: index },
+        Key { objectid: dirid, kind: DIR_ITEM_KEY, offset: name_hash(name) },
+        Key { objectid: dirid, kind: INODE_ITEM_KEY, offset: 0 },
+    ];
+    let roots: Vec<u64> = std::iter::once(tree).chain(copies.iter().copied()).collect();
+    let mut paths: Vec<Vec<edit::Path>> = Vec::new();
+    for &r in &roots {
+        paths.push(keys.iter().map(|&k| ed.path(r, k)).collect::<Result<_, _>>()?);
+    }
+    let all: Vec<&edit::Path> = paths.iter().flatten().collect();
+    if let Some(node) = shared_node(&all, &mut |n| block_refs(ed, extent_root, n))? {
+        return Err(Error::Unsupported(format!("node {node} of its directory is shared with another snapshot")));
+    }
+    let leaf = |p: &edit::Path| p.last().map(|l| l.0);
+    let mut had = Vec::new();
+    for &c in copies {
+        had.push(ed.get(c, keys[0])?.is_some());
+    }
+    let shrink = |ed: &mut Editor, t: u64| -> Result<(), Error> {
+        if ed.get(t, keys[2])?.is_none_or(|i| i.len() < 24) {
+            return Err(Error::Format(format!("inode item of directory {dirid} missing")));
+        }
+        ed.update(t, keys[2], |d| {
+            let size = u64_at(d, 16).saturating_sub(2 * name.len() as u64);
+            d[16..24].copy_from_slice(&size.to_le_bytes());
+        })
+    };
+    let unlink_in = |ed: &mut Editor, t: u64| -> Result<bool, Error> {
+        let mut found = false;
+        if ed.get(t, keys[0])?.is_some() {
+            ed.delete(t, keys[0])?;
+            found = true;
+        }
+        if let Some(rest) = ed.get(t, keys[1])?.map(|d| without_entry(&d, name)).transpose()?.flatten() {
+            if rest.is_empty() {
+                ed.delete(t, keys[1])?;
+            } else {
+                ed.replace(t, keys[1], &rest)?;
+            }
+            found = true;
+        }
+        Ok(found)
+    };
+    if !unlink_in(ed, tree)? {
+        return Err(Error::Format("directory entry not found".into()));
+    }
+    shrink(ed, tree)?;
+    for (i, &c) in copies.iter().enumerate() {
+        // Entries in nodes shared with `tree` are gone already; the copy's own nodes still have them.
+        unlink_in(ed, c)?;
+        let shared_inode = leaf(&paths[i + 1][2]) == leaf(&paths[0][2]);
+        match (had[i], shared_inode) {
+            (true, false) => shrink(ed, c)?,
+            (false, true) => return Err(Error::Unsupported("directory size shared with a snapshot without the entry".into())),
+            _ => {}
+        }
+    }
+    for p in all {
+        ed.repair_keys(p)?;
+    }
+    Ok(())
 }
 
 const INODE_REF_KEY: u8 = 12;
@@ -252,9 +377,8 @@ pub fn offline_subvolumes(fs: &Filesystem) -> Result<Vec<Subvolume>, Error> {
     let mut refs = Vec::new();
     fs.walk(fs.sb.root, 0, &mut |_, key, data| {
         if key.kind == ROOT_REF_KEY && (FIRST_FREE..=LAST_FREE).contains(&key.offset) {
-            let name_len = u16_at(data, 16) as usize;
-            let name = String::from_utf8_lossy(&data[18..18 + name_len]).into_owned();
-            refs.push((key.objectid, key.offset, u64_at(data, 0), name));
+            let (dirid, _, name) = root_ref(data)?;
+            refs.push((key.objectid, key.offset, dirid, String::from_utf8_lossy(name).into_owned()));
         }
         Ok(())
     })?;
@@ -284,8 +408,9 @@ pub fn offline_subvolumes(fs: &Filesystem) -> Result<Vec<Subvolume>, Error> {
                 let (key, data) = ed
                     .find_first(tree, ino, INODE_REF_KEY)?
                     .ok_or_else(|| Error::Format(format!("inode {ino} of subvolume {parent} has no name")))?;
-                let len = u16_at(&data, 8) as usize;
-                parts.push(String::from_utf8_lossy(&data[10..10 + len]).into_owned());
+                let len = data.get(8..10).map_or(0, |l| u16::from_le_bytes([l[0], l[1]]) as usize);
+                let name = data.get(10..10 + len).ok_or_else(|| Error::Format(format!("inode ref of {ino} truncated")))?;
+                parts.push(String::from_utf8_lossy(name).into_owned());
                 ino = key.offset;
             }
             let mut path = pp;
@@ -339,13 +464,20 @@ pub fn restore_plan(fs: &Filesystem, patterns: &[String]) -> Result<Option<(Excl
             break;
         }
     }
-    let exact: Vec<String> = subvols.iter().filter(|s| set.contains(&s.id)).map(|s| s.path.to_string_lossy().into_owned()).collect();
+    // The agent's snapshots in the image (`<SNAP_DIR>/<run>/<source id>.<name>`) share their
+    // source's nodes: they are edited along with it.
+    let (pinned, snapshots): (Vec<Pinned>, Vec<u64>) = subvols
+        .iter()
+        .filter(|s| s.path.starts_with(crate::prepare::SNAP_DIR) && s.path.components().count() == 3)
+        .filter_map(|s| {
+            let src = s.path.file_name()?.to_string_lossy().split('.').next()?.parse().ok()?;
+            Some((Pinned { subvol: src, snapshot_transid: 0 }, s.id))
+        })
+        .unzip();
     let map = crate::usedmap::UsedMap::build(fs)?;
     let data = map.ranges.iter().filter(|r| r.kind == crate::usedmap::Kind::Data).map(|r| (r.logical, r.len));
-    // No path is the agent's snapshot directory here: snapshots were found by UUID.
-    let none = Path::new("/");
     let picked = direct.iter().map(|s| s.path.clone()).collect();
-    Ok(plan(fs, &subvols, &[], &[], none, &exact, data)?.map(|e| (e, picked)))
+    Ok(plan_ids(fs, &subvols, &pinned, &snapshots, set, data)?.map(|e| (e, picked)))
 }
 
 #[cfg(test)]
@@ -359,6 +491,71 @@ mod tests {
         assert!(glob("btrbk_snapshots/@games.*", "btrbk_snapshots/@games.20261020T1200"));
         assert!(glob("*cache*", "@home/user/.cache"));
         assert!(!glob("@home/?", "@home/ab"));
+    }
+
+    #[test]
+    fn shared_nodes_found_from_their_refs() {
+        // A tree and the agent's snapshot of it: roots r and s, both pointing to node a, which
+        // points to leaf l.
+        let tree: edit::Path = vec![(10, 0), (20, 1), (30, 2)];
+        let snap: edit::Path = vec![(11, 0), (20, 1), (30, 2)];
+        let refs = |extra: &'static [(u64, u64)]| {
+            move |n: u64| Ok(match n {
+                20 => 2,
+                _ => 1,
+            } + extra.iter().filter(|e| e.0 == n).map(|e| e.1).sum::<u64>())
+        };
+        assert_eq!(shared_node(&[&tree, &snap], &mut refs(&[])).unwrap(), None);
+        // A third tree (snapper) points to a, or to l through a node of its own.
+        assert_eq!(shared_node(&[&tree, &snap], &mut refs(&[(20, 1)])).unwrap(), Some(20));
+        assert_eq!(shared_node(&[&tree, &snap], &mut refs(&[(30, 1)])).unwrap(), Some(30));
+        // Without the snapshot's path, a's second reference is unexplained.
+        assert_eq!(shared_node(&[&tree], &mut refs(&[])).unwrap(), Some(20));
+    }
+
+    #[test]
+    fn restore_exclusion_by_id_and_consistent() {
+        use std::os::unix::fs::FileExt;
+        let dir = std::env::temp_dir().join(format!("btrfs-image-test-{}-exclude", std::process::id()));
+        let root = dir.join("root");
+        std::fs::create_dir_all(root.join("keep")).unwrap();
+        for i in 0..1500 {
+            std::fs::write(root.join("keep").join(format!("file-with-a-long-name-{i}")), i.to_string()).unwrap();
+        }
+        for d in ["g*", "games"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+            std::fs::write(root.join(d).join("f"), d).unwrap();
+        }
+        let img = dir.join("fs.img");
+        std::fs::File::create(&img).unwrap().set_len(256 << 20).unwrap();
+        let ok = std::process::Command::new("mkfs.btrfs")
+            .args(["-q", "-f", "--rootdir"])
+            .arg(&root)
+            .args(["--subvol", "g*", "--subvol", "games"])
+            .arg(&img)
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            eprintln!("mkfs.btrfs not available: skipped");
+            return;
+        }
+        let fs = Filesystem::open(&img).unwrap();
+        // "g?" matches "g*" only; its path used as a pattern would match "games" too.
+        let (ex, picked) = restore_plan(&fs, &["g?".into()]).unwrap().unwrap();
+        assert_eq!(picked, vec![PathBuf::from("g*")]);
+        assert_eq!(ex.subvolumes, vec![PathBuf::from("g*")]);
+        let f = std::fs::OpenOptions::new().write(true).open(&img).unwrap();
+        for (logical, node) in &ex.nodes {
+            for phys in fs.physical(*logical).unwrap() {
+                f.write_all_at(node, phys).unwrap();
+            }
+        }
+        drop(f);
+        let check = std::process::Command::new("btrfs").args(["check", "--readonly"]).arg(&img).output();
+        if let Ok(out) = check {
+            assert!(out.status.success(), "btrfs check: {}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

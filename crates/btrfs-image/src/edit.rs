@@ -1,6 +1,7 @@
 //! Copy-on-read editing of btrfs trees for the image: nodes are read at the generation being
 //! imaged, changed in memory, and the changed copies (checksums recomputed) replace the
-//! originals in what is sent. The device is never written.
+//! originals in what is sent. The device is never written. A changed node keeps its address:
+//! every tree sharing it sees the change (callers must check what shares it).
 //!
 //! Only edits that fit in the existing nodes are supported: deleting and updating items,
 //! and inserting into a leaf with enough free space. Anything else (splitting or merging
@@ -17,7 +18,7 @@ pub struct Editor<'a> {
 }
 
 /// Path from a tree root to a leaf: (node, slot) per level, root first.
-type Path = Vec<(u64, usize)>;
+pub type Path = Vec<(u64, usize)>;
 
 fn nritems(n: &[u8]) -> usize {
     u32_at(n, 96) as usize
@@ -99,6 +100,35 @@ impl<'a> Editor<'a> {
             path.push((logical, slot));
             logical = ptr_child(&n, slot);
         }
+    }
+
+    /// Path from `root` to the leaf where `key` is or would be.
+    pub fn path(&self, root: u64, key: Key) -> Result<Path, Error> {
+        Ok(self.search(root, key)?.0)
+    }
+
+    /// Makes every key pointer on `path` (from [`Editor::path`], before the edits) equal to the
+    /// first key of the node it points to. `fix_keys` does it for the tree being edited; a node
+    /// it shares with other trees is also pointed to from their own nodes, which this repairs.
+    pub fn repair_keys(&mut self, path: &Path) -> Result<(), Error> {
+        for lvl in (0..path.len().saturating_sub(1)).rev() {
+            let ((parent, slot), child) = (path[lvl], path[lvl + 1].0);
+            let c = self.node(child)?;
+            if nritems(&c) == 0 {
+                return Err(Error::Unsupported(format!("node {child} left empty")));
+            }
+            let first = if level(&c) == 0 { item_key(&c, 0) } else { ptr_key(&c, 0) };
+            let mut p = self.node(parent)?;
+            if slot >= nritems(&p) || ptr_child(&p, slot) != child {
+                return Err(Error::Format(format!("node {parent} no longer points to {child}")));
+            }
+            if ptr_key(&p, slot) != first {
+                let o = HEADER_SIZE + slot * KEY_PTR_SIZE;
+                write_key(&mut p[o..o + 17], first);
+                self.changed.insert(parent, p);
+            }
+        }
+        Ok(())
     }
 
     /// First item with this objectid and type (any offset), if any.

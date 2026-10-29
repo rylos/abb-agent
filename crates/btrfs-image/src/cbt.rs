@@ -46,6 +46,14 @@ fn mix(x: u64) -> u64 {
     z ^ (z >> 31)
 }
 
+/// Contribution of tree node `r` to block `block`, if the node lies in it. A node not aligned
+/// to the node size (btrfs-convert of old, BTRFS_FS_UNALIGNED_TREE_BLOCK) can straddle two
+/// blocks: it counts in both, or a change in the second would go unseen.
+fn tree_part(r: &crate::usedmap::Range, block: u64) -> Option<u64> {
+    (r.physical / BLOCK <= block && (r.physical + r.len - 1) / BLOCK >= block)
+        .then(|| mix(r.physical ^ mix(r.logical ^ mix(r.generation ^ r.salt))))
+}
+
 impl Digests {
     fn add(&mut self, physical: u64, value: u64) {
         let i = (physical / BLOCK) as usize;
@@ -71,7 +79,14 @@ impl Digests {
                         d.table[b as usize] = ALWAYS;
                     }
                 }
-                Kind::Tree => d.add(r.physical, r.logical ^ mix(r.generation ^ r.salt)),
+                Kind::Tree => {
+                    for b in r.physical / BLOCK..=(r.physical + r.len - 1) / BLOCK {
+                        let t = &mut d.table[b as usize];
+                        if *t != ALWAYS {
+                            *t = t.wrapping_add(tree_part(r, b).unwrap_or(0));
+                        }
+                    }
+                }
                 Kind::Data => {}
             }
         }
@@ -158,7 +173,10 @@ impl Digests {
                 continue;
             }
             let content: &[u8] = match cap.data.get(&r.logical) {
-                Some(c) => c,
+                Some(c) if c.len() as u64 >= r.len => c,
+                Some(c) => {
+                    return Err(Error::Format(format!("captured extent at {} is {} bytes, not {}", r.logical, c.len(), r.len)));
+                }
                 None => {
                     buf.resize(r.len as usize, 0);
                     fs.read_at(&mut buf, r.physical)?;
@@ -212,8 +230,8 @@ impl Digests {
                 break;
             }
             match r.kind {
-                Kind::Tree if r.physical / BLOCK == block as u64 => {
-                    sum = sum.wrapping_add(mix(r.physical ^ mix(r.logical ^ mix(r.generation ^ r.salt))));
+                Kind::Tree => {
+                    sum = sum.wrapping_add(tree_part(r, block as u64).unwrap_or(0));
                 }
                 Kind::Data => {
                     let (rs, re) = (r.physical.max(start), (r.physical + r.len).min(end));
@@ -517,6 +535,7 @@ impl CbtMeta {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::usedmap::{Range, Stats};
 
     #[test]
     fn table_keeps_its_owner_and_reads_format_1() {
@@ -541,5 +560,27 @@ mod tests {
         let (t, meta) = Digests::load(&path).unwrap();
         assert_eq!((t.table, meta.version_id, meta.owner.as_str()), (vec![0, 7, 9], 5, ""));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn straddling_node_counts_in_both_blocks() {
+        let node = Range { physical: BLOCK - 4096, len: 16384, kind: Kind::Tree, logical: 1 << 30, generation: 7, salt: 0 };
+        assert!(tree_part(&node, 0).is_some());
+        assert!(tree_part(&node, 1).is_some());
+        assert!(tree_part(&node, 2).is_none());
+        let aligned = Range { physical: 2 * BLOCK, ..node };
+        assert_eq!((tree_part(&aligned, 1), tree_part(&aligned, 3)), (None, None));
+        assert!(tree_part(&aligned, 2).is_some());
+
+        // verify_block of the second block expects the node's contribution, as computed.
+        let map = UsedMap { excluded_data: Vec::new(), ranges: vec![node], stats: Stats::default() };
+        let table = vec![tree_part(&node, 0).unwrap(), tree_part(&node, 1).unwrap(), 0];
+        let d = Digests { table, covered: vec![0; 8], sector: 4096 };
+        let data = vec![0u8; BLOCK as usize];
+        assert!(d.verify_block(&map, 1, &data).is_ok());
+        assert!(d.verify_block(&map, 0, &data).is_ok());
+        // Same node, another generation: the second block changes too.
+        let moved = Range { generation: 8, ..node };
+        assert_ne!(tree_part(&moved, 1), tree_part(&node, 1));
     }
 }
