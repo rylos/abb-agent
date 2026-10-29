@@ -3,8 +3,10 @@
 //! After the snapshots and the superblock read (generation N), these remain exposed to reuse:
 //! - the nodes of the global trees (root, chunk, extent, csum, free space, dev, uuid, …);
 //! - the root node of every subvolume (the snapshot has a copy of it, it does not share it);
-//! - the nodes of a subvolume modified after its snapshot (generation > the snapshot's
-//!   otransid) and the data extents written in that window.
+//! - the nodes of a subvolume modified after its snapshot (generation >= the snapshot's
+//!   otransid: the snapshot is taken during the commit of that transaction, and the source can
+//!   still be changed in it afterwards, e.g. the snapshot's own directory entry when the
+//!   snapshot lives in the subvolume it copies) and the data extents written in that window.
 //!
 //! - the data of files deleted but still open (orphan inodes): btrfs drops them from a new
 //!   snapshot right after creating it, so only the live subvolume references them, whatever
@@ -166,8 +168,9 @@ struct Building {
 }
 
 /// Captures trees, level by level with parallel reads. With `since = Some(t)` only the nodes
-/// with generation > t are descended into (the others are shared with the snapshot) and the
-/// data extents written after t are captured.
+/// with generation >= t are descended into (older ones are shared with the snapshot taken in
+/// t; those of t itself may have been written after it) and the data extents written from t
+/// on are captured.
 fn capture_trees(fs: &Filesystem, cap: &mut Building, roots: Vec<(u64, u64, Option<u64>)>) -> Result<(), Error> {
     let mut frontier = roots;
     while !frontier.is_empty() {
@@ -181,7 +184,7 @@ fn capture_trees(fs: &Filesystem, cap: &mut Building, roots: Vec<(u64, u64, Opti
             for (node, &(logical, _, since)) in nodes.into_iter().zip(chunk) {
                 if node.header.level > 0 {
                     for (_, child, child_gen) in node.ptrs() {
-                        if since.is_none_or(|t| child_gen > t) {
+                        if since.is_none_or(|t| child_gen >= t) {
                             next.push((child, child_gen, since));
                         }
                     }
@@ -199,7 +202,7 @@ fn capture_trees(fs: &Filesystem, cap: &mut Building, roots: Vec<(u64, u64, Opti
                         let generation = u64_at(item, 0);
                         let disk_bytenr = u64_at(item, 21);
                         let disk_num_bytes = u64_at(item, 29);
-                        if generation > t && disk_bytenr != 0 && !cap.data.contains_key(&disk_bytenr) {
+                        if generation >= t && disk_bytenr != 0 && !cap.data.contains_key(&disk_bytenr) {
                             check_extent_len(disk_bytenr, disk_num_bytes)?;
                             let mut buf = vec![0u8; disk_num_bytes as usize];
                             fs.read_at(&mut buf, fs.physical(disk_bytenr)?[0])?;
