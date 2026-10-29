@@ -12,9 +12,9 @@ use crate::stream::{self, MIB, Piece};
 use crate::volume::Vol;
 use abb_proto::transport::{Error, Result};
 use abb_proto::{Connection, Value};
-use btrfs_image::cbt::Digests;
+use btrfs_image::cbt::{CbtMeta, Digests};
 use serde_json::{Value as Json, json};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 const GIB: f64 = (1u64 << 30) as f64;
@@ -392,8 +392,60 @@ fn used_estimate(intervals: &[Interval], volumes: &[Vol], d: &Disk) -> u64 {
     total
 }
 
-fn cbt_path(p: &Partition) -> std::path::PathBuf {
-    Path::new(crate::state::STATE_DIR).join("cbt").join(format!("{}.cbt", p.fs_uuid))
+/// Where the CBT table of a volume is kept, and what ties it to the volume. A table is used only
+/// for the same server and task, the same image on the server (a disk keeps its image, see
+/// `state::image_names`), the same partition and the same filesystem: applied to another volume
+/// it would mark as unchanged blocks that the server then takes from a different base.
+pub struct Table {
+    pub path: PathBuf,
+    pub owner: String,
+    /// Table of agent 0.2.13 and earlier (`cbt/<fs uuid>.cbt`, without owner): removed after the
+    /// next backup.
+    legacy: PathBuf,
+    /// The legacy table may be the base: no other volume of this backup has the same filesystem
+    /// UUID and the disk has a stable id, so its image is the one it was saved for.
+    legacy_ok: bool,
+    /// The file the base table was read from.
+    loaded: Option<PathBuf>,
+}
+
+/// The tables of `volume_parts`, for task `task_uuid` of server `ds_id`.
+fn tables(ds_id: &str, task_uuid: &str, disks: &[(Disk, Vec<Interval>)], volume_parts: &[Partition]) -> Vec<Table> {
+    let dir = Path::new(crate::state::STATE_DIR).join("cbt");
+    (0..volume_parts.len())
+        .map(|v| {
+            let p = &volume_parts[v];
+            let d = disks
+                .iter()
+                .find(|(_, iv)| iv.iter().any(|i| i.source == Source::Vol(v)))
+                .map(|(d, _)| d)
+                .expect("every volume is on a disk");
+            let key = format!("{}-p{}-{}", d.image, p.number, p.fs_uuid);
+            let unique = volume_parts.iter().filter(|q| q.fs_uuid == p.fs_uuid).count() == 1;
+            Table {
+                path: dir.join(format!("{key}.cbt")),
+                owner: format!("{ds_id}/{task_uuid}/{key}"),
+                legacy: dir.join(format!("{}.cbt", p.fs_uuid)),
+                legacy_ok: unique && disk::stable_id(&d.name).is_some(),
+                loaded: None,
+            }
+        })
+        .collect()
+}
+
+/// Why a saved table cannot be the base of this backup (`None` if it can): it must belong to
+/// `owner` (empty for a legacy table), to `base_version_id` and to a partition at `offset`.
+fn table_mismatch(meta: &CbtMeta, base_version_id: u64, offset: u64, owner: &str) -> Option<String> {
+    if meta.owner != owner {
+        return Some(if meta.owner.is_empty() { "has no owner".into() } else { format!("belongs to {}", meta.owner) });
+    }
+    if meta.version_id != base_version_id {
+        return Some(format!("is from version {} (base {base_version_id})", meta.version_id));
+    }
+    if meta.partition_offset != offset {
+        return Some(format!("is for a partition at offset {}", meta.partition_offset));
+    }
+    None
 }
 
 /// On btrfs the CBT tables live in a subvolume of their own, left out of the images: they are
@@ -438,24 +490,36 @@ pub fn cbt_subvolume() -> Option<std::path::PathBuf> {
 }
 
 /// CBT tables of the previous backup, by volume: `None` for a volume whose table does not match
-/// `base_version_id` (a new disk or volume), which is sent in full within the incremental.
-/// `None` overall when no volume has one: a full backup.
-fn previous_digests(volumes: &[Partition], base_version_id: u64) -> Option<Vec<Option<Digests>>> {
-    if base_version_id == 0 || volumes.is_empty() {
+/// `base_version_id` or the volume (a new disk or volume), which is sent in full within the
+/// incremental. `None` overall when no volume has one: a full backup.
+fn previous_digests(volume_parts: &[Partition], tables: &mut [Table], base_version_id: u64) -> Option<Vec<Option<Digests>>> {
+    if base_version_id == 0 || volume_parts.is_empty() {
         return None;
     }
-    let out: Vec<Option<Digests>> = volumes
+    let out: Vec<Option<Digests>> = volume_parts
         .iter()
-        .map(|p| match Digests::load(&cbt_path(p)) {
-            Ok((d, meta)) if meta.version_id == base_version_id && meta.partition_offset == p.offset => Some(d),
-            Ok((_, meta)) => {
-                eprintln!("{}: CBT table is from version {} (base {base_version_id}): sent in full", alias(p), meta.version_id);
-                None
+        .zip(tables.iter_mut())
+        .map(|(p, t)| {
+            let mut candidates = vec![(t.path.clone(), t.owner.as_str())];
+            if t.legacy_ok && !t.path.exists() {
+                candidates.push((t.legacy.clone(), ""));
             }
-            Err(e) => {
-                eprintln!("{}: no CBT table ({e}): sent in full", alias(p));
-                None
+            let mut why = "no CBT table".to_string();
+            for (path, owner) in candidates {
+                match Digests::load(&path) {
+                    Ok((d, meta)) => match table_mismatch(&meta, base_version_id, p.offset, owner) {
+                        None => {
+                            t.loaded = Some(path);
+                            return Some(d);
+                        }
+                        Some(m) => why = format!("CBT table {m}"),
+                    },
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => why = format!("CBT table: {e}"),
+                }
             }
+            eprintln!("{}: {why}: sent in full", alias(p));
+            None
         })
         .collect();
     out.iter().any(Option::is_some).then_some(out)
@@ -663,8 +727,9 @@ fn run_locked(sess: &Session, trigger: Trigger) -> Result<()> {
         vec![("subaction", Value::str("get_base_version")), ("task_id", Value::Int(task_id))],
     )?;
     let base_version_id = get_int(&base, "base_version_id")?;
-    let prev = previous_digests(&volume_parts, base_version_id);
-    let raws = stream::RawTables::load(&disks, base_version_id);
+    let mut tables = tables(&sess.state.ds_id, &task.uuid, &disks, &volume_parts);
+    let prev = previous_digests(&volume_parts, &mut tables, base_version_id);
+    let raws = stream::RawTables::load(&disks, base_version_id, &format!("{}/{}", sess.state.ds_id, task.uuid));
     let is_cbt = prev.is_some() as u64;
     let (rt, upd) = match trigger {
         Trigger::Server(rt) => {
@@ -729,7 +794,7 @@ fn run_locked(sess: &Session, trigger: Trigger) -> Result<()> {
         format!("full · version {version_id}")
     });
 
-    let outcome = run_inner(&job, &mut c, &task, start_time, &disks, &volume_parts, prev.as_deref(), &raws, version_id)
+    let outcome = run_inner(&job, &mut c, &task, start_time, &disks, &volume_parts, &tables, prev.as_deref(), &raws, version_id)
         .map(|complete| complete && !missed);
     let status = match &outcome {
         Ok(true) => "complete",
@@ -802,6 +867,7 @@ fn run_inner(
     start_time: u64,
     disks: &[(Disk, Vec<Interval>)],
     volume_parts: &[Partition],
+    tables: &[Table],
     prev: Option<&[Option<Digests>]>,
     raws: &stream::RawTables,
     version_id: u64,
@@ -833,10 +899,11 @@ fn run_inner(
     }
     // ext: blocks of unchanged files need not be read again.
     if let Some(prev) = prev {
-        for ((p, v), _) in volume_parts.iter().zip(volumes.iter_mut()).zip(prev).filter(|((p, _), old)| matches!(p.fs, Fs::Ext(_)) && old.is_some()) {
+        for (((p, v), _), t) in volume_parts.iter().zip(volumes.iter_mut()).zip(prev).zip(tables).filter(|(((p, _), old), _)| matches!(p.fs, Fs::Ext(_)) && old.is_some()) {
             // The CBT table of this volume belongs to the base version (checked when loaded).
-            let Ok((_, meta)) = Digests::load(&cbt_path(p)) else { continue };
-            if let Some(sigs) = crate::volume::load_inodes(&cbt_path(p).with_extension("inodes"), meta.version_id) {
+            let Some(src) = &t.loaded else { continue };
+            let Ok((_, meta)) = Digests::load(src) else { continue };
+            if let Some(sigs) = crate::volume::load_inodes(&src.with_extension("inodes"), meta.version_id) {
                 let n = v.plan_skip(&sigs);
                 eprintln!("{}: {n} blocks of 64 KiB belong to unchanged files, not read", alias(p));
             }
@@ -894,10 +961,13 @@ fn run_inner(
             }
         }
         // The version is on the server: the digests become the base for the next incremental.
-        for (p, v) in volume_parts.iter().zip(&volumes) {
-            let path = cbt_path(p);
-            if let Err(e) = std::fs::create_dir_all(path.parent().unwrap()).and_then(|_| v.save_digests(&path, version_id, p.offset)) {
-                eprintln!("saving CBT for {}: {e}", alias(p));
+        for ((p, v), t) in volume_parts.iter().zip(&volumes).zip(tables) {
+            match std::fs::create_dir_all(t.path.parent().unwrap()).and_then(|_| v.save_digests(&t.path, version_id, p.offset, &t.owner)) {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(&t.legacy);
+                    let _ = std::fs::remove_file(t.legacy.with_extension("inodes"));
+                }
+                Err(e) => eprintln!("saving CBT for {}: {e}", alias(p)),
             }
         }
         let complete = disks.iter().all(|(d, iv)| unsupported(d, iv).is_empty()) && volumes.iter().all(|v| !v.incomplete());
@@ -937,4 +1007,70 @@ pub fn bench(names: Vec<String>, limit: Option<u64>, image: Option<&str>) -> Res
         raw as f64 / MIB as f64 / s
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn part(name: &str, number: u32, offset: u64, fs: Fs, uuid: &str) -> Partition {
+        Partition {
+            name: name.into(),
+            number,
+            offset,
+            length: 1 << 30,
+            type_guid: String::new(),
+            fs,
+            fs_uuid: uuid.into(),
+            mount_path: String::new(),
+            mounts: vec![],
+            read_only: true,
+        }
+    }
+
+    fn disk(name: &str, parts: Vec<Partition>) -> Disk {
+        Disk { name: name.into(), image: name.into(), size: 4 << 30, sector_size: 512, layout: "GPT".into(), partitions: parts }
+    }
+
+    #[test]
+    fn cbt_table_must_match_owner_version_and_offset() {
+        let d = Digests::from_table(vec![1, 2]);
+        let meta = CbtMeta::new(7, 0, 1 << 20, &d).owned("ds/task/vda-p2-u");
+        assert_eq!(table_mismatch(&meta, 7, 1 << 20, "ds/task/vda-p2-u"), None);
+        // Another image (disks renamed), another server or task, a legacy table.
+        assert!(table_mismatch(&meta, 7, 1 << 20, "ds/task/vdb-p2-u").is_some());
+        assert!(table_mismatch(&meta, 7, 1 << 20, "ds2/task/vda-p2-u").is_some());
+        assert!(table_mismatch(&CbtMeta::new(7, 0, 1 << 20, &d), 7, 1 << 20, "ds/task/vda-p2-u").is_some());
+        assert_eq!(table_mismatch(&CbtMeta::new(7, 0, 1 << 20, &d), 7, 1 << 20, ""), None);
+        assert!(table_mismatch(&meta, 8, 1 << 20, "ds/task/vda-p2-u").is_some());
+        assert!(table_mismatch(&meta, 7, 2 << 20, "ds/task/vda-p2-u").is_some());
+    }
+
+    #[test]
+    fn clones_with_the_same_uuid_get_tables_of_their_own() {
+        let mut disks = Vec::new();
+        let mut parts = Vec::new();
+        for name in ["zzvda", "zzvdb"] {
+            let d = disk(name, vec![part(&format!("{name}2"), 2, 1 << 20, Fs::Ext(4), "same")]);
+            let mut mine = Vec::new();
+            let iv: Vec<Interval> = plan(&d, &mut mine, &Selection::WholeDevice)
+                .into_iter()
+                .map(|mut i| {
+                    if let Source::Vol(v) = i.source {
+                        i.source = Source::Vol(parts.len() + v);
+                    }
+                    i
+                })
+                .collect();
+            parts.extend(mine);
+            disks.push((d, iv));
+        }
+        let t = tables("ds", "task", &disks, &parts);
+        assert_eq!(t.len(), 2);
+        assert_ne!(t[0].path, t[1].path);
+        assert_eq!(t[0].owner, "ds/task/zzvda-p2-same");
+        assert_eq!(t[1].owner, "ds/task/zzvdb-p2-same");
+        // The legacy table (by UUID only) could belong to either: never used.
+        assert!(!t[0].legacy_ok && !t[1].legacy_ok);
+    }
 }

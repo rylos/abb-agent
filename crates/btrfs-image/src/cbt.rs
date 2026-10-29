@@ -24,6 +24,8 @@ const EXTENT_CSUM_OBJECTID: u64 = u64::MAX - 9;
 const EXTENT_CSUM_KEY: u8 = 128;
 const CSUM_SIZE: usize = 4;
 const MAGIC: &[u8; 8] = b"ABBCBT01";
+/// Format 2: the header is followed by the owner (u32 length, bytes).
+const MAGIC2: &[u8; 8] = b"ABBCBT02";
 /// Tags the contributions of sectors without checksums, which are computed from the content.
 const UNCOVERED: u64 = 1 << 40;
 
@@ -432,35 +434,52 @@ impl Digests {
         cur == ALWAYS || prev.table.get(block).copied().unwrap_or(0) != cur
     }
 
-    /// Saves the table together with the data that ties it to a server version.
+    /// Saves the table together with the data that ties it to a server version and a volume.
     pub fn save(&self, path: &Path, meta: &CbtMeta) -> std::io::Result<()> {
         let raw: Vec<u8> = self.table.iter().flat_map(|v| v.to_le_bytes()).collect();
         let packed = lz4_flex::block::compress_prepend_size(&raw);
         let tmp = path.with_extension("tmp");
         let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(MAGIC)?;
+        f.write_all(MAGIC2)?;
         for v in [meta.version_id, meta.generation, meta.partition_offset, meta.table_len()] {
             f.write_all(&v.to_le_bytes())?;
         }
+        f.write_all(&(meta.owner.len() as u32).to_le_bytes())?;
+        f.write_all(meta.owner.as_bytes())?;
         f.write_all(&packed)?;
         f.sync_all()?;
-        std::fs::rename(tmp, path)
+        std::fs::rename(tmp, path)?;
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            std::fs::File::open(dir)?.sync_all()?;
+        }
+        Ok(())
     }
 
+    /// Reads a table saved by `save`. Tables of format 1 have no owner (empty).
     pub fn load(path: &Path) -> std::io::Result<(Digests, CbtMeta)> {
         let mut f = std::fs::File::open(path)?;
         let mut all = Vec::new();
         f.read_to_end(&mut all)?;
-        if all.len() < 40 || &all[..8] != MAGIC {
-            return Err(std::io::Error::other("invalid CBT file"));
+        let invalid = || std::io::Error::other("invalid CBT file");
+        if all.len() < 40 || (&all[..8] != MAGIC && &all[..8] != MAGIC2) {
+            return Err(invalid());
         }
+        let (owner, data) = if &all[..8] == MAGIC2 {
+            let n = all.get(40..44).ok_or_else(invalid)?;
+            let n = u32::from_le_bytes(n.try_into().unwrap()) as usize;
+            let owner = all.get(44..44 + n).ok_or_else(invalid)?;
+            (String::from_utf8(owner.to_vec()).map_err(|_| invalid())?, 44 + n)
+        } else {
+            (String::new(), 40)
+        };
         let meta = CbtMeta {
             version_id: u64_at(&all, 8),
             generation: u64_at(&all, 16),
             partition_offset: u64_at(&all, 24),
             len: u64_at(&all, 32),
+            owner,
         };
-        let raw = lz4_flex::block::decompress_size_prepended(&all[40..]).map_err(std::io::Error::other)?;
+        let raw = lz4_flex::block::decompress_size_prepended(&all[data..]).map_err(std::io::Error::other)?;
         let table: Vec<u64> = raw.as_chunks::<8>().0.iter().map(|c| u64::from_le_bytes(*c)).collect();
         if table.len() as u64 != meta.len {
             return Err(std::io::Error::other("truncated CBT file"));
@@ -469,21 +488,58 @@ impl Digests {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct CbtMeta {
     /// Server version the table corresponds to.
     pub version_id: u64,
     pub generation: u64,
     pub partition_offset: u64,
     len: u64,
+    /// What the table belongs to (the caller's identity of server, task, image and volume);
+    /// empty in tables of format 1.
+    pub owner: String,
 }
 
 impl CbtMeta {
     pub fn new(version_id: u64, generation: u64, partition_offset: u64, d: &Digests) -> CbtMeta {
-        CbtMeta { version_id, generation, partition_offset, len: d.table.len() as u64 }
+        CbtMeta { version_id, generation, partition_offset, len: d.table.len() as u64, owner: String::new() }
+    }
+
+    pub fn owned(self, owner: &str) -> CbtMeta {
+        CbtMeta { owner: owner.to_string(), ..self }
     }
 
     fn table_len(&self) -> u64 {
         self.len
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn table_keeps_its_owner_and_reads_format_1() {
+        let dir = std::env::temp_dir().join(format!("abb-cbt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = Digests::from_table(vec![0, 7, 9]);
+        let path = dir.join("a.cbt");
+        d.save(&path, &CbtMeta::new(12, 34, 1 << 20, &d).owned("server task sda 2 uuid")).unwrap();
+        let (t, meta) = Digests::load(&path).unwrap();
+        assert_eq!(t.table, vec![0, 7, 9]);
+        assert_eq!((meta.version_id, meta.generation, meta.partition_offset), (12, 34, 1 << 20));
+        assert_eq!(meta.owner, "server task sda 2 uuid");
+
+        // Format 1: same header, no owner.
+        let mut old = MAGIC.to_vec();
+        for v in [5u64, 6, 7, 3] {
+            old.extend(v.to_le_bytes());
+        }
+        old.extend(lz4_flex::block::compress_prepend_size(&[0u64, 7, 9].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()));
+        std::fs::write(&path, old).unwrap();
+        let (t, meta) = Digests::load(&path).unwrap();
+        assert_eq!((t.table, meta.version_id, meta.owner.as_str()), (vec![0, 7, 9], 5, ""));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

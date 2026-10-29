@@ -45,6 +45,9 @@ pub enum Check {
 pub struct RawTables {
     pub prev: Vec<std::collections::HashMap<u64, u64>>,
     pub cur: Mutex<Vec<std::collections::HashMap<u64, u64>>>,
+    /// Server and task the digests belong to: version ids of another server or task say
+    /// nothing about the base.
+    owner: String,
 }
 
 impl RawTables {
@@ -52,14 +55,14 @@ impl RawTables {
         std::path::Path::new(crate::state::STATE_DIR).join("cbt").join(format!("{}.raw", d.image_name()))
     }
 
-    /// The previous backup's digests, if they belong to `base_version_id`.
-    pub fn load(disks: &[(Disk, Vec<Interval>)], base_version_id: u64) -> RawTables {
+    /// The previous backup's digests, if they belong to `base_version_id` of `owner`.
+    pub fn load(disks: &[(Disk, Vec<Interval>)], base_version_id: u64, owner: &str) -> RawTables {
         let prev = disks
             .iter()
             .map(|(d, _)| {
                 let j: Option<serde_json::Value> = std::fs::read(Self::path(d)).ok().and_then(|b| serde_json::from_slice(&b).ok());
                 match j {
-                    Some(j) if j["version_id"].as_u64() == Some(base_version_id) => j["blocks"]
+                    Some(j) if j["version_id"].as_u64() == Some(base_version_id) && j["owner"].as_str() == Some(owner) => j["blocks"]
                         .as_object()
                         .map(|m| m.iter().filter_map(|(k, v)| Some((k.parse().ok()?, v.as_u64()?))).collect())
                         .unwrap_or_default(),
@@ -67,7 +70,7 @@ impl RawTables {
                 }
             })
             .collect();
-        RawTables { prev, cur: Mutex::new(vec![Default::default(); disks.len()]) }
+        RawTables { prev, cur: Mutex::new(vec![Default::default(); disks.len()]), owner: owner.to_string() }
     }
 
     /// Saves this backup's digests as the base for the next one.
@@ -75,7 +78,7 @@ impl RawTables {
         let cur = self.cur.lock().unwrap();
         for ((d, _), blocks) in disks.iter().zip(cur.iter()) {
             let m: serde_json::Map<String, serde_json::Value> = blocks.iter().map(|(k, v)| (k.to_string(), (*v).into())).collect();
-            let j = serde_json::json!({ "version_id": version_id, "blocks": m });
+            let j = serde_json::json!({ "version_id": version_id, "owner": self.owner, "blocks": m });
             if let Err(e) = crate::state::write_atomic(&Self::path(d), j.to_string().as_bytes(), 0o644) {
                 eprintln!("saving the digests of {}: {e}", d.name);
             }
@@ -483,7 +486,7 @@ pub fn bench(disks: &[(Disk, Vec<Interval>)], volumes: &[Vol], limit: Option<u64
                 .transpose()
         })
         .collect::<std::io::Result<_>>()?;
-    let raws = RawTables { prev: vec![Default::default(); disks.len()], cur: Mutex::new(vec![Default::default(); disks.len()]) };
+    let raws = RawTables { prev: vec![Default::default(); disks.len()], cur: Mutex::new(vec![Default::default(); disks.len()]), owner: String::new() };
     let t = Instant::now();
     parallel_ordered(
         jobs.len(),

@@ -427,15 +427,15 @@ impl Vol {
         }
     }
 
-    /// Digests to save as the base for the next incremental.
-    pub fn save_digests(&self, path: &std::path::Path, version_id: u64, partition_offset: u64) -> std::io::Result<()> {
+    /// Digests to save as the base for the next incremental, tied to `owner` (see `backup::Table`).
+    pub fn save_digests(&self, path: &std::path::Path, version_id: u64, partition_offset: u64, owner: &str) -> std::io::Result<()> {
         match self {
             Vol::Btrfs { prep, digests } => {
-                digests.save(path, &CbtMeta::new(version_id, prep.fs.sb.generation, partition_offset, digests))
+                digests.save(path, &CbtMeta::new(version_id, prep.fs.sb.generation, partition_offset, digests).owned(owner))
             }
             Vol::Ext(x) => {
                 let d = Digests::from_table(x.table.iter().map(|a| a.load(Ordering::Relaxed)).collect());
-                d.save(path, &CbtMeta::new(version_id, x.fs.wtime as u64, partition_offset, &d))?;
+                d.save(path, &CbtMeta::new(version_id, x.fs.wtime as u64, partition_offset, &d).owned(owner))?;
                 match &x.inodes {
                     Some(i) => save_inodes(&path.with_extension("inodes"), version_id, &i.sigs),
                     None => {
