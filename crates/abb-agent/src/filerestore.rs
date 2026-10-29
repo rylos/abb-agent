@@ -129,12 +129,24 @@ pub fn check(sess: &Session) {
         let state = sess.state.clone();
         std::thread::spawn(move || {
             let id = r.running_task_id;
+            // Even after a panic: otherwise the restore could never start again.
+            let _active = Active(id);
             let s = Session::new(state);
             if let Err(e) = run(&s, r) {
                 eprintln!("file restore {id}: {e}");
             }
-            ACTIVE.lock().unwrap().as_mut().map(|a| a.remove(&id));
         });
+    }
+}
+
+/// A restore in [`ACTIVE`] while this lives.
+struct Active(u64);
+
+impl Drop for Active {
+    fn drop(&mut self) {
+        if let Some(a) = ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            a.remove(&self.0);
+        }
     }
 }
 
@@ -181,9 +193,11 @@ impl Report<'_> {
         self.last = Instant::now();
         let mut c = self.sess.connect()?;
         if !self.logs.is_empty() {
-            let logs = std::mem::take(&mut self.logs);
-            if let Err(e) = self.sess.call(&mut c, "log_report", vec![("subaction", Value::str("result_detail")), ("logs", Value::Array(logs))]) {
-                eprintln!("log_report: {e}");
+            // Kept until sent: tried again with the next report.
+            let logs = Value::Array(self.logs.clone());
+            match self.sess.call(&mut c, "log_report", vec![("subaction", Value::str("result_detail")), ("logs", logs)]) {
+                Ok(_) => self.logs.clear(),
+                Err(e) => eprintln!("log_report: {e}"),
             }
         }
         if !self.done.is_empty() {
@@ -243,6 +257,12 @@ pub fn run(sess: &Session, r: Restore) -> Result<()> {
                 attempts += 1;
                 eprintln!("file restore {id}: {e}; reconnecting");
                 writer.abandon();
+                // Finished paths reported first, or the server sends them again.
+                match report.flush() {
+                    Ok(RUNNING) => {}
+                    Ok(_) => break Err(Stop::Cancelled),
+                    Err(e) => eprintln!("file restore {id}: reporting progress: {e}"),
+                }
                 std::thread::sleep(Duration::from_secs(10 * attempts));
             }
             Err(Stop::Disconnected(e)) => break Err(Stop::Failed(e.to_string())),
@@ -264,17 +284,19 @@ pub fn run(sess: &Session, r: Restore) -> Result<()> {
         }
         Err(Stop::Disconnected(_)) => unreachable!(),
     };
-    report.flush()?;
-    let mut c = sess.connect()?;
-    let reply = sess.call(
-        &mut c,
-        "restore",
-        vec![
-            ("subaction", Value::str("check_complete")),
-            ("running_task_id", Value::Int(id)),
-            ("status", Value::str(status)),
-        ],
-    )?;
+    // Without check_complete the task would stay running on the server: tried a few times.
+    let mut attempts = 0;
+    let reply = loop {
+        match complete(sess, &mut report, status) {
+            Ok(reply) => break reply,
+            Err(e) if attempts < 5 => {
+                attempts += 1;
+                eprintln!("file restore {id}: ending the task: {e}; trying again");
+                std::thread::sleep(Duration::from_secs(5 << attempts));
+            }
+            Err(e) => return Err(e),
+        }
+    };
     eprintln!(
         "file restore {id}: {} ({} restored, {} skipped, {} failed)",
         reply.get("status").and_then(Value::as_str).unwrap_or(status),
@@ -283,6 +305,21 @@ pub fn run(sess: &Session, r: Restore) -> Result<()> {
         report.failed
     );
     Ok(())
+}
+
+/// Last report and `check_complete` with the outcome.
+fn complete(sess: &Session, report: &mut Report, status: &str) -> Result<Value> {
+    report.flush()?;
+    let mut c = sess.connect()?;
+    sess.call(
+        &mut c,
+        "restore",
+        vec![
+            ("subaction", Value::str("check_complete")),
+            ("running_task_id", Value::Int(report.r.running_task_id)),
+            ("status", Value::str(status)),
+        ],
+    )
 }
 
 /// One `get_file` channel, until the server says there is nothing more.
