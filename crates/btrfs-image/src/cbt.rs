@@ -156,7 +156,10 @@ impl Digests {
                 continue;
             }
             let content: &[u8] = match cap.data.get(&r.logical) {
-                Some(c) => c,
+                Some(c) if c.len() as u64 >= r.len => c,
+                Some(c) => {
+                    return Err(Error::Format(format!("captured extent at {} is {} bytes, not {}", r.logical, c.len(), r.len)));
+                }
                 None => {
                     buf.resize(r.len as usize, 0);
                     fs.read_at(&mut buf, r.physical)?;

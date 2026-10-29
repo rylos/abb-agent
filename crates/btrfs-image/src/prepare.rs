@@ -190,9 +190,9 @@ pub fn prepare(
                 .ok_or_else(|| Error::Format(format!("snapshot with unexpected name: {}", s.path.display())))?;
             let otransid = items
                 .iter()
-                .find(|(i, _)| *i == s.id)
+                .find(|(i, d)| *i == s.id && d.len() >= 311)
                 .map(|(_, d)| u64_at(d, 303))
-                .ok_or_else(|| Error::Format(format!("ROOT_ITEM of {} missing", s.id)))?;
+                .ok_or_else(|| Error::Format(format!("ROOT_ITEM of {} missing or without otransid", s.id)))?;
             pinned.push(Pinned { subvol: src, snapshot_transid: otransid });
             snap_ids.push(s.id);
             ours.push(s.id);

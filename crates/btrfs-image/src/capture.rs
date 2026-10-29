@@ -63,7 +63,8 @@ pub fn capture(fs: &Filesystem, pinned: &[Pinned], snapshots: &[u64], unpinnable
     let mut roots: Vec<(u64, u64, u64)> = Vec::new(); // (objectid, bytenr, generation)
     fs.walk(fs.sb.root, 0, &mut |_, key, data| {
         if key.kind == ROOT_ITEM_KEY {
-            roots.push((key.objectid, u64_at(data, 176), u64_at(data, 160)));
+            let (bytenr, generation) = root_location(data)?;
+            roots.push((key.objectid, bytenr, generation));
         }
         Ok(())
     })?;
@@ -100,6 +101,7 @@ pub fn capture(fs: &Filesystem, pinned: &[Pinned], snapshots: &[u64], unpinnable
                 }
             })?;
             for (disk_bytenr, disk_num_bytes) in extents {
+                check_extent_len(disk_bytenr, disk_num_bytes)?;
                 if cap.data.contains_key(&disk_bytenr) {
                     continue;
                 }
@@ -147,6 +149,15 @@ fn walk_range(fs: &Filesystem, root: u64, root_gen: u64, lo: Key, hi: Key, item:
     Ok(())
 }
 
+/// A data extent is at most 128 MiB (256 MiB preallocated): anything else is a corrupt item,
+/// not a size to allocate.
+fn check_extent_len(disk_bytenr: u64, len: u64) -> Result<(), Error> {
+    if len == 0 || len > crate::usedmap::MAX_DATA_EXTENT {
+        return Err(Error::Format(format!("data extent at {disk_bytenr} of {len} bytes")));
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 struct Building {
     nodes: HashMap<u64, Vec<u8>>,
@@ -176,13 +187,20 @@ fn capture_trees(fs: &Filesystem, cap: &mut Building, roots: Vec<(u64, u64, Opti
                     }
                 } else if let Some(t) = since {
                     for (key, item) in node.items() {
-                        if key.kind != EXTENT_DATA_KEY || item[20] == FILE_EXTENT_INLINE {
+                        if key.kind != EXTENT_DATA_KEY {
+                            continue;
+                        }
+                        if item.len() < 21 || item[20] != FILE_EXTENT_INLINE && item.len() < 37 {
+                            return Err(Error::Format(format!("file extent item of {} bytes in node {logical}", item.len())));
+                        }
+                        if item[20] == FILE_EXTENT_INLINE {
                             continue;
                         }
                         let generation = u64_at(item, 0);
                         let disk_bytenr = u64_at(item, 21);
                         let disk_num_bytes = u64_at(item, 29);
                         if generation > t && disk_bytenr != 0 && !cap.data.contains_key(&disk_bytenr) {
+                            check_extent_len(disk_bytenr, disk_num_bytes)?;
                             let mut buf = vec![0u8; disk_num_bytes as usize];
                             fs.read_at(&mut buf, fs.physical(disk_bytenr)?[0])?;
                             cap.data_bytes += disk_num_bytes;

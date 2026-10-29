@@ -13,6 +13,9 @@ pub enum Kind {
     Data,
 }
 
+/// Largest data extent: 128 MiB written, 256 MiB preallocated (btrfs_prealloc_file_range).
+pub const MAX_DATA_EXTENT: u64 = 256 << 20;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Range {
     pub physical: u64,
@@ -47,8 +50,12 @@ pub struct UsedMap {
 impl UsedMap {
     pub fn build(fs: &Filesystem) -> Result<UsedMap, Error> {
         let nodesize = fs.sb.nodesize as u64;
+        let sector = fs.sb.sectorsize as u64;
         let mut ranges = Vec::new();
         let mut stats = Stats::default();
+        if fs.sb.total_bytes < 1 << 20 {
+            return Err(Error::Format(format!("device of {} bytes", fs.sb.total_bytes)));
+        }
 
         ranges.push(Range { physical: 0, len: 1 << 20, kind: Kind::Reserved, logical: 0, generation: 0, salt: 0 });
         for &m in &SUPER_MIRRORS[1..] {
@@ -60,9 +67,19 @@ impl UsedMap {
         let (extent_root, extent_gen) = fs.tree_root(EXTENT_TREE_OBJECTID)?;
         let mut extents: Vec<(u64, u64, Kind, u64)> = Vec::new();
         fs.walk(extent_root, extent_gen, &mut |_, key, data| {
+            let short = |need: usize| {
+                if data.len() < need {
+                    return Err(Error::Format(format!("extent item of {} bytes at {}", data.len(), key.objectid)));
+                }
+                Ok(())
+            };
             match key.kind {
-                METADATA_ITEM_KEY => extents.push((key.objectid, nodesize, Kind::Tree, u64_at(data, 8))),
+                METADATA_ITEM_KEY => {
+                    short(24)?;
+                    extents.push((key.objectid, nodesize, Kind::Tree, u64_at(data, 8)));
+                }
                 EXTENT_ITEM_KEY => {
+                    short(24)?;
                     let flags = u64_at(data, 16);
                     let kind = if flags & EXTENT_FLAG_TREE_BLOCK != 0 { Kind::Tree } else { Kind::Data };
                     extents.push((key.objectid, key.offset, kind, u64_at(data, 8)));
@@ -73,6 +90,15 @@ impl UsedMap {
         })?;
 
         for (logical, len, kind, generation) in extents {
+            // Sizes and places that the tables built on this map can rely on.
+            let bad = match kind {
+                Kind::Tree => len != nodesize,
+                _ => len == 0 || len > MAX_DATA_EXTENT || len % sector != 0,
+            } || logical % sector != 0;
+            let c = fs.chunk_of(logical)?;
+            if bad || logical + len > c.logical + c.length {
+                return Err(Error::Format(format!("{kind:?} extent at {logical} of {len} bytes")));
+            }
             match kind {
                 Kind::Tree => {
                     stats.tree_blocks += 1;

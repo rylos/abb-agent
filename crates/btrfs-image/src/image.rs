@@ -30,17 +30,9 @@ pub fn range_bytes(
         return Ok(bytes.clone());
     }
     match kind {
-        Kind::Tree => {
-            // Verify the node, then use the bytes read from the requested stripe
-            // (with DUP the second copy has the same content).
-            let node = fs.read_node(logical, 0)?;
-            let mut copy = vec![0u8; len as usize];
-            fs.read_at(&mut copy, physical)?;
-            if copy != node.data {
-                return Err(Error::Changed { logical, reason: "DUP copies differ".into() });
-            }
-            Ok(copy)
-        }
+        // The node verified from either copy, for both copies: a bad copy on the device is
+        // repaired in the image.
+        Kind::Tree => Ok(fs.read_node(logical, 0)?.data),
         Kind::Data => {
             let mut buf = vec![0u8; len as usize];
             fs.read_at(&mut buf, physical)?;
@@ -78,7 +70,8 @@ pub fn write_image(fs: &Filesystem, cap: &Capture, map: &UsedMap, out: &File) ->
 /// Returns `false` if the window contains no used bytes.
 pub fn fill_window(fs: &Filesystem, cap: &Capture, map: &UsedMap, start: u64, buf: &mut [u8]) -> Result<bool, Error> {
     let end = start + buf.len() as u64;
-    // First range that may overlap the window (no range exceeds 128 MiB).
+    // First range that may overlap the window: ranges do not overlap, so their ends are sorted
+    // too and the search is exact (the margin only makes it look further back).
     let first = map.ranges.partition_point(|r| r.physical + r.len <= start.saturating_sub(128 << 20));
     let mut cursor = start; // the window is already done up to here
     let mut any = false;
@@ -100,19 +93,22 @@ pub fn fill_window(fs: &Filesystem, cap: &Capture, map: &UsedMap, start: u64, bu
             Kind::Tree => {
                 if let Some(node) = cap.nodes.get(&r.logical) {
                     dst.copy_from_slice(&node[src_off..src_off + dst.len()]);
-                } else if rs == r.physical && re == r.physical + r.len {
-                    fs.verify_node(r.logical, 0, dst)?;
+                } else if rs == r.physical && re == r.physical + r.len && fs.verify_node(r.logical, r.generation, dst).is_ok() {
+                    // Verified in place. The allocation transaction of the extent is the node's
+                    // generation: an older node still there (a lost write) does not pass.
                 } else {
-                    // Node straddling the window: verify it by reading it in full.
-                    let mut node = vec![0u8; r.len as usize];
-                    fs.read_at(&mut node, r.physical)?;
-                    fs.verify_node(r.logical, 0, &node)?;
-                    dst.copy_from_slice(&node[src_off..src_off + dst.len()]);
+                    // Node straddling the window, or this copy failed: verified in full, from
+                    // whichever copy is good (DUP).
+                    let node = fs.read_node(r.logical, r.generation)?;
+                    dst.copy_from_slice(&node.data[src_off..src_off + dst.len()]);
                 }
             }
             Kind::Data => {
                 if let Some(data) = cap.data.get(&r.logical) {
-                    dst.copy_from_slice(&data[src_off..src_off + dst.len()]);
+                    let src = data.get(src_off..src_off + dst.len()).ok_or_else(|| {
+                        Error::Format(format!("captured extent at {} is {} bytes, not {}", r.logical, data.len(), r.len))
+                    })?;
+                    dst.copy_from_slice(src);
                 }
             }
             Kind::Reserved => {

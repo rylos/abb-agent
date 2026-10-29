@@ -201,8 +201,8 @@ pub fn plan(
             // The directory entry is inside a tree that goes away too.
             continue;
         }
-        let (dirid, index, nlen) = (u64_at(&rref, 0), u64_at(&rref, 8), u16_at(&rref, 16) as usize);
-        let name = rref[18..18 + nlen].to_vec();
+        let (dirid, index, name) = root_ref(&rref)?;
+        let (nlen, name) = (name.len(), name.to_vec());
         let (ptree, _) = root_of(parent).ok_or_else(|| Error::Format(format!("root of subvolume {parent} not found")))?;
         ed.delete(ptree, Key { objectid: dirid, kind: DIR_INDEX_KEY, offset: index })?;
         let dkey = Key { objectid: dirid, kind: DIR_ITEM_KEY, offset: name_hash(&name) };
@@ -214,6 +214,9 @@ pub fn plan(
         while o + 30 <= ditem.len() {
             let (dlen, elen) = (u16_at(&ditem, o + 25) as usize, u16_at(&ditem, o + 27) as usize);
             let end = o + 30 + elen + dlen;
+            if end > ditem.len() {
+                return Err(Error::Format("truncated directory item".into()));
+            }
             if !removed && ditem[o + 30..o + 30 + elen] == name[..] {
                 removed = true;
             } else {
@@ -252,9 +255,8 @@ pub fn offline_subvolumes(fs: &Filesystem) -> Result<Vec<Subvolume>, Error> {
     let mut refs = Vec::new();
     fs.walk(fs.sb.root, 0, &mut |_, key, data| {
         if key.kind == ROOT_REF_KEY && (FIRST_FREE..=LAST_FREE).contains(&key.offset) {
-            let name_len = u16_at(data, 16) as usize;
-            let name = String::from_utf8_lossy(&data[18..18 + name_len]).into_owned();
-            refs.push((key.objectid, key.offset, u64_at(data, 0), name));
+            let (dirid, _, name) = root_ref(data)?;
+            refs.push((key.objectid, key.offset, dirid, String::from_utf8_lossy(name).into_owned()));
         }
         Ok(())
     })?;
@@ -284,8 +286,9 @@ pub fn offline_subvolumes(fs: &Filesystem) -> Result<Vec<Subvolume>, Error> {
                 let (key, data) = ed
                     .find_first(tree, ino, INODE_REF_KEY)?
                     .ok_or_else(|| Error::Format(format!("inode {ino} of subvolume {parent} has no name")))?;
-                let len = u16_at(&data, 8) as usize;
-                parts.push(String::from_utf8_lossy(&data[10..10 + len]).into_owned());
+                let len = data.get(8..10).map_or(0, |l| u16::from_le_bytes([l[0], l[1]]) as usize);
+                let name = data.get(10..10 + len).ok_or_else(|| Error::Format(format!("inode ref of {ino} truncated")))?;
+                parts.push(String::from_utf8_lossy(name).into_owned());
                 ino = key.offset;
             }
             let mut path = pp;
