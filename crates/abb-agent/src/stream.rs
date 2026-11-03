@@ -75,6 +75,10 @@ impl RawTables {
 
     /// Saves this backup's digests as the base for the next one.
     pub fn save(&self, disks: &[(Disk, Vec<Interval>)], version_id: u64) {
+        // The directory is otherwise created only when the volume tables are written, which
+        // happens after this call: the first backup of a disk would fail here with ENOENT.
+        let dir = std::path::Path::new(crate::state::STATE_DIR).join("cbt");
+        let _ = std::fs::create_dir_all(dir);
         let cur = self.cur.lock().unwrap();
         for ((d, _), blocks) in disks.iter().zip(cur.iter()) {
             let m: serde_json::Map<String, serde_json::Value> = blocks.iter().map(|(k, v)| (k.to_string(), (*v).into())).collect();
