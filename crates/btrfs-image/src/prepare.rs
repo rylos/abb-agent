@@ -75,7 +75,72 @@ pub fn top_mount(dev: &Path, uuid: &str) -> Result<(PathBuf, bool), Error> {
 /// they belong to this filesystem.
 /// `before_snapshot` is called with the subvolumes that will be left out, before the snapshots
 /// are taken (so that what it writes ends up in the image).
+/// Waits before each new attempt of [`prepare`] after the filesystem changed under it.
+const PREPARE_RETRY: [u64; 5] = [15, 30, 60, 120, 240];
+
+/// Snapshots the volume and builds the plan (see [`Prepared`]). The trees not covered by the
+/// snapshots (root, extent, csum, …) are read from the device while btrfs keeps committing:
+/// on a busy filesystem (right after boot, a package upgrade) a node read may already have
+/// been reused by a later transaction. That is transient, so the run's snapshots are dropped
+/// and everything is redone after a pause, up to `PREPARE_RETRY.len()` times, before failing.
 pub fn prepare(
+    dev: &Path,
+    uuid: &str,
+    run_name: &str,
+    exclude: &[String],
+    exclude_dirs: &[PathBuf],
+    before_snapshot: &mut dyn FnMut(&[PathBuf]),
+) -> Result<Prepared, Error> {
+    let mut attempt = 0;
+    loop {
+        let r = prepare_once(dev, uuid, run_name, exclude, exclude_dirs, before_snapshot);
+        if r.is_err() {
+            // `prepare_once` returns early on errors: its snapshots and mount are still there.
+            if let Err(e) = remove_run(dev, uuid, run_name) {
+                eprintln!("removing the snapshots of the failed attempt: {e}");
+            }
+        }
+        match r {
+            Err(e @ Error::Changed { .. }) if attempt < PREPARE_RETRY.len() => {
+                let wait = PREPARE_RETRY[attempt];
+                attempt += 1;
+                eprintln!("{e}: the filesystem is busy, new attempt ({attempt}/{}) in {wait}s", PREPARE_RETRY.len());
+                std::thread::sleep(Duration::from_secs(wait));
+            }
+            r => {
+                if r.is_ok() && attempt > 0 {
+                    eprintln!("prepared at attempt {}", attempt + 1);
+                }
+                return r;
+            }
+        }
+    }
+}
+
+/// Deletes the snapshots of run `run_name` and unmounts the volume root if the agent mounted it.
+fn remove_run(dev: &Path, uuid: &str, run_name: &str) -> Result<(), Error> {
+    let (top, mounted_by_us) = top_mount(dev, uuid)?;
+    // A root left mounted by the failed attempt is found as "already mounted": it is ours anyway.
+    let ours = mounted_by_us || top == Path::new(&format!("/run/abb-agent/top-{uuid}"));
+    let run = top.join(SNAP_DIR).join(run_name);
+    let result = (|| -> Result<(), Error> {
+        let Ok(rd) = std::fs::read_dir(&run) else { return Ok(()) };
+        let mut names: Vec<String> = rd.filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned())).collect();
+        names.sort();
+        for n in &names {
+            snapshot::destroy(&run, n)?;
+        }
+        std::fs::remove_dir(&run)?;
+        let _ = std::fs::remove_dir(top.join(SNAP_DIR));
+        Ok(())
+    })();
+    if ours {
+        top_unmount(&top);
+    }
+    result
+}
+
+fn prepare_once(
     dev: &Path,
     uuid: &str,
     run_name: &str,
