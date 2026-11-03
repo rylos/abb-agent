@@ -35,6 +35,9 @@ pub struct Schedule {
     /// One backup after every boot, as soon as the server is reachable (on top of the schedule
     /// set in the ABB console).
     pub on_boot: bool,
+    /// Seconds after boot before that backup starts: right after boot the system writes a lot
+    /// (services, login, timers) and btrfs commits often, which can fail the run.
+    pub on_boot_delay: u64,
     /// Hours between backups, on top of the console schedule (0 = none).
     pub interval_hours: u64,
     /// Minutes before retrying a failed backup.
@@ -49,7 +52,7 @@ pub struct Schedule {
 
 impl Default for Schedule {
     fn default() -> Schedule {
-        Schedule { on_boot: true, interval_hours: 0, retry_minutes: 60, wait_locks: Vec::new(), only_if: String::new() }
+        Schedule { on_boot: true, on_boot_delay: 30, interval_hours: 0, retry_minutes: 60, wait_locks: Vec::new(), only_if: String::new() }
     }
 }
 
@@ -133,6 +136,8 @@ mod tests {
         // Uncommenting a setting under its section line works.
         let edited = shipped.replace("# on_boot = true", "on_boot = false");
         assert!(!toml::from_str::<Config>(&edited).unwrap().schedule.on_boot);
+        let edited = shipped.replace("# on_boot_delay = 30", "on_boot_delay = 120");
+        assert_eq!(toml::from_str::<Config>(&edited).unwrap().schedule.on_boot_delay, 120);
         // Without the section line, the error says where it belongs.
         let e = toml::from_str::<Config>("on_boot = false").unwrap_err().to_string();
         assert!(misplaced(&e).contains("[schedule]"), "{e}");

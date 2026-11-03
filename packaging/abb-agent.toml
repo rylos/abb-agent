@@ -26,6 +26,9 @@
 #
 # Back up once after every boot, as soon as the server is reachable.
 # on_boot = true
+# Seconds to wait after boot before that backup, while the system settles (services, login):
+# the snapshots of a filesystem being written heavily are more likely to need a retry.
+# on_boot_delay = 30
 # Back up every N hours in addition to the console schedule (0 = never).
 # interval_hours = 0
 # Minutes before retrying a failed backup (0 = do not retry).

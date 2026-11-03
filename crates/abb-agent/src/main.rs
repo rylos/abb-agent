@@ -406,7 +406,7 @@ fn status(watch: bool) {
             println!("{}", st.row("Console", &console));
         }
     }
-    let mut local = vec![format!("after boot: {}", if sc.on_boot { "yes" } else { "no" })];
+    let mut local = vec![format!("after boot: {}", if sc.on_boot { format!("yes, {} s after it", sc.on_boot_delay) } else { "no".into() })];
     if sc.interval_hours > 0 {
         local.push(format!("every {} h", sc.interval_hours));
     }

@@ -38,8 +38,9 @@ pub fn local_due(sc: &LocalSchedule, last: &LastRun, since: u64) -> Option<(u64,
     if failed && sc.retry_minutes > 0 {
         due.push((last.start + sc.retry_minutes * 60, (TRIGGER_SCHEDULE, None)));
     }
-    if sc.on_boot && done < boot_time() && !failed {
-        due.push((0, (TRIGGER_EVENT, Some(EVENT_STARTUP))));
+    let boot = boot_time();
+    if sc.on_boot && done < boot && !failed {
+        due.push((boot + sc.on_boot_delay, (TRIGGER_EVENT, Some(EVENT_STARTUP))));
     }
     // From the last attempt, failed ones included: a failure (or a version the server rejected)
     // without retries must not stop the interval backups.
@@ -403,5 +404,14 @@ mod tests {
         // Nothing yet, and no backup after boot: from the first start of the service.
         assert_eq!(local_due(&sc, &LastRun::default(), 500).map(|d| d.0), Some(500 + 6 * 3600));
         assert_eq!(local_due(&sc, &LastRun::default(), 0), None);
+    }
+
+    #[test]
+    fn backup_after_boot_waits_the_delay() {
+        let sc = LocalSchedule { on_boot: true, on_boot_delay: 45, interval_hours: 0, ..LocalSchedule::default() };
+        assert_eq!(local_due(&sc, &LastRun::default(), 0).map(|d| d.0), Some(boot_time() + 45));
+        // Already done after this boot: not due.
+        let ok = LastRun { start: boot_time() + 50, status: "complete".into(), last_ok_start: boot_time() + 50, ..LastRun::default() };
+        assert_eq!(local_due(&sc, &ok, 0), None);
     }
 }
