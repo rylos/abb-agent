@@ -2,6 +2,7 @@
 name = "abb-proto"
 version = "0.2.15"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "Synology Active Backup for Business agent↔server protocol (PStream/PObject)"
 

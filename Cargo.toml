@@ -4,6 +4,7 @@ members = ["crates/abb-agent", "crates/abb-proto", "crates/abb-restore", "crates
 
 [workspace.package]
 edition = "2024"
+rust-version = "1.88"
 license = "GPL-3.0-or-later"
 
 [workspace.dependencies]

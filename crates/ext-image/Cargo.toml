@@ -2,6 +2,7 @@
 name = "ext-image"
 version = "0.2.15"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "Read-only ext2/3/4 reader for raw block devices: map of used blocks"
 

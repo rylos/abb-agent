@@ -2,6 +2,7 @@
 name = "abb-restore"
 version = "0.2.15"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "Bare-metal restore from Synology Active Backup for Business, for any Linux live system"
 

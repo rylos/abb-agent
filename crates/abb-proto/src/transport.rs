@@ -292,12 +292,14 @@ impl Connection {
         let r = sock.peek(&mut [0u8; 1]);
         sock.set_read_timeout(old)?;
         match r {
-            // TLS: bytes came, but maybe not a whole record, or not application data.
-            Ok(n) if n > 0 && let Stream::Tls(s) = &mut self.stream => {
-                s.conn.read_tls(&mut s.sock)?;
-                Ok(s.conn.process_new_packets()?.plaintext_bytes_to_read() > 0)
-            }
-            Ok(_) => Ok(true),
+            Ok(n) => match &mut self.stream {
+                // TLS: bytes came, but maybe not a whole record, or not application data.
+                Stream::Tls(s) if n > 0 => {
+                    s.conn.read_tls(&mut s.sock)?;
+                    Ok(s.conn.process_new_packets()?.plaintext_bytes_to_read() > 0)
+                }
+                _ => Ok(true),
+            },
             Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted) => Ok(false),
             Err(e) => Err(e.into()),
         }
