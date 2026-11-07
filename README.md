@@ -380,8 +380,10 @@ filesystem's back, by writing to the block device directly, would not be seen).
 
 Things that do not work yet, or have not been tested:
 
-- **Tested on Arch Linux only**, with ABB 3.2.1 on DSM 7.4. Other distributions (Debian, Fedora,
-  openSUSE…) and other ABB versions should work but have not been tried.
+- **Tested on Arch Linux**, with ABB 3.2.1 on DSM 7.4. Users report it working on Fedora 44,
+  backup and bare-metal restore ([#6](https://github.com/rylos/abb-agent/issues/6)). Other
+  distributions (Debian, Ubuntu, openSUSE…) and other ABB versions should work but have not been
+  verified.
 - **Backup:** XFS, LVM, LUKS, md-raid and multi-device btrfs are left out of the image (the backup
   is reported as partial). So is any other filesystem the agent does not read (NTFS, f2fs, exFAT…)
   while it is mounted read-write or held by the kernel; unmounted, it is copied as it is. MBR disks
