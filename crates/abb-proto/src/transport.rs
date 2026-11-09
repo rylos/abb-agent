@@ -4,8 +4,8 @@
 
 use crate::pobject::Value;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature};
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature, verify_tls13_signature_with_raw_key};
+use rustls::pki_types::{CertificateDer, ServerName, SubjectPublicKeyInfoDer, UnixTime};
 use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, SignatureScheme, StreamOwned};
 use sha2::{Digest, Sha256};
 use std::fmt;
@@ -145,12 +145,78 @@ impl ServerCertVerifier for PinVerifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        verify_tls13_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+        let algorithms = &self.provider.signature_verification_algorithms;
+        // DSM's default certificate is X.509 v1, which webpki refuses to parse. The pin is what
+        // authenticates it: all this has to prove is that the peer owns the key.
+        match v1_public_key(cert.as_ref()) {
+            Some(spki) => verify_tls13_signature_with_raw_key(message, &SubjectPublicKeyInfoDer::from(spki), dss, algorithms),
+            None => verify_tls13_signature(message, cert, dss, algorithms),
+        }
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         self.provider.signature_verification_algorithms.supported_schemes()
     }
+}
+
+/// One DER element.
+struct DerElement<'a> {
+    tag: u8,
+    content: &'a [u8],
+    /// The element with its header.
+    whole: &'a [u8],
+    /// What follows it.
+    rest: &'a [u8],
+}
+
+/// The DER element at the start of `der`. `None` if it is malformed or truncated.
+fn der_element(der: &[u8]) -> Option<DerElement<'_>> {
+    let (&tag, after_tag) = der.split_first()?;
+    let (&first, mut body) = after_tag.split_first()?;
+    let len = if first < 0x80 {
+        first as usize
+    } else {
+        let n = (first & 0x7f) as usize;
+        if n == 0 || n > 4 || body.len() < n {
+            return None;
+        }
+        let (bytes, content) = body.split_at(n);
+        body = content;
+        bytes.iter().fold(0, |len, &b| (len << 8) | b as usize)
+    };
+    if body.len() < len {
+        return None;
+    }
+    let (content, rest) = body.split_at(len);
+    Some(DerElement { tag, content, whole: &der[..der.len() - body.len() + len], rest })
+}
+
+/// The SubjectPublicKeyInfo of an X.509 v1 certificate, with its header. `None` for any other
+/// version and for malformed input, which are left to webpki.
+fn v1_public_key(cert: &[u8]) -> Option<&[u8]> {
+    const INTEGER: u8 = 0x02;
+    const SEQUENCE: u8 = 0x30;
+    const VERSION: u8 = 0xa0;
+
+    let sequence = |der| der_element(der).filter(|e| e.tag == SEQUENCE);
+    let certificate = sequence(cert)?;
+    let tbs = sequence(certificate.content)?;
+    let mut field = der_element(tbs.content)?;
+    if field.tag == VERSION {
+        // A v1 certificate has no version field, but some encoders write the default anyway.
+        if field.content != [INTEGER, 1, 0] {
+            return None;
+        }
+        field = der_element(field.rest)?;
+    }
+    if field.tag != INTEGER {
+        return None; // serial number
+    }
+    let mut rest = field.rest;
+    for _ in ["signature", "issuer", "validity", "subject"] {
+        rest = sequence(rest)?.rest;
+    }
+    sequence(rest).map(|e| e.whole)
 }
 
 enum Stream {
@@ -314,4 +380,116 @@ pub fn check_error(resp: &Value) -> Result<()> {
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustls::pki_types::PrivateKeyDer;
+    use rustls::server::{ClientHello, ResolvesServerCert, ServerConfig, ServerConnection};
+    use rustls::sign::CertifiedKey;
+    use std::net::TcpListener;
+
+    // Throwaway certificates and keys, made for these tests and used nowhere else.
+    const V1: &[u8] = include_bytes!("../testdata/v1.der");
+    const V1_KEY: &[u8] = include_bytes!("../testdata/v1.key.der");
+    const V3: &[u8] = include_bytes!("../testdata/v3.der");
+    const V3_KEY: &[u8] = include_bytes!("../testdata/v3.key.der");
+
+    fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+        assert!(content.len() < 0x80);
+        [&[tag, content.len() as u8], content].concat()
+    }
+
+    /// A certificate with the given fields at the start of its TBSCertificate.
+    fn certificate(head: &[Vec<u8>]) -> (Vec<u8>, Vec<u8>) {
+        let spki = tlv(0x30, b"key");
+        let mut tbs = head.concat();
+        for _ in 0..4 {
+            tbs.extend(tlv(0x30, b""));
+        }
+        tbs.extend(&spki);
+        (tlv(0x30, &tlv(0x30, &tbs)), spki)
+    }
+
+    #[test]
+    fn finds_the_key_of_a_v1_certificate_only() {
+        assert!(v1_public_key(V1).is_some());
+        assert_eq!(v1_public_key(V3), None);
+
+        let serial = tlv(0x02, &[7]);
+        let (cert, spki) = certificate(std::slice::from_ref(&serial));
+        assert_eq!(v1_public_key(&cert), Some(&spki[..]));
+        let (cert, spki) = certificate(&[tlv(0xa0, &tlv(0x02, &[0])), serial.clone()]);
+        assert_eq!(v1_public_key(&cert), Some(&spki[..]));
+        let (cert, _) = certificate(&[tlv(0xa0, &tlv(0x02, &[1])), serial]);
+        assert_eq!(v1_public_key(&cert), None);
+    }
+
+    #[test]
+    fn malformed_certificates_are_refused() {
+        for end in 0..V1.len() {
+            assert_eq!(v1_public_key(&V1[..end]), None, "truncated at {end}");
+        }
+        for der in [&[0x30, 0x80][..], &[0x30, 0x85, 1, 1, 1, 1, 1], &[0x30, 0x84, 0xff, 0xff, 0xff, 0xff], &[0x02, 0x00]] {
+            assert_eq!(v1_public_key(der), None, "{der:02x?}");
+        }
+    }
+
+    #[derive(Debug)]
+    struct Fixed(Arc<CertifiedKey>);
+
+    impl ResolvesServerCert for Fixed {
+        fn resolve(&self, _: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+            Some(self.0.clone())
+        }
+    }
+
+    /// One `Connection::open` against a local server that presents `cert` and signs with `key`.
+    fn handshake(cert: &'static [u8], key: &'static [u8], versions: &'static [&'static rustls::SupportedProtocolVersion]) -> Result<Connection> {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let signing_key = provider.key_provider.load_private_key(PrivateKeyDer::try_from(key).unwrap()).unwrap();
+        let certified = Arc::new(CertifiedKey::new(vec![CertificateDer::from(cert)], signing_key));
+        let config = ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(versions)
+            .unwrap()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(Fixed(certified)));
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut tcp, _) = listener.accept().unwrap();
+            Value::read_from(&mut tcp).unwrap();
+            tcp.write_all(&Value::Map(vec![]).to_bytes().unwrap()).unwrap();
+            let mut conn = ServerConnection::new(Arc::new(config)).unwrap();
+            while conn.is_handshaking() && conn.complete_io(&mut tcp).is_ok() {}
+        });
+        Connection::open("127.0.0.1", port, None)
+    }
+
+    const TLS13: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS13];
+    const TLS12: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS12];
+
+    #[test]
+    fn tls13_accepts_a_v1_certificate() {
+        let c = handshake(V1, V1_KEY, TLS13).unwrap();
+        assert_eq!(c.fingerprint, <Fingerprint>::from(Sha256::digest(V1)));
+    }
+
+    #[test]
+    fn tls13_still_needs_the_key_of_a_v1_certificate() {
+        assert!(handshake(V1, V3_KEY, TLS13).is_err());
+    }
+
+    #[test]
+    fn tls13_v3_certificates_are_unchanged() {
+        assert!(handshake(V3, V3_KEY, TLS13).is_ok());
+        assert!(handshake(V3, V1_KEY, TLS13).is_err());
+    }
+
+    #[test]
+    fn tls12_still_refuses_a_v1_certificate() {
+        assert!(handshake(V1, V1_KEY, TLS12).is_err());
+    }
 }
