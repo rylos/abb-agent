@@ -9,6 +9,9 @@ ConditionPathExists=/var/lib/abb-agent/excluded.json
 
 [Service]
 Type=oneshot
+# Stays active once done: without it every later pull of local-fs.target during boot starts it
+# again, and the fifth or sixth start in a few seconds fails with start-limit-hit.
+RemainAfterExit=yes
 ExecStart=/usr/bin/abb-agent restore-fixup
 
 [Install]
