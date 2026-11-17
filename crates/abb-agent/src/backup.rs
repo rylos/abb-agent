@@ -1079,10 +1079,12 @@ fn run_inner(
             }
         }
         server_accepted(job, c)?;
+        // The filesystem in the image is consistent either way; files written during the backup
+        // (logs, journals) may have mixed content, as with file-level tools. Counted, not partial:
+        // on a running root filesystem some always change.
         for (p, v) in volume_parts.iter().zip(&volumes) {
             if let Some(n) = v.changed_while_read().filter(|&n| n > 0) {
-                eprintln!("{}: {n} files changed while the backup read them: their content in this version may be inconsistent (partial backup), the next backup reads them again", alias(p));
-                consistent = false;
+                eprintln!("{}: {n} files changed while the backup read them: their content in this version may be mixed, the next backup reads them again", alias(p));
             }
         }
         let complete = !missed
