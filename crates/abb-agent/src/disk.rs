@@ -137,14 +137,43 @@ pub fn label(d: &Disk) -> String {
     format!("{} ({}){}", d.name, crate::ui::size(d.size), if system { " · system" } else { "" })
 }
 
-/// Disk containing partition `part` (e.g. "nvme0n1p2" → "nvme0n1").
+/// Disk containing partition `part` (e.g. "nvme0n1p2" → "nvme0n1"). A device-mapper or md
+/// device (LUKS, LVM, RAID: "dm-0") is followed down to the disk it sits on.
 pub fn parent_disk(part: &str) -> std::io::Result<String> {
-    let link = fs::canonicalize(Path::new("/sys/class/block").join(part))?;
-    let parent = link.parent().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned());
-    match parent {
-        Some(p) if Path::new("/sys/block").join(&p).exists() => Ok(p),
-        _ => Ok(part.to_string()),
+    let mut disks = Vec::new();
+    physical_disks(part, &mut disks, 0)?;
+    match disks.as_slice() {
+        [d] => Ok(d.clone()),
+        _ => Err(std::io::Error::other(format!(
+            "{part} spans the disks {}: name the ones to back up in `disks`",
+            disks.join(", ")
+        ))),
     }
+}
+
+/// Disks under block device `name`, through the devices it is built on (`slaves`).
+fn physical_disks(name: &str, out: &mut Vec<String>, depth: u8) -> std::io::Result<()> {
+    let sys = Path::new("/sys/class/block").join(name);
+    let mut below: Vec<String> = fs::read_dir(sys.join("slaves"))
+        .map(|d| d.filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned())).collect())
+        .unwrap_or_default();
+    below.sort();
+    if !below.is_empty() && depth < 8 {
+        for b in below {
+            physical_disks(&b, out, depth + 1)?;
+        }
+        return Ok(());
+    }
+    let link = fs::canonicalize(&sys)?;
+    let parent = link.parent().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned());
+    let disk = match parent {
+        Some(p) if Path::new("/sys/block").join(&p).exists() => p,
+        _ => name.to_string(),
+    };
+    if !out.contains(&disk) {
+        out.push(disk);
+    }
+    Ok(())
 }
 
 /// Whether `name` (under /sys/block) is a physical disk worth backing up: not a virtual
@@ -492,5 +521,25 @@ mod tests {
         assert!(!p.in_use());
         p.read_only = false;
         assert!(p.in_use());
+    }
+
+    /// Device-mapper devices present on this machine (none on most CI hosts) resolve to the disk
+    /// below them, never to themselves.
+    #[test]
+    fn dm_devices_resolve_to_their_disk() {
+        let Ok(dir) = fs::read_dir("/sys/block") else { return };
+        for e in dir.filter_map(|e| e.ok()) {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if !name.starts_with("dm-") {
+                continue;
+            }
+            match parent_disk(&name) {
+                Ok(d) => {
+                    assert!(!d.starts_with("dm-"), "{name} -> {d}");
+                    assert!(Path::new("/sys/block").join(&d).exists(), "{name} -> {d}");
+                }
+                Err(e) => assert!(e.to_string().contains("spans the disks"), "{name}: {e}"),
+            }
+        }
     }
 }
