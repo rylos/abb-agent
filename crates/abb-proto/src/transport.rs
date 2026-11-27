@@ -16,11 +16,12 @@ use std::time::Duration;
 
 pub const DEFAULT_PORT: u16 = 5510;
 
-/// Advertised version: the same as the registered official agent (3.2.2-5554).
+/// Advertised version: the official agent of the latest Active Backup release checked against
+/// abb-agent (3.2.3-5557, offered by ABB 3.2.3-25557).
 pub const AGENT_MAJOR: u64 = 3;
 pub const AGENT_MINOR: u64 = 2;
-pub const AGENT_MINI: u64 = 2;
-pub const AGENT_BUILD: &str = "5554";
+pub const AGENT_MINI: u64 = 3;
+pub const AGENT_BUILD: &str = "5557";
 
 /// SHA-256 fingerprint of the server certificate (DER).
 pub type Fingerprint = [u8; 32];

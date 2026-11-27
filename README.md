@@ -397,9 +397,11 @@ Things that do not work yet, or have not been tested:
 - **Restore of MBR disks** is not handled beyond writing the image as it is (untested).
 - After a restore onto **different hardware** the initramfs is not regenerated, and no UEFI NVRAM
   boot entry is created (the fallback path `\EFI\BOOT\` is used instead).
-- The agent identifies itself as the official agent version it was written against (3.2.2, build
-  5554). The NAS checks only that build, never refuses a newer one, and an agent left at an older
-  version keeps backing up; a future ABB release may still change the protocol. `abb-agent status`
+- The agent identifies itself as the official agent of the latest Active Backup release it was
+  checked against (3.2.3, build 5557). The NAS checks only that build, never refuses a newer one,
+  and an agent left at an older version keeps backing up; a future ABB release may still change the
+  protocol. Each new Active Backup release is compared with the previous one (server and official
+  agent) before abb-agent announces its build. `abb-agent status`
   shows the Active Backup version on the NAS, and the journal notes when it changes. *Update agent*
   in the console does not update abb-agent: update it with the package manager.
 

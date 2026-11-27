@@ -5,7 +5,8 @@
 //! digits must be above 4400 for most actions and above 4496 for a few (image restore, task
 //! versions); a missing or non-numeric build counts as 0 and the server then leaves requests
 //! unanswered. It never refuses a newer build, and an agent that is not updated keeps backing
-//! up. abb-agent announces the official agent's 3.2.2 build 5554 and keeps it fixed.
+//! up. abb-agent announces the official agent build of the latest Active Backup release it was
+//! checked against (`AGENT_BUILD`) and keeps it fixed; the console then shows no update.
 
 use crate::session::Session;
 use crate::state::STATE_DIR;
@@ -162,7 +163,7 @@ pub fn warnings(p: &Package) -> Vec<String> {
         w.push(format!("abb-agent announces build {} (agent.announce_build in {}) instead of {AGENT_BUILD}", agent_build(), crate::config::path()));
     }
     if p.agent_build() <= MIN_SERVER_BUILD {
-        w.push(format!("Active Backup {p} on the NAS is older than the official agent 3.2.2 accepts: update the package in DSM"));
+        w.push(format!("Active Backup {p} on the NAS is older than the official agent accepts: update the package in DSM"));
     }
     if p.agent_build() > ours() {
         w.push(format!(
@@ -267,13 +268,13 @@ mod tests {
 
     #[test]
     fn announce_build_override() {
-        assert_eq!(check_override("", 5554), Ok(Override::None));
-        assert_eq!(check_override("5600", 5554), Ok(Override::Use));
+        assert_eq!(check_override("", 5557), Ok(Override::None));
+        assert_eq!(check_override("5600", 5557), Ok(Override::Use));
         // Left over from before an update that announces a newer build: ignored, not an error.
-        assert_eq!(check_override("5500", 5554), Ok(Override::Older));
-        assert!(check_override("55x0", 5554).is_err());
-        assert!(check_override("4400", 5554).is_err());
-        assert!(check_override("15600", 5554).is_err());
+        assert_eq!(check_override("5500", 5557), Ok(Override::Older));
+        assert!(check_override("55x0", 5557).is_err());
+        assert!(check_override("4400", 5557).is_err());
+        assert!(check_override("15600", 5557).is_err());
     }
 
     #[test]
